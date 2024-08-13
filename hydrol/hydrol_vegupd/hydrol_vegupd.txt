@@ -1,0 +1,17 @@
+initialization:
+     71, Generating update device(humtot(:),tmc(:,:),dz(:),mask_soiltile(:,:),mc(:,:,:),ok_bare_soil_new,pref_soil_veg(:),vegetmax_soil(:,:,:),resdist(:,:),water2infilt(:,:),vegtot_old(:),mask_veget(:,:),vegtot(:),frac_bare_ns(:,:))
+main:
+     27, Generating enter data copyin(qsintveg(:,:),drain_upd(:),frac_bare(:,:),runoff_upd(:),veget_max(:,:),veget(:,:),soiltile(:,:))
+     28, Generating NVIDIA GPU code
+         29, !$acc loop gang, vector(128) ! blockidx%x threadidx%x
+             Generating reduction(+:error_flag_hydrol_tmc_update_1)
+     28, Generating implicit copyin(soiltile(:,:),veget_max(:,:),veget(:,:)) [if not already present]
+         Generating implicit copy(runoff_upd(:),frac_bare(:,:),error_flag_hydrol_tmc_update_1,qsintveg(:,:),drain_upd(:)) [if not already present]
+     33, Generating update self(frac_bare_ns(:,:),vegetmax_soil(:,:,:),mask_veget(:,:),frac_bare(:,:),mask_soiltile(:,:))
+     34, Generating exit data delete(qsintveg(:,:),drain_upd(:),frac_bare(:,:),runoff_upd(:),veget_max(:,:),veget(:,:),soiltile(:,:))
+hydrol_tmc_update_acc:
+    113, Generating acc routine seq
+         Generating NVIDIA GPU code
+hydrol_vegupd_acc:
+    684, Generating acc routine seq
+         Generating NVIDIA GPU code
