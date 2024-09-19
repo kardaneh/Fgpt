@@ -202,18 +202,18 @@ class Isolator:
         cls.find_subroutines()
         cls.extract_loop_indices()
 
-        for subroutine in ['hydrol_vegupd']:#cls.subroutine_keys_ncl:
+        for subroutine in ['hydrol_soil']:#cls.subroutine_keys_ncl:
             self.parent_subroutine_call = set()
             self.separate_parent_subroutine(cls, subroutine)
         
-        '''['hydrol_diag_soil','hydrol_diag_soil_flux','hydrol_nudge_mc','hydrol_root_profile',
+        '''subs = ['hydrol_diag_soil','hydrol_diag_soil_flux','hydrol_nudge_mc','hydrol_root_profile',
                 'hydrol_soil_coef','hydrol_soil_froz','hydrol_soil_infilt','hydrol_soil_setup',
                 'hydrol_soil_smooth_over_mcs2','hydrol_soil_smooth_under_mcr','hydrol_soil_tridiag',
-                'hydrol_split_soil']:
-        '''
-        '''for subroutine in ['hydrol_tmc_update']:
+                'hydrol_split_soil']
+        subs = ['hydrol_soil']
+        for subroutine in subs:
             self.separate_child_subroutine(cls, subroutine)
-        '''
+       ''' 
     def run(self):
         self.setup_environment()
         self.create_target_directory()

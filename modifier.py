@@ -547,7 +547,7 @@ class Modifier:
                                 old_arg_spec = intrinsic_name[intrinsic_parent]['dim']
                                 reduction_dim = old_arg_spec.split('=')[-1].strip()
                                 print(f'{reduction_dim}th of :s in {node_str} must stay as < : >.')
-                                reduction_dim = self.rocess_section_subscript_list(node, reduction_dim)
+                                reduction_dim = self.process_section_subscript_list(node, reduction_dim)
                                 print(f'dimension {reduction_dim} of {node_str} must stay as < : >.')
                             
                             mod_node, new_arg_spec = self.modify_colon_array(node, intrinsic_parent, reduction_dim)
@@ -557,15 +557,22 @@ class Modifier:
                                     re.escape(old_arg_spec), new_arg_spec.tostr(), mod_intrinsic_parent
                                 )
                             input_stmt = re.sub(re.escape(intrinsic_parent), mod_intrinsic_parent, input_stmt)
+                            node = mod_node
                     else:
                         mod_node, new_arg_spec = self.modify_colon_array(node)
                         input_stmt = re.sub(re.escape(node_str), mod_node.tostr(), input_stmt)
+                        node = mod_node
                 elif ':' not in node_str and isinstance(node, F23.Name):
                     array_name = node_str
                     mod_node = self.modify_array_without_notation(node)
                     input_stmt = re.sub(
                         r'\b' + re.escape(array_name) + r'\b(?!\()', mod_node.tostr(), input_stmt
                     )
+                    node = mod_node
+                mod_node = self.remove_vec_for_locals_in_assigns(node)
+                input_stmt = re.sub(
+                        re.escape(node.tostr()), mod_node.tostr(), input_stmt
+                        )
 
             return input_stmt
         except Exception as e:
@@ -1025,9 +1032,12 @@ class Modifier:
                                     assert grandchild.tostr() in self.within_calls, (
                                         f"Error: '{grandchild.tostr()}' not found in within_calls"
                                     )
-                                    if self.child_error_flag and grandchild.tostr() in self.child_error_flag.keys():
-                                            add_error_flag_into_call_stmt = True
-                                            add_error_flags = self.child_error_flag[grandchild.tostr()]
+                                    #if self.child_error_flag and grandchild.tostr() in self.child_error_flag.keys():
+                                    if (self.child_error_flag and
+                                            grandchild.tostr() in self.child_error_flag and
+                                            self.child_error_flag[grandchild.tostr()]):
+                                        add_error_flag_into_call_stmt = True
+                                        add_error_flags = self.child_error_flag[grandchild.tostr()]
                                     call_stmt += f"{grandchild.tostr()}_acc"
                                 elif isinstance(grandchild, F23.Actual_Arg_Spec_List):
                                     if add_error_flag_into_call_stmt:
@@ -1234,16 +1244,16 @@ def main():
 
 if __name__ == "__main__":
     # Initialize SubroutineFinder with paths to module directory and module tree.
-    '''cls = SubroutineFinder(processor.module_dir_sp, processor.module_tree_sp)
+    cls = Extractor(processor.module_dir_sp, processor.module_tree_sp)
     cls.find_subroutines()
-    subroutine_key = 'hydrol_soil_infilt'
+    subroutine_key = 'hydrol_root_profile'
     subroutine_tree = cls.subroutines[subroutine_key]
     cls.find_variables(subroutine_tree, subroutine_key)
     cls.dec_global = {}
     cls.dec_child = {}
     cls.find_global_variables(processor.module_dir_sp, processor.module_tree_sp, cls.var_global)
     cls.extract_loop_indices()
-    '''
+    
     # Call the main function to process the Fortran code.
     main()
 

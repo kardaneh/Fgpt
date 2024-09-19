@@ -1,0 +1,14 @@
+initialization:
+     47, Generating update device(dr_ns(:,:),rootsink(:,:,:),qflux_ns(:,:,:),mcl(:,:,:),dt_sechiba,dz(:),check_top_ns(:,:))
+main:
+     20, Generating enter data copyin(mclint(:,:),flux_top(:))
+     21, Generating NVIDIA GPU code
+         22, !$acc loop gang, vector(128) ! blockidx%x threadidx%x
+             Generating reduction(+:error_flag_hydrol_diag_soil_flux_1)
+     21, Generating implicit copyin(mclint(:,:),flux_top(:)) [if not already present]
+         Generating implicit copy(error_flag_hydrol_diag_soil_flux_1) [if not already present]
+     26, Generating update self(check_top_ns(:,:),qflux_ns(:,:,:))
+     27, Generating exit data delete(mclint(:,:),flux_top(:))
+hydrol_diag_soil_flux_acc:
+     78, Generating acc routine seq
+         Generating NVIDIA GPU code
