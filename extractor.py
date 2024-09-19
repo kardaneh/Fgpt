@@ -142,12 +142,14 @@ class Extractor:
         shapes = {name.string for name in shape}
 
         for declaration_stmt in walk(declared, F23.Type_Declaration_Stmt):
-            implicit_shape = walk(declaration_stmt, F23.Assumed_Shape_Spec)
-            if implicit_shape and len(walk(declaration_stmt, F23.Entity_Decl)) > 1:
+            #implicit_shape = walk(declaration_stmt, F23.Assumed_Shape_Spec)
+            #if implicit_shape and len(walk(declaration_stmt, F23.Entity_Decl)) > 1:
+            if len(walk(declaration_stmt, F23.Entity_Decl)) > 1:
                 node_list = Processor().separate_entity_declarations(declaration_stmt)
             else:
                 node_list = [declaration_stmt]
             for node in node_list:
+                implicit_shape = walk(node, F23.Assumed_Shape_Spec)
                 if implicit_shape:
                     shape_finder = Shaper(self.module_dir, self.dummy_arg_list, self.actual_arg_spec_list, self.call_subroutines)
                     nodes = shape_finder.find_implicit_shape(node, subroutine_name)
