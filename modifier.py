@@ -7,6 +7,49 @@ from fparser.two import Fortran2008 as F28
 from collections import deque, defaultdict
 
 class Modifier:
+    """
+    The Modifier class is responsible for transforming Fortran source code to handle various
+    computational and array-related transformations, particularly when porting or optimizing the code for
+    modern architectures such as GPUs.
+
+    The class includes methods for:
+        - Replacing unsupported Fortran GPU features with compatible code.
+        - Modifying and optimizing array operations.
+        - Handling vectorization and manually adjusting loops for performance improvements.
+        - Parsing and modifying `If-Then` and `Else-If` statements in the Fortran code.
+        - Creating call statements for subroutines, processing dummy arguments and vector dimensions.
+        - Merging and adding vector loops within the Fortran code blocks for better performance.
+
+    Attributes:
+        all_array_info (dict): Stores information about all arrays found in the code.
+        loop_dict (dict): Maps loops and their relevant metadata.
+        var_declared (set): A set of declared variables in the code.
+        imp_shape (list): A list containing the shapes of implicit arrays.
+        allowed_external_subroutines (list): A list of allowed external subroutines.
+        var_global (dict): Stores global variables for the Fortran code being processed.
+        seen (set): A set to track visited nodes during the traversal of expressions.
+        arrays_queue (collections.deque): A queue to store arrays during expression traversal.
+        error_flag (dict): Flags for error handling in child nodes.
+
+    Methods:
+        replace_gpu_unsupported(parse_tree):
+            Replaces GPU-unsupported features in the Fortran code.
+        
+        merge_vector_loop(parse_tree):
+            Merges vector loops to optimize performance.
+        
+        add_vector_loop(modified_block):
+            Adds vector loops to the transformed Fortran code.
+        
+        replace_vec_colon_with_index(output_stmt):
+            Replaces vectorized colons in array accesses with index-based accesses.
+        
+        edit_if_else_stmt(stmt):
+            Edits `If-Then` and `Else-If` statements, processing vector dimensions.
+
+        create_act_call_stmt(subroutine_stmt):
+            Creates and modifies a call statement for a subroutine with dummy arguments and vector dimensions.
+    """
     def __init__(self, all_array_info, loop_dict, var_declared, imp_shape, io_subroutines, var_global,\
             within_calls=None, child_error_flag=None):
         self.all_array_info = all_array_info
@@ -1060,6 +1103,7 @@ class Modifier:
                         new_specification_part = self.modify_specification_part(child)
                         block.content[idc] = self.remove_vec_for_locals_in_specification(new_specification_part)
                     elif isinstance(child, F23.Where_Construct):
+                        print("Where construc: ", child.tostr())
                         stmt = walk(child, F23.Assignment_Stmt)
                         self.add_dos(stmt[0])
                         self.replace_where(child)
@@ -1088,8 +1132,8 @@ class Modifier:
                             del block.content[idc]
                             continue
                     elif isinstance(child, F23.Return_Stmt):
-                        if isinstance(block.content[idc+1], F23.End_If_Stmt):
-                            block.content[idc+1] = F23.Else_Stmt("ELSE")
+                        if isinstance(block.content[idc+2], F23.End_If_Stmt):
+                            block.content[idc+2] = F23.Else_Stmt("ELSE")
                         else:
                             raise RuntimeError("Error: The next statement is not an End_If_Stmt. "
                                                "Cannot insert ELSE statement here.")
@@ -1246,7 +1290,7 @@ if __name__ == "__main__":
     # Initialize SubroutineFinder with paths to module directory and module tree.
     cls = Extractor(processor.module_dir_sp, processor.module_tree_sp)
     cls.find_subroutines()
-    subroutine_key = 'hydrol_root_profile'
+    subroutine_key = 'hydrol_alma'
     subroutine_tree = cls.subroutines[subroutine_key]
     cls.find_variables(subroutine_tree, subroutine_key)
     cls.dec_global = {}

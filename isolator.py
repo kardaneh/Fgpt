@@ -6,6 +6,51 @@ from extractor import Extractor
 from modifier import Modifier
 
 class Isolator:
+    """
+    The Isolator class is responsible for isolating subroutines from Fortran modules. It 
+    manages the environment setup, parsing, and transformation of the subroutines while handling 
+    dependencies like global variable declarations. The class operates on Fortran code, separating parent 
+    and child subroutines, and preparing the code for further processing or compilation.
+
+    Key responsibilities include:
+        - Setting up the directory structure and environment for isolating subroutines.
+        - Extracting subroutines from Fortran modules and handling their dependencies.
+        - Processing subroutines to identify and modify relevant loops and variables.
+        - Merging global variable declarations across the processed subroutines.
+        - Updating and managing main program files, ensuring the integration of isolated subroutines.
+
+    Attributes:
+        rest_of_path (str): The path to the module directory within the working environment.
+        target_module (str): The name of the Fortran module being processed.
+        scratch_dir (str): The working directory where intermediate files and outputs are stored.
+        module_dir_sp (str): The specific path to the module within the scratch directory.
+        module_file_sp (str): The full path to the target Fortran module file.
+        processor_sp (Processor): A `Processor` instance to handle parsing and Fortran code operations.
+        module_tree_sp (Node): The parsed tree representation of the Fortran module.
+        target_module_dir (str): Directory for the isolated target module's output.
+        global_vars_decl_sp (dict): Dictionary to hold global variable declarations from subroutines.
+        child_subroutine_call_sp (dict): Stores subroutine calls within the processed child subroutines.
+        child_error_flag (dict): Tracks errors or flags encountered during child subroutine isolation.
+
+    Methods:
+        setup_environment():
+            Sets up the directory structure and paths for the target module and its processing.
+
+        create_target_directory():
+            Creates or cleans the directory where the isolated subroutines will be stored.
+
+        separate_child_subroutine(cls, subroutine_key):
+            Isolates a specific child subroutine from the Fortran module, parsing and processing it.
+
+        merge_global_vars_decl(in_dict):
+            Merges global variable declarations from child subroutines into a master list.
+
+        process_subroutines():
+            Processes all subroutines from the target module, handling both parent and child subroutines.
+
+        run():
+            Executes the full pipeline of environment setup, subroutine isolation, and processing.
+    """
     def __init__(self, rest_of_path, target_module, work):
         self.module_global_file = "module_global.f90"
         self.main_program_file = "main.f90"

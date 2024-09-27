@@ -1,0 +1,17 @@
+initialization:
+     62, Generating update device(precisol_ns(:,:),dt_sechiba,tr_ns(:,:),humrelv(:,:,:),ae_ns(:,:),pref_soil_veg(:),precisol(:,:),check_cwrr,vegtot(:),vegetmax_soil(:,:,:),rootsink(:,:,:),ok_hydrol_arch)
+main:
+     52, Generating enter data copyin(evap_bare_lim_ns(:,:),transpir(:,:),soiltile(:,:),evap_bare_lim(:),e_frac(:,:,:,:),f_absorption(:,:),tot_bare_soil(:),veget_max(:,:),vevapnu(:),humrel(:,:),us(:,:,:,:))
+     53, Generating NVIDIA GPU code
+         54, !$acc loop gang, vector(128) ! blockidx%x threadidx%x
+             Generating reduction(+:error_flag_hydrol_split_soil_12,error_flag_hydrol_split_soil_2,error_flag_hydrol_split_soil_3,error_flag_hydrol_split_soil_4,error_flag_hydrol_split_soil_5,error_flag_hydrol_split_soil_6,error_flag_hydrol_split_soil_7,error_flag_hydrol_split_soil_9,error_flag_hydrol_split_soil_8,error_flag_hydrol_split_soil_1,error_flag_hydrol_split_soil_10,error_flag_hydrol_split_soil_11)
+     53, Generating implicit copy(us(:,:,:,:)) [if not already present]
+         Generating implicit copyin(humrel(:,:),veget_max(:,:),vevapnu(:),tot_bare_soil(:),f_absorption(:,:)) [if not already present]
+         Generating implicit copy(error_flag_hydrol_split_soil_9) [if not already present]
+         Generating implicit copyin(evap_bare_lim(:),soiltile(:,:),transpir(:,:),evap_bare_lim_ns(:,:),e_frac(:,:,:,:)) [if not already present]
+         Generating implicit copy(error_flag_hydrol_split_soil_12,error_flag_hydrol_split_soil_2,error_flag_hydrol_split_soil_3,error_flag_hydrol_split_soil_4,error_flag_hydrol_split_soil_5,error_flag_hydrol_split_soil_6,error_flag_hydrol_split_soil_7,error_flag_hydrol_split_soil_8,error_flag_hydrol_split_soil_1,error_flag_hydrol_split_soil_10,error_flag_hydrol_split_soil_11) [if not already present]
+     58, Generating update self(precisol_ns(:,:),ae_ns(:,:),tr_ns(:,:),rootsink(:,:,:))
+     59, Generating exit data delete(evap_bare_lim_ns(:,:),transpir(:,:),soiltile(:,:),evap_bare_lim(:),e_frac(:,:,:,:),f_absorption(:,:),tot_bare_soil(:),vevapnu(:),veget_max(:,:),humrel(:,:),us(:,:,:,:))
+hydrol_split_soil_acc:
+    175, Generating acc routine seq
+         Generating NVIDIA GPU code

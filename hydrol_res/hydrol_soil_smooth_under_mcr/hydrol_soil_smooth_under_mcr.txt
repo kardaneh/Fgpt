@@ -1,0 +1,14 @@
+initialization:
+     41, Generating update device(zmaxh,mc(:,:,:),dz(:),check_cwrr,mask_soiltile(:,:))
+main:
+     21, Generating enter data copyin(check(:,:),mcr(:),njsc(:),is_under_mcr(:,:))
+     22, Generating NVIDIA GPU code
+         23, !$acc loop gang, vector(128) ! blockidx%x threadidx%x
+     22, Generating implicit copy(is_under_mcr(:,:)) [if not already present]
+         Generating implicit copyin(mcr(:),njsc(:)) [if not already present]
+         Generating implicit copy(check(:,:)) [if not already present]
+     27, Generating update self(check(:,:),mc(:,:,:),is_under_mcr(:,:))
+     28, Generating exit data delete(check(:,:),mcr(:),njsc(:),is_under_mcr(:,:))
+hydrol_soil_smooth_under_mcr_acc:
+     89, Generating acc routine seq
+         Generating NVIDIA GPU code
