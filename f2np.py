@@ -6,6 +6,39 @@ from processor import Processor
 import re
 
 class F2NP:
+    """
+    F2NP is a class for converting Fortran code into NumPy-based Python code.
+
+    This class takes Fortran constructs and translates them into equivalent
+    Python code using NumPy for numerical operations. It handles various
+    Fortran statements, including subroutine calls, type declarations, 
+    control statements (if, do), and intrinsic functions.
+
+    Attributes:
+        result (list): A list to store the results of the translation.
+        indentation_level (int): The current level of indentation for nested
+                                 structures.
+        npcode (str): The resulting Python code as a string.
+        replacements (dict): A mapping of Fortran logical and arithmetic 
+                             operators to their Python equivalents.
+        intrinsic_replacements (dict): A mapping of Fortran intrinsic 
+                                        functions to their NumPy equivalents.
+
+    Methods:
+        recursive(block): Recursively processes the Fortran block.
+        handle_subroutine_stmt(stmt): Translates Fortran subroutine statements.
+        handle_call_stmt(stmt): Translates Fortran subroutine call statements.
+        handle_type_declaration_stmt(stmt): Translates type declaration statements.
+        simplify_limits(expression): Simplifies loop limits and expressions.
+        handle_end_stmt(stmt): Handles end statements for control structures.
+        handle_print_stmt(stmt): Translates print statements.
+        handle_assignment(stmt): Handles variable assignments.
+        handle_do_stmt(stmt): Translates Fortran do loops to Python for loops.
+        handle_if_condition(condition): Translates Fortran if conditions.
+        handle_part_ref(stmt_str, part_ref): Handles array references.
+        handle_intrinsic_function_reference(stmt_str, intrinsic_function_reference): 
+            Translates intrinsic function calls.
+    """
     def __init__(self):
         self.result = []
         self.indentation_level = 0
@@ -55,59 +88,90 @@ class F2NP:
 
 
     def recursive(self, block):
+        """
+        Recursively processes a block of Fortran code, identifying and handling different types 
+        of Fortran statements such as subroutines, type declarations, DO loops, IF conditions, 
+        and assignments, converting them to equivalent Python code with NumPy.
+        
+        Parameters:
+        block: A Fortran block of code to be analyzed and transformed.
+        """
         if hasattr(block, "content"):
             idx = 0
             while idx < len(block.content):
                 child = block.content[idx]
                 if isinstance(child, F23.Subroutine_Stmt):
+                    print('\033[34m' + f"{child}" + '\033[0m')
                     child = self.handle_subroutine_stmt(child)
                     self.npcode += f"{self.indentation_level * '    '}{child}\n"
                     self.indentation_level += 1
+                    print('\033[32m' + f"{child}" + '\033[0m\n')
                 elif isinstance(child, F23.Type_Declaration_Stmt):
+                    print('\033[34m' + f"{child}" + '\033[0m')
                     child = self.handle_type_declaration_stmt(child)
+                    print('\033[32m' + f"{child}" + '\033[0m\n')
                     if child is not None:
                         self.npcode += f"{self.indentation_level * '    '}{child}\n"
                     else:
                         del block.content[idx]
                         continue
                 elif isinstance(child, F23.Nonlabel_Do_Stmt):
+                    print('\033[34m' + f"{child}" + '\033[0m')
                     child = self.handle_do_stmt(child)
+                    print('\033[32m' + f"{child}" + '\033[0m\n')
                     self.npcode += f"{self.indentation_level * '    '}{child}\n"
                     self.indentation_level += 1
                 elif isinstance(child, F23.If_Then_Stmt):
+                    print('\033[34m' + f"{child}" + '\033[0m')
                     if walk(child, F23.Part_Ref):
                         child = self.handle_assignment(child)
                     else:
                         child = child.tostr()
-                    condition = self.handle_if_condition(child)
-                    self.npcode += f"{self.indentation_level * '    '}{condition}\n"
+                    child = self.handle_if_condition(child)
+                    print('\033[32m' + f"{child}" + '\033[0m\n')
+                    self.npcode += f"{self.indentation_level * '    '}{child}\n"
                     self.indentation_level += 1
                 elif isinstance(child, (F23.Else_If_Stmt, F23.Else_Stmt)):
+                    print('\033[34m' + f"{child}" + '\033[0m')
                     self.indentation_level -= 1
                     if isinstance(child, F23.Else_If_Stmt) and walk(child, F23.Part_Ref):
                         child = self.handle_assignment(child)
                     else:
                         child = child.tostr()
-                    condition = self.handle_if_condition(child)
-                    self.npcode += f"{self.indentation_level * '    '}{condition}\n"
+                    child = self.handle_if_condition(child)
+                    print('\033[32m' + f"{child}" + '\033[0m\n')
+                    self.npcode += f"{self.indentation_level * '    '}{child}\n"
                     self.indentation_level += 1
                 elif isinstance(child, (F23.End_If_Stmt, F23.End_Do_Stmt, F23.End_Subroutine_Stmt)):
+                    print('\033[34m' + f"{child}" + '\033[0m')
                     self.indentation_level -= 1
                     del block.content[idx]
                     continue
-                    #condition = self.handle_end_stmt(child)
-                    #self.npcode += f"{self.indentation_level * '    '}{condition}\n"
                 elif isinstance(child, F23.Print_Stmt):
-                    pychild = self.handle_print_stmt(child)
-                    self.npcode += f"{self.indentation_level * '    '}{pychild}\n"
+                    print('\033[34m' + f"{child}" + '\033[0m')
+                    child = self.handle_print_stmt(child)
+                    print('\033[32m' + f"{child}" + '\033[0m\n')
+                    self.npcode += f"{self.indentation_level * '    '}{child}\n"
                 elif isinstance(child, F23.Assignment_Stmt):
-                    pychild = self.handle_assignment(child)
-                    self.npcode += f"{self.indentation_level * '    '}{pychild}\n"
+                    print('\033[34m' + f"{child}" + '\033[0m')
+                    child = self.handle_assignment(child)
+                    print('\033[32m' + f"{child}" + '\033[0m\n')
+                    self.npcode += f"{self.indentation_level * '    '}{child}\n"
                 else:
                     self.recursive(child)
                 idx += 1
 
     def handle_subroutine_stmt(self, stmt):
+        """
+        Handles a Fortran subroutine statement, extracting its name and arguments,
+        and converting it into a Python function definition.
+        
+        Parameters:
+        stmt: A Fortran subroutine statement to be converted.
+        
+        Returns:
+        str: Python function definition corresponding to the subroutine.
+        """
         self.arg_list = []
         for child in stmt.children:
             if child is None:
@@ -121,6 +185,15 @@ class F2NP:
         return f"def {subroutine_name}({arg_list}):"
 
     def handle_call_stmt(self, stmt):
+        """
+        Handles a Fortran CALL statement, converting it to a Python function call.
+        
+        Parameters:
+        stmt: A Fortran CALL statement.
+        
+        Returns:
+        str: Python function call equivalent to the Fortran CALL.
+        """
         for child in stmt.children:
             if child is None:
                 continue
@@ -131,6 +204,16 @@ class F2NP:
         return f"{subroutine_name}({arg_list})"
 
     def handle_type_declaration_stmt(self, stmt):
+        """
+        Handles a Fortran type declaration, converting it to a NumPy array declaration.
+        It determines the data type (e.g., REAL, INTEGER) and the dimensions of the array.
+
+        Parameters:
+        stmt: A Fortran type declaration statement.
+        
+        Returns:
+        str: NumPy array declaration corresponding to the Fortran type declaration.
+        """
         var_part = []
         for child in stmt.children:
             if child is None:
@@ -163,6 +246,16 @@ class F2NP:
 
 
     def simplify_limits(self, expression):
+        """
+        Simplifies expressions for loop bounds or array dimensions, combining constants 
+        and variables in the expression.
+
+        Parameters:
+        expression: The expression representing loop bounds or dimensions.
+        
+        Returns:
+        str: Simplified version of the expression.
+        """
         terms = re.split(r'\s*([+\-])\s*', expression)
         numbers = []
         variables = []
@@ -199,6 +292,15 @@ class F2NP:
         self.result.append(f"np.where({condition})")
 
     def handle_do_stmt(self, stmt):
+        """
+        Handles a Fortran DO loop, converting it into a Python for loop.
+
+        Parameters:
+        stmt: A Fortran DO loop statement.
+
+        Returns:
+        str: Python for loop equivalent to the Fortran DO loop.
+        """
         line_parts = stmt.tostr().split('=')
         loop_var = line_parts[0].split()[-1]
         start_end_stride_values = line_parts[1].split(',')
@@ -216,11 +318,29 @@ class F2NP:
         return f"for {loop_var} in range({lb}, {end}, {stride}):"
 
     def handle_if_condition(self, condition):
+        """
+        Handles a Fortran IF condition, converting it to a Python IF statement.
+
+        Parameters:
+        stmt: A Fortran IF condition statement.
+        
+        Returns:
+        str: Python IF statement equivalent to the Fortran condition.
+        """
         for fortran_op, python_op in self.replacements.items():
             condition = re.sub(fortran_op, python_op, condition, flags=re.IGNORECASE)
         return condition
 
     def handle_print_stmt(self, stmt):
+        """
+        Handles a Fortran PRINT statement, converting it into a Python print statement.
+
+        Parameters:
+        stmt: A Fortran PRINT statement.
+        
+        Returns:
+        str: Python print statement equivalent to the Fortran PRINT.
+        """
         assert isinstance(stmt, F23.Print_Stmt), (
                 f"Unexpected statement type: {type(stmt).__name__}. Expected one of: "
                 f"Print_Stmt")
@@ -273,6 +393,15 @@ class F2NP:
         return stmt_str
 
     def handle_assignment(self, stmt):
+        """
+        Handles a Fortran assignment statement, converting it into a Python assignment.
+
+        Parameters:
+        stmt: A Fortran assignment statement.
+        
+        Returns:
+        str: Python assignment equivalent to the Fortran statement.
+        """
         stmt_str = stmt.tostr()
         part_ref = walk(stmt, F23.Part_Ref)
         intrinsic_function_reference = walk(stmt, F23.Intrinsic_Function_Reference)

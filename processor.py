@@ -8,6 +8,16 @@ from fparser.two.parser import ParserFactory
 from collections import deque
 
 class Processor:
+    """
+    A class for parsing Fortran files, strings, and statements using fparser, 
+    creating Abstract Syntax Trees (ASTs), generating Fortran code, and performing 
+    various mappings.
+
+    Attributes:
+    -----------
+    parser : object
+        An instance of the Fortran 2008 parser created by fparser.
+    """
     def __init__(self):
         logging.basicConfig(level=logging.INFO)
         self.parser = ParserFactory().create(std="f2008")
