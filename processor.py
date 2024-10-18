@@ -6,6 +6,7 @@ from fparser.two import Fortran2008 as F28
 from fparser.common.readfortran import FortranFileReader, FortranStringReader
 from fparser.two.parser import ParserFactory
 from collections import deque
+from line_length import FortLineLength 
 
 class Processor:
     """
@@ -21,6 +22,10 @@ class Processor:
     def __init__(self):
         logging.basicConfig(level=logging.INFO)
         self.parser = ParserFactory().create(std="f2008")
+        self.line_length = FortLineLength()
+        current_dir = os.getcwd()
+        self.benchmark_dir = os.path.join(current_dir, 'benchmark')
+        os.makedirs(self.benchmark_dir, exist_ok=True)
 
     def parse_fortran_file(self, file_path):
         try:
@@ -80,13 +85,13 @@ class Processor:
         except Exception as e:
             raise RuntimeError(f"An error occurred while parsing Fortran code: {e}")
 
-    def initiate_empty_routine(self, routine_name):
+    def initiate_empty_routine(self, subroutine_name):
         try:
             code_template = f"""
-            subroutine {routine_name}()
-                call random_seed(put=seed)
-                write(*,*) '--- inside the routine {routine_name} ---'
-            end subroutine {routine_name}
+            subroutine read_dummy()
+                open(unit=1363, file='{self.benchmark_dir}/{subroutine_name}/dummy.bin', form='unformatted', status='old')
+                write(*,*) '--- inside the read dummy routine for {subroutine_name} ---'
+            end subroutine read_dummy
             """
             reader = FortranStringReader(code_template, ignore_comments=True)
             parse_tree = self.parser(reader)
@@ -171,27 +176,20 @@ class Processor:
 
     def add_entity_to_allocation(self, allocate_stmt, var_modif):
         try:
-            lst = []
-            opt = ""
-
+            new_allocation = []
             for child in allocate_stmt.children:
                 if child is None:
                     continue
                 if isinstance(child, F23.Allocation_List) or isinstance(child, F28.Allocation_List):
                     for grandchild in child.children:
-                        lst.append(grandchild.tostr())
                         allocate_name = grandchild.children[0].tostr()
+                        code = f"if(.not. allocated({allocate_name}))then\n{allocate_stmt.tostr()}\nend if"
+                        new_allocation.append(self.parse_fortran_statement(code))
                         if allocate_name in var_modif:
                             allocate_name_add = allocate_name + '_cpu'
-                            allocate_arr = re.sub(rf'\b{allocate_name}\b', allocate_name_add, grandchild.tostr())
-                            lst.append(allocate_arr)
-                elif isinstance(child, F23.Alloc_Opt_List) or isinstance(child, F28.Alloc_Opt_List):
-                    for grandchild in child.children:
-                        opt = grandchild.tostr()
-
-            part_merged = ', '.join([name for name in lst])
-            allocation = f"allocate({part_merged}, {opt})"
-            new_allocation = F23.Allocate_Stmt(allocation)
+                            allocation = re.sub(rf'\b{allocate_name}\b', allocate_name_add, allocate_stmt.tostr())
+                            code = f"if(.not. allocated({allocate_name_add}))then\n{allocation}\nend if"
+                            new_allocation.append(self.parse_fortran_statement(code))
             logging.info("Successfully generated allocation statements")
             return new_allocation
         except Exception as e:
@@ -292,12 +290,13 @@ class Processor:
             logging.error(f"Failed to remove INTENT and SAVE attributes, Error: {e}")
             raise
 
-    def out_module_fortran(self):
-        code = """
+    def out_module_fortran(self, subroutine_name):
+        code = f"""
         module module_global
         implicit none
         integer, parameter :: i_std = 4
         integer, parameter :: r_std = 8
+        integer(kind = i_std), parameter :: nsnow=3
         integer(kind = i_std), parameter :: nslm=11
         integer(kind = i_std), parameter :: nvm = 13
         integer(kind = i_std), parameter :: nstm = 3
@@ -305,14 +304,10 @@ class Processor:
         integer                          :: ier
         integer                          :: seed(64) = 1
         contains
-        subroutine declarations()
-        call random_seed(put=seed)
-        write(*,*)'--- add the declarations in module global ---'
-        end subroutine declarations
-        subroutine initialization()
-        call random_seed(put=seed)
-        write(*,*)'--- initialization of global variables in module global ---'
-        end subroutine initialization
+        subroutine declaration_initialization()
+        open(unit=1363, file='{self.benchmark_dir}/{subroutine_name}/global.bin', form='unformatted', status='old')
+        write(*,*)'--- add the declaration and initialization in module global ---'
+        end subroutine declaration_initialization
         end module module_global
         """
         try:
@@ -400,6 +395,7 @@ class Processor:
 
     def write_fortran_code_to_file(self, code, file_path):
         try:
+            code = self.line_length.process(code.tostr())
             with open(file_path, 'w') as f:
                 f.write(str(code))
             logging.info(f"Successfully wrote code to file: {file_path}")
@@ -407,9 +403,24 @@ class Processor:
             logging.error(f"Failed to write code to file: {file_path}, Error: {e}")
             raise
 
-    def update_global_module(self, input_dict, file_path):
+    def update_global_module(self, input_dict, file_path, subroutine_name, module_tree):
         try:
-            self.out_module = self.out_module_fortran()
+            self.out_module = self.out_module_fortran(subroutine_name)
+            write_stmt_code = "\n".join(self.write_stmt)
+            for call in walk(module_tree, F23.Call_Stmt):
+                assert isinstance(call.children[0], F23.Name), f"Expected F23.Name, but got {type(call.children[0])}"
+                assert isinstance(call.children[1], F23.Actual_Arg_Spec_List), \
+                        f"Expected F23.Actual_Arg_Spec_List, but got {type(call.children[1])}"
+                if call.children[0].tostr() == subroutine_name:
+                    code_template = (
+                            f"{call.tostr()}\n"
+                            f"open(unit=1363, file='{self.benchmark_dir}/{subroutine_name}/global.bin', form='unformatted', status='replace')\n"
+                            f"{write_stmt_code}\n"
+                            "close(1363)"
+                            )
+                    call.parent.children[call.parent.children.index(call)] = self.parse_fortran_statement(code_template)
+                    break
+
             for node in self.out_module.content:
                 if isinstance(node, F23.Module):
                     for idx, subnode in enumerate(node.content):
@@ -434,17 +445,19 @@ class Processor:
                                     for kdx, subsubsubnode in enumerate(subsubnode.content):
                                         if isinstance(subsubsubnode, F23.Execution_Part):
                                             ldx = len(subsubsubnode.content) - 1
-                                            if subroutine == 'declarations':
+                                            if subroutine == 'declaration_initialization':
                                                 for stmt in self.reads_in_decleration_routine:
                                                     subsubsubnode.content.insert(ldx + 1, stmt)
                                                     ldx += 1
                                                 for stmt in self.add_to_routin:
                                                     subsubsubnode.content.insert(ldx + 1, stmt)
                                                     ldx += 1
-                                            if subroutine == 'initialization':
+                                            #if subroutine == 'initialization':
                                                 for stmt in self.reads_in_read_routine:
                                                     subsubsubnode.content.insert(ldx + 1, stmt)
                                                     ldx += 1
+                                                subsubsubnode.content.insert(ldx + 1,F23.Close_Stmt(f"close(1363)"))
+                                                ldx += 1
                                                 if self.acc_declare_create:
                                                     subsubsubnode.content.insert(ldx + 1, self.acc_update_device_cmd)
                                                     ldx += 1
@@ -455,19 +468,53 @@ class Processor:
             raise
 
     def update_main_program(self, custom_dec_inout, custom_subroutine_trees, call_stmts, \
+            dummy_add_decl, \
             error_flag, \
             acc_data_copyin,\
-            var_modif, file_path, childs_subroutine_tree=None):
+            var_modif, file_path, \
+            subroutine_name, dummy_args, module_tree, \
+            childs_subroutine_tree=None):
         try:
             self.out_main = self.out_main_fortran()
             custom_module_name = walk(walk(self.out_module,F23.Module_Stmt), F23.Name)[0].string
             custom_subroutines_names = [name.string for name in walk(walk(self.out_module,F23.Subroutine_Stmt),F23.Name)]
-            specification_part = self.remove_intent_and_save(custom_dec_inout)
+            #specification_part = self.remove_intent_and_save(custom_dec_inout)
             initialization_part = self.initialization_statement(custom_dec_inout)
             if self.dummy_list:
                 print('need to build an initialization for in/inout dummy args: ')
                 specification_part_dummy = self.remove_intent_and_save(self.dummy_list)
-                block_tree = self.generate_read_routine(specification_part_dummy, initialization_part)
+                block_tree = self.generate_read_routine(specification_part_dummy, initialization_part, subroutine_name)
+
+            custom_dec_inout.append(dummy_add_decl)
+            if error_flag.keys():
+                for key in error_flag.keys():
+                    custom_dec_inout.append(error_flag[key]['error_flag_decl'])
+            specification_part = self.remove_intent_and_save(custom_dec_inout)
+
+            if initialization_part:
+                self.write_stmt = []
+                for call in walk(module_tree, F23.Call_Stmt):
+                    assert isinstance(call.children[0], F23.Name), f"Expected F23.Name, but got {type(call.children[0])}"
+                    assert isinstance(call.children[1], F23.Actual_Arg_Spec_List), \
+                            f"Expected F23.Actual_Arg_Spec_List, but got {type(call.children[1])}"
+                    if call.children[0].tostr() == subroutine_name:
+                        arg_string = [string.strip() for string in call.children[1].tostr().split(',')]
+                        for rstmt in initialization_part:
+                            assert isinstance(rstmt.children[2], F23.Input_Item_List)
+                            assert len(rstmt.children[2].children) == 1
+                            arg = rstmt.children[2].tostr()
+                            corresponding_element = arg_string[dummy_args.index(arg)]
+                            self.write_stmt.append(F23.Write_Stmt(f"write(1363){corresponding_element}").tostr())
+                        write_dummy_code = "\n".join(self.write_stmt)
+                        code_template = (
+                                f"{call.tostr()}\n"
+                                f"open(unit=1363, file='{self.benchmark_dir}/{subroutine_name}/dummy.bin', form='unformatted', status='replace')\n"
+                                f"{write_dummy_code}\n"
+                                "close(1363)"
+                                )
+                        call.parent.children[call.parent.children.index(call)] = self.parse_fortran_statement(code_template)
+                        break
+
             for node in self.out_main.content:
                 if isinstance(node, F23.Main_Program):
                     for idx, subnode in enumerate(node.content):
@@ -486,10 +533,10 @@ class Processor:
                                 kdx += 1
                         elif isinstance(subnode, F23.Execution_Part):
                             kdx = len(subnode.content) - 1
-                            for name in custom_subroutines_names:
-                                subroutine_call = f"Call {name}"
-                                subnode.content.insert(kdx + 1, F23.Call_Stmt(subroutine_call))
-                                kdx += 1
+                            #for name in custom_subroutines_names:
+                            subroutine_call = "Call declaration_initialization"
+                            subnode.content.insert(kdx + 1, F23.Call_Stmt(subroutine_call))
+                            kdx += 1
 
                             subnode.content.insert(kdx + 1, self.create_call_stmt(block_tree))
                             kdx += 1
@@ -501,11 +548,11 @@ class Processor:
                                 subnode.content.insert(kdx + 1, F23.Assignment_Stmt(stmt_str))
                                 kdx += 1
 
-                            for name in custom_subroutines_names:
-                                if name == 'initialization':
-                                    subroutine_call = f"Call {name}"
-                                    subnode.content.insert(kdx + 1, F23.Call_Stmt(subroutine_call))
-                                    kdx += 1
+                            #for name in custom_subroutines_names:
+                            #if name == 'initialization':
+                            subroutine_call = "Call declaration_initialization"
+                            subnode.content.insert(kdx + 1, F23.Call_Stmt(subroutine_call))
+                            kdx += 1
                             subnode.content.insert(kdx + 1, self.create_call_stmt(block_tree))
                             kdx += 1
                             reductions = ''
@@ -576,9 +623,9 @@ class Processor:
             print(f"An error occurred in creating a Call_Stmt object: {e}")
             raise
 
-    def generate_read_routine(self, specification_part, initialization_part):
+    def generate_read_routine(self, specification_part, initialization_part, subroutine_name):
         try:
-            block = self.initiate_empty_routine("read_dummy")
+            block = self.initiate_empty_routine(subroutine_name)
             if hasattr(block, "content"):
                 idc = 0
                 while idc < len(block.content):
@@ -603,6 +650,8 @@ class Processor:
                         for stmt in initialization_part:
                             child.content.insert(kdx + 1, stmt)
                             kdx += 1
+                        child.content.insert(kdx + 1,F23.Close_Stmt(f"close(1363)"))
+                        kdx += 1
                     idc += 1
                 return block
         except Exception as e:
@@ -610,7 +659,7 @@ class Processor:
             raise
 
     def initialization_statement(self, items):
-        stmt_list = []
+        read_list = []
         items_sep = []
         self.dummy_list = []
         for item in items:
@@ -633,7 +682,7 @@ class Processor:
                         var_name = child.tostr()
                 if init:
                     self.dummy_list.append(item)
-                    if 'REAL' in var_type:
+                    '''if 'REAL' in var_type:
                         stmt_str = f"Call random_number({var_name})"
                     elif 'INTEGER' in var_type:
                         stmt_str = f"{var_name} = 2"
@@ -641,9 +690,13 @@ class Processor:
                         stmt_str = f"{var_name} = .TRUE."
                     else:
                         raise NotImplementedError(f"Variable type not implemented: {var_type}")
-                    stmt_list.append(self.parse_fortran_statement(stmt_str))
+                    read_list.append(self.parse_fortran_statement(stmt_str))
+                    '''
+                    read_list.append(F23.Read_Stmt(f"read(1363){var_name}"))
+                    self.write_stmt.append(F23.Write_Stmt(f"write(1363){var_name}").tostr())
+            #read_list.append(F23.Close_Stmt(f"close(1363)"))
             logging.info(f"processing initialization completed!")
-            return stmt_list
+            return read_list
         except Exception as e:
             logging.error(f"Error processing initialization: {e}")
             raise
@@ -657,6 +710,7 @@ class Processor:
             self.acc_declare_copyin = []
             self.reads_in_decleration_routine = []
             self.reads_in_read_routine = []
+            self.write_stmt = []
             for key in input_dict.keys():
                 var_in_modif = False
                 if key in var_modif:
@@ -699,10 +753,12 @@ class Processor:
                                     if isinstance(child, F23.Name):
                                         self.acc_declare_copyin.append(child.tostr())
                     if is_alo_stmt:
-                        if var_in_modif:
-                            self.add_to_routin.append(self.add_entity_to_allocation(item, var_modif))
-                        else:
-                            self.add_to_routin.append(item)
+                        #self.add_to_routin.append(item)
+                        #if var_in_modif:
+                        for allocation_stmt in self.add_entity_to_allocation(item, var_modif):
+                            self.add_to_routin.append(allocation_stmt.children[0])
+                        #else:
+                        #    self.add_to_routin.append(item)
                     if is_use_stmt:
                         self.add_to_usestm.append(item)
             self.add_to_module = self.remove_intent_and_save(self.add_to_module)

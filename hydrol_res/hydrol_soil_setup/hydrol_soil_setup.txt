@@ -1,9 +1,0 @@
-initialization:
-     62, Generating update device(g1(:,:),dz(:),e(:,:),ep(:,:),free_drain_coef(:,:),a(:,:),dt_sechiba,fp(:,:),d(:,:),f(:,:),one_day,gp(:,:))
-main:
-     20, Generating NVIDIA GPU code
-         21, !$acc loop gang, vector(128) ! blockidx%x threadidx%x
-     25, Generating update self(g1(:,:),gp(:,:),e(:,:),ep(:,:),fp(:,:),f(:,:))
-hydrol_soil_setup_acc:
-    106, Generating acc routine seq
-         Generating NVIDIA GPU code

@@ -1,98 +1,140 @@
+import re
 
-def find_break_point(line, max_index, key_list):
-    ''' find the most appropriate break point for a fortran line '''
+class FortLineLength:
+    """
+    This class processes a free-format Fortran code string, ensuring that any lines 
+    longer than the specified maximum line length are wrapped appropriately, using 
+    continuation characters based on the line type (e.g., statement, OpenMP, OpenACC, comment).
+    
+    Attributes:
+        _line_length (int): The maximum allowed line length for Fortran code.
+        _cont_start (dict): The starting continuation characters for different line types.
+        _cont_end (dict): The ending continuation characters for different line types.
+        _key_lists (dict): List of break-point keywords for different line types.
+        _stat (re.Pattern): Regex to match standard Fortran statements.
+        _omp (re.Pattern): Regex to match OpenMP directives.
+        _acc (re.Pattern): Regex to match OpenACC directives.
+        _comment (re.Pattern): Regex to match comments in the Fortran code.
+    """
 
-    for key in key_list:
-        idx = line.rfind(key, 0, max_index)
-        if idx > 0:
-            return idx+len(key)
-    raise Exception(
-        "Error in find_break_point. No suitable break point found"
-        " for line '" + line[:max_index] + "' and keys '" +
-        str(key_list) + "'")
-
-
-class FortLineLength():
-
-    ''' This class take a free format fortran code as a string and
-    line wraps any lines that are larger than the specified line
-    length'''
-
-    # pylint: disable=too-many-instance-attributes
     def __init__(self, line_length=132):
+        """
+        Initializes the FortLineLength class with a specified maximum line length.
+
+        Args:
+            line_length (int): Maximum allowed line length, default is 132.
+        """
         self._line_length = line_length
-        self._cont_start = {"statement": "&",
-                            "openmp_directive": "!$omp& ",
-                            "openacc_directive": "!$acc& ",
-                            "comment": "!& ",
-                            "unknown": "&"}
-        self._cont_end = {"statement": "&",
-                          "openmp_directive": " &",
-                          "openacc_directive": " &",
-                          "comment": "",
-                          "unknown": "&"}
-        self._key_lists = {"statement": [", ", ",", " "],
-                           "openmp_directive": [" ", ",", ")", "="],
-                           "openacc_directive": [" ", ",", ")", "="],
-                           "comment": [" ", ".", ","],
-                           "unknown": [" ", ",", "=", "+", ")"]}
-        import re
-        self._stat = re.compile(r'^\s*(INTEGER|REAL|TYPE|CALL|SUBROUTINE|USE)',
-                                flags=re.I)
+        self._cont_start = {
+            "statement": "&",
+            "openmp_directive": "!$OMP& ",
+            "openacc_directive": "!$ACC& ",
+            "comment": "!& ",
+            "unknown": "&"
+        }
+        self._cont_end = {
+            "statement": "&",
+            "openmp_directive": " &",
+            "openacc_directive": " &",
+            "comment": "",
+            "unknown": "&"
+        }
+        self._key_lists = {
+            "statement": [", ", ",", " "],
+            "openmp_directive": [" ", ",", ")", "="],
+            "openacc_directive": [" ", ",", ")", "="],
+            "comment": [" ", ".", ",", "="],
+            "unknown": [" ", ",", "=", "+", ")"]
+        }
+        self._stat = re.compile(r'^\s*(INTEGER|REAL|TYPE|CALL|SUBROUTINE|USE)', flags=re.I)
         self._omp = re.compile(r'^\s*!\$OMP', flags=re.I)
         self._acc = re.compile(r'^\s*!\$ACC', flags=re.I)
         self._comment = re.compile(r'^\s*!')
 
+    def find_break_point(self, line, max_index, key_list):
+        """
+        Finds the most appropriate break point for a Fortran line based on a list of keywords.
+
+        Args:
+            line (str): The Fortran code line.
+            max_index (int): The maximum index up to which the break point should be found.
+            key_list (list): List of keywords that can serve as break points.
+        
+        Returns:
+            int: The index where the break point occurs.
+
+        Raises:
+            Exception: If no suitable break point is found within the allowed range.
+        """
+        for key in key_list:
+            idx = line.rfind(key, 0, max_index)
+            if idx > 0:
+                return idx + len(key)
+        raise Exception(
+            "Error in find_break_point. No suitable break point found for line '"
+            + line[:max_index] + "' and keys '" + str(key_list) + "'"
+        )
+
     def long_lines(self, fortran_in):
-        '''returns true if at least one of the lines in the input code is
-           longer than the allowed length. Otherwise returns false '''
+        """
+        Checks if any line in the input Fortran code exceeds the maximum allowed line length.
+
+        Args:
+            fortran_in (str): The Fortran code as a string.
+        
+        Returns:
+            bool: True if at least one line is longer than the allowed length, False otherwise.
+        """
         for line in fortran_in.split('\n'):
             if len(line) > self._line_length:
                 return True
         return False
 
-    @property
-    def length(self):
-        ''' returns the maximum allowed line length'''
-        return self._line_length
-
     def process(self, fortran_in):
-        ''' takes fortran code as a string as input and output fortran
-        code as a string with any long lines wrapped appropriately '''
+        """
+        Processes the input Fortran code and wraps lines that exceed the maximum allowed length.
 
+        Args:
+            fortran_in (str): The input Fortran code as a string.
+        
+        Returns:
+            str: The processed Fortran code with long lines wrapped appropriately.
+        """
         fortran_out = ""
         for line in fortran_in.split('\n'):
             if len(line) > self._line_length:
                 line_type = self._get_line_type(line)
-
                 c_start = self._cont_start[line_type]
                 c_end = self._cont_end[line_type]
                 key_list = self._key_lists[line_type]
 
-                break_point = find_break_point(
-                    line, self._line_length-len(c_end), key_list)
+                break_point = self.find_break_point(line, self._line_length - len(c_end), key_list)
                 fortran_out += line[:break_point] + c_end + "\n"
                 line = line[break_point:]
+                
                 while len(line) + len(c_start) > self._line_length:
-                    break_point = find_break_point(
-                        line, self._line_length-len(c_end)-len(c_start),
-                        key_list)
+                    break_point = self.find_break_point(line, self._line_length - len(c_end) - len(c_start), key_list)
                     fortran_out += c_start + line[:break_point] + c_end + "\n"
                     line = line[break_point:]
+
                 if line:
                     fortran_out += c_start + line + "\n"
             else:
                 fortran_out += line + "\n"
 
-        # We add an extra newline so remove it when we return
+        # Remove the extra newline at the end
         return fortran_out[:-1]
 
     def _get_line_type(self, line):
-        ''' Classes lines into diffrent types. This is required as
-        directives need different continuation characters to fortran
-        statements. It also enables us to know a little about the
-        structure of the line which could be useful at some point.'''
+        """
+        Determines the type of a Fortran line (statement, OpenMP directive, OpenACC directive, or comment).
 
+        Args:
+            line (str): A single Fortran code line.
+        
+        Returns:
+            str: The line type, either 'statement', 'openmp_directive', 'openacc_directive', 'comment', or 'unknown'.
+        """
         if self._stat.match(line):
             return "statement"
         if self._omp.match(line):

@@ -26,7 +26,7 @@ class Modifier:
         var_declared (set): A set of declared variables in the code.
         imp_shape (list): A list containing the shapes of implicit arrays.
         allowed_external_subroutines (list): A list of allowed external subroutines.
-        var_global (dict): Stores global variables for the Fortran code being processed.
+        var_local (dict): Stores global variables for the Fortran code being processed.
         seen (set): A set to track visited nodes during the traversal of expressions.
         arrays_queue (collections.deque): A queue to store arrays during expression traversal.
         error_flag (dict): Flags for error handling in child nodes.
@@ -50,12 +50,12 @@ class Modifier:
         create_act_call_stmt(subroutine_stmt):
             Creates and modifies a call statement for a subroutine with dummy arguments and vector dimensions.
     """
-    def __init__(self, all_array_info, loop_dict, var_declared, imp_shape, io_subroutines, var_global,\
+    def __init__(self, all_array_info, loop_dict, var_declared, imp_shape, io_subroutines, var_local,\
             within_calls=None, child_error_flag=None):
         self.all_array_info = all_array_info
         self.loop_dict = loop_dict
         self.var_declared = var_declared
-        self.var_global = var_global
+        self.var_local = var_local
         self.imp_shape = imp_shape
         self.within_calls = within_calls
         self.child_error_flag = child_error_flag
@@ -68,6 +68,9 @@ class Modifier:
         self.vector_loop = F23.Nonlabel_Do_Stmt('DO ji = 1, kjpindex')
         self.dummy_add = self.vector_loop.tostr().split('=')[0].split()[-1]
         self.unsupported_functions = ['MINLOC', 'MAXLOC']
+        self.fortran_math_functions_no_dim = ["ABS", "SQRT", "EXP", "LOG", "SIN", "COS",\
+                "TAN", "ASIN", "ACOS", "ATAN", "MOD", "SIGN", "MAX", "MIN", "FLOOR",\
+                "CEILING", "NINT", "RAND"]
         self.gpu_unsupported_decl = []
     def contains_unsupported_function(self, assignment_stmt):
         """
@@ -95,7 +98,13 @@ class Modifier:
         try:
             if isinstance(node, F23.Part_Ref):
                 part_refs = walk(node.children, F23.Part_Ref)
+                self.arrays_queue.append(node)
+                #if hasattr(node, 'children'):
                 if part_refs:
+                    for part_ref in part_refs:
+                        self.arrays_queue.append(part_ref)
+                        #self.traverse_expression(child)
+                '''if part_refs:
                     print(f"There is indirect addressing in {node.tostr()}")
                     section_subscript_lists = [gc for gc in node.children if isinstance(gc, F23.Section_Subscript_List)]
                     for ssl in section_subscript_lists:
@@ -104,6 +113,7 @@ class Modifier:
                             self.arrays_queue.append(part_ref)
                 else:
                     self.arrays_queue.append(node)
+                '''
             elif isinstance(node, F23.Name):
                 name_str = node.tostr()
                 if (name_str in self.all_array_info.keys() and
@@ -207,6 +217,8 @@ class Modifier:
         try:
             intrinsic_name = {}
             for intrinsic in walk(stmt, F23.Intrinsic_Name):
+                if intrinsic.tostr() in self.fortran_math_functions_no_dim:
+                    continue
                 intrinsic_parent = intrinsic.parent.tostr()
                 if intrinsic_parent not in intrinsic_name:
                     dict_list = []
@@ -384,7 +396,7 @@ class Modifier:
             for child in node.children:
                 if isinstance(child, F23.Name):
                     array_name = child.tostr()
-                    if array_name not in self.var_global and array_name not in self.dummy_arg_list:
+                    if array_name in self.var_local:
                         print(f"Array '{array_name}' is a local array and the vector dim will be removed!")
                     else:
                         print(f"Array '{array_name}' is a global/dummy array and the vector dim will be kept!")
@@ -765,7 +777,7 @@ class Modifier:
                         assert len(entity_decls) == 1,\
                                 "walk(declaration_stmt, F23.Entity_Decl), but got a different number."
                         entity_decl = entity_decls[0].tostr()
-                        if entity_decl in self.dummy_arg_list or not walk(declaration_stmt, F23.Explicit_Shape_Spec_List):
+                        if entity_decl not in self.var_local or not walk(declaration_stmt, F23.Explicit_Shape_Spec_List):
                             idc += 1
                             continue
                         block.content[idc] = self.traverse_declaration_stmt(declaration_stmt)
@@ -865,7 +877,7 @@ class Modifier:
             self.traverse_expression(assignment_stmt)
             intrinsic_name = self.extract_intrinsic_names(assignment_stmt)
             input_stmt = assignment_stmt.tostr()
-
+            
             while self.arrays_queue:
                 node = self.arrays_queue.popleft()
                 if ':' in node.tostr() and isinstance(node, F23.Part_Ref):
@@ -1131,6 +1143,10 @@ class Modifier:
                         if walk(child, F23.Write_Stmt):
                             del block.content[idc]
                             continue
+                        else:
+                            code = f"IF({child.children[0]})THEN\n{child.children[1]}\nENDIF\n"
+                            block.content[idc] = Processor().parse_fortran_statement(code)
+                            idc -= 1
                     elif isinstance(child, F23.Return_Stmt):
                         if isinstance(block.content[idc+2], F23.End_If_Stmt):
                             block.content[idc+2] = F23.Else_Stmt("ELSE")
@@ -1274,8 +1290,9 @@ def main():
     file_path = './org.f90'
     Processor().write_fortran_code_to_file(parse_tree, file_path)
     all_array_info = cls.extract_array_info(cls.dec_global, cls.var_dummy)
+    local_var_child = cls.extract_names(cls.var_local)
     modifier = Modifier(all_array_info, cls.loop_dict, cls.var_declared, cls.imp_shape,
-                                  cls.allowed_external_subroutines, cls.var_global)
+                                  cls.allowed_external_subroutines, local_var_child)
     parse_tree = modifier.replace_gpu_unsupported(parse_tree)
     modified_block = modifier.merge_vector_loop(parse_tree)
     assert modifier.do_index == 0 and modifier.enddo_index == 0, (
@@ -1288,16 +1305,16 @@ def main():
 
 if __name__ == "__main__":
     # Initialize SubroutineFinder with paths to module directory and module tree.
-    cls = Extractor(processor.module_dir_sp, processor.module_tree_sp)
+    '''cls = Extractor(isolator.module_dir_sp, isolator.module_tree_sp)
     cls.find_subroutines()
-    subroutine_key = 'hydrol_alma'
+    subroutine_key = 'hydrol_soil_froz'
     subroutine_tree = cls.subroutines[subroutine_key]
     cls.find_variables(subroutine_tree, subroutine_key)
     cls.dec_global = {}
     cls.dec_child = {}
-    cls.find_global_variables(processor.module_dir_sp, processor.module_tree_sp, cls.var_global)
+    cls.find_global_variables(isolator.module_dir_sp, isolator.module_tree_sp, cls.var_global)
     cls.extract_loop_indices()
-    
+    '''
     # Call the main function to process the Fortran code.
     main()
 

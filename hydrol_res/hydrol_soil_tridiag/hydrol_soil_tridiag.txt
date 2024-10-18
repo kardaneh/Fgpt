@@ -1,9 +1,0 @@
-initialization:
-     33, Generating update device(resolv(:),tmat(:,:,:),rhs(:,:),mcl(:,:,:))
-main:
-     15, Generating NVIDIA GPU code
-         16, !$acc loop gang, vector(128) ! blockidx%x threadidx%x
-     20, Generating update self(mcl(:,:,:))
-hydrol_soil_tridiag_acc:
-     52, Generating acc routine seq
-         Generating NVIDIA GPU code

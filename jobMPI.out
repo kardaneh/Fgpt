@@ -1,0 +1,177 @@
+Unloading profile/base
+  ERROR: Module evaluation aborted
+Loading openmpi/4.1.4--nvhpc--23.1-cuda-11.8
+  Loading requirement: zlib/1.2.13--gcc--11.3.0
+Loading netcdf-fortran/4.6.0--openmpi--4.1.4--nvhpc--23.1
+  Loading requirement: parallel-netcdf/1.12.3--openmpi--4.1.4--nvhpc--23.1
+    netcdf-c/4.9.0--openmpi--4.1.4--nvhpc--23.1
+ --- inside the main program ---
+ --- add the declarations in module global ---
+ --- initialization of global variables in module global ---
+ --- inside the routine read_dummy ---
+ --- end the routine read_dummy ---
+ //////////// End of hydrol_soil
+   0.4447090625762939     
+ --- initialization of global variables in module global ---
+ --- inside the routine read_dummy ---
+ --- end the routine read_dummy ---
+   0.2302191257476807     
+ 
+ Test failed: All elements in mc_gpu do not match mc_cpu.
+Maximum absolute error:   0.3211316115864142E+10
+Min and Max of mc_gpu:  -0.1659985179217770E+11   0.1599183812451919E+02
+Min and Max of mc_cpu:  -0.1659985179217770E+11   0.1599183949276875E+02
+ 
+ Test passed: All elements in profil_froz_hydro_ns_gpu are equal to profil_froz_hydro_ns_cpu.
+ Test passed: All elements in kfact_root_gpu are equal to kfact_root_cpu.
+ 
+ Test failed: All elements in mcl_gpu do not match mcl_cpu.
+Maximum absolute error:   0.1605658057932071E+10
+Min and Max of mcl_gpu:  -0.8299925896088851E+10   0.7995919062259595E+01
+Min and Max of mcl_cpu:  -0.8299925896088851E+10   0.7995919746384375E+01
+ 
+ Test passed: All elements in tmat_gpu are equal to tmat_cpu.
+ 
+ Test failed: All elements in rhs_gpu do not match rhs_cpu.
+Maximum absolute error:   0.6245438432641011E+09
+Min and Max of rhs_gpu:  -0.6245438415959531E+09   0.3291758784334216E+01
+Min and Max of rhs_cpu:  -0.1454451723942705E+05   0.3295553513201027E+01
+ 
+ 
+ LOGICAL EQV test failed: Not all elements in resolv_gpu match resolv_cpu.
+ 
+ 
+ Test failed: All elements in dr_ns_gpu do not match dr_ns_cpu.
+Maximum absolute error:   0.8278016606093725E+00
+Min and Max of dr_ns_gpu:   0.0000000000000000E+00   0.3079722817714529E+01
+Min and Max of dr_ns_cpu:   0.0000000000000000E+00   0.3089218143822483E+01
+ 
+ 
+ Test failed: All elements in tmc_gpu do not match tmc_cpu.
+Maximum absolute error:   0.3670489619016155E+10
+Min and Max of tmc_gpu:  -0.1897260483052677E+11   0.2083312629879791E+05
+Min and Max of tmc_cpu:  -0.1897260483052677E+11   0.9735665360434145E+05
+ 
+ 
+ Test failed: All elements in soil_wet_ns_gpu do not match soil_wet_ns_cpu.
+Maximum absolute error:   0.1000000000000000E+01
+Min and Max of soil_wet_ns_gpu:   0.0000000000000000E+00   0.1000000000000000E+01
+Min and Max of soil_wet_ns_cpu:   0.0000000000000000E+00   0.1000000000000000E+01
+ 
+ 
+ Test failed: All elements in humrelv_gpu do not match humrelv_cpu.
+Maximum absolute error:   0.2000000000000000E+01
+Min and Max of humrelv_gpu:   0.0000000000000000E+00   0.2000000000000000E+01
+Min and Max of humrelv_cpu:   0.0000000000000000E+00   0.2000000000000000E+01
+ 
+ 
+ Test failed: All elements in ae_ns_gpu do not match ae_ns_cpu.
+Maximum absolute error:   0.2917684328712072E+06
+Min and Max of ae_ns_gpu:   0.6928034651639542E-05   0.2917684823053422E+06
+Min and Max of ae_ns_cpu:   0.6928034651639542E-05   0.1994149959937230E+01
+ 
+ 
+ Test failed: All elements in soil_wet_litter_gpu do not match soil_wet_litter_cpu.
+Maximum absolute error:   0.1000000000000000E+01
+Min and Max of soil_wet_litter_gpu:   0.0000000000000000E+00   0.1000000000000000E+01
+Min and Max of soil_wet_litter_cpu:   0.0000000000000000E+00   0.1000000000000000E+01
+ 
+ 
+ Test failed: All elements in tmc_litter_gpu do not match tmc_litter_cpu.
+Maximum absolute error:   0.4965121454398447E+09
+Min and Max of tmc_litter_gpu:  -0.2566557683610568E+10   0.1542814291367628E+01
+Min and Max of tmc_litter_cpu:  -0.2566557683610568E+10   0.1560936825963171E+01
+ 
+ 
+ Test failed: All elements in ru_ns_gpu do not match ru_ns_cpu.
+Maximum absolute error:   0.1353808866727137E+06
+Min and Max of ru_ns_gpu:   0.0000000000000000E+00   0.1800586947968759E+06
+Min and Max of ru_ns_cpu:   0.0000000000000000E+00   0.1800586947968759E+06
+ 
+ 
+ Test failed: All elements in vegstressv_gpu do not match vegstressv_cpu.
+Maximum absolute error:   0.1000000000000000E+01
+Min and Max of vegstressv_gpu:   0.0000000000000000E+00   0.1000000000000000E+01
+Min and Max of vegstressv_cpu:   0.0000000000000000E+00   0.1000000000000000E+01
+ 
+ Test passed: All elements in qflux_ns_gpu are equal to qflux_ns_cpu.
+ 
+ Test failed: All elements in srhs_gpu do not match srhs_cpu.
+Maximum absolute error:   0.6245438432641011E+09
+Min and Max of srhs_gpu:  -0.6245438415959531E+09   0.3291758784334216E+01
+Min and Max of srhs_cpu:  -0.1454451723942705E+05   0.3295553513201027E+01
+ 
+ 
+ Test failed: All elements in kk_gpu do not match kk_cpu.
+Maximum absolute error:   0.8520697996240498E+00
+Min and Max of kk_gpu:   0.2225256551362471E-01   0.1978429186855720E+01
+Min and Max of kk_cpu:   0.2225256551362471E-01   0.1978429186855720E+01
+ 
+ 
+ Test failed: All elements in kk_moy_gpu do not match kk_moy_cpu.
+Maximum absolute error:   0.3669435728262491E+00
+Min and Max of kk_moy_gpu:   0.3779945103788710E-01   0.5141513103529256E+01
+Min and Max of kk_moy_cpu:   0.3779945103788710E-01   0.5141513103529256E+01
+ 
+ 
+ Test failed: All elements in undermcr_gpu do not match undermcr_cpu.
+Maximum absolute error:   0.2000000000000000E+01
+Min and Max of undermcr_gpu:   0.1000000000000000E+01   0.3000000000000000E+01
+Min and Max of undermcr_cpu:   0.1000000000000000E+01   0.3000000000000000E+01
+ 
+ 
+ Test failed: All elements in water2infilt_gpu do not match water2infilt_cpu.
+Maximum absolute error:   0.4867239035339581E+05
+Min and Max of water2infilt_gpu:   0.0000000000000000E+00   0.2141884166099156E+06
+Min and Max of water2infilt_cpu:   0.0000000000000000E+00   0.2141884166099156E+06
+ 
+ Test passed: All elements in stmat_gpu are equal to stmat_cpu.
+ 
+ Test failed: All elements in evap_bare_lim_gpu do not match evap_bare_lim_cpu.
+Maximum absolute error:   0.1133703450638006E+01
+Min and Max of evap_bare_lim_gpu:   0.0000000000000000E+00   0.9617221341928093E+00
+Min and Max of evap_bare_lim_cpu:   0.0000000000000000E+00   0.1224046288494385E+01
+ 
+ 
+ Test failed: All elements in evap_bare_lim_ns_gpu do not match evap_bare_lim_ns_cpu.
+Maximum absolute error:   0.1000000000000000E+01
+Min and Max of evap_bare_lim_ns_gpu:   0.0000000000000000E+00   0.1000000000000000E+01
+Min and Max of evap_bare_lim_ns_cpu:   0.0000000000000000E+00   0.1000000000000000E+01
+ 
+ 
+ Test failed: All elements in mc_layh_gpu do not match mc_layh_cpu.
+Maximum absolute error:   0.2345290891784884E+04
+Min and Max of mc_layh_gpu:  -0.9289704804335887E+05  -0.2634430423687041E+05
+Min and Max of mc_layh_cpu:  -0.9289704804335887E+05  -0.2634430423687041E+05
+ 
+ 
+ Test failed: All elements in mcl_layh_gpu do not match mcl_layh_cpu.
+Maximum absolute error:   0.2345290891784884E+04
+Min and Max of mcl_layh_gpu:  -0.9289704804335887E+05  -0.2634430423687041E+05
+Min and Max of mcl_layh_cpu:  -0.9289704804335887E+05  -0.2634430423687041E+05
+ 
+ 
+ Test failed: All elements in mc_layh_s_gpu do not match mc_layh_s_cpu.
+Maximum absolute error:   0.4014145144830177E+09
+Min and Max of mc_layh_s_gpu:  -0.2074981474022213E+10   0.1998979765564899E+01
+Min and Max of mc_layh_s_cpu:  -0.2074981474022213E+10   0.1998979936596094E+01
+ 
+ 
+ Test failed: All elements in mcl_layh_s_gpu do not match mcl_layh_s_cpu.
+Maximum absolute error:   0.4014145144830177E+09
+Min and Max of mcl_layh_s_gpu:  -0.2074981474022213E+10   0.1998979765564899E+01
+Min and Max of mcl_layh_s_cpu:  -0.2074981474022213E+10   0.1998979936596094E+01
+ 
+ Test passed: All elements in root_deficit_gpu are equal to root_deficit_cpu.
+ 
+ Test failed: All elements in ksoil_gpu do not match ksoil_cpu.
+Maximum absolute error:   0.3835485741420948E+01
+Min and Max of ksoil_gpu:   0.1909217779817807E-01   0.4887677506345352E+01
+Min and Max of ksoil_cpu:   0.1909217779817807E-01   0.4887677888690225E+01
+ 
+ 
+ Test failed: All elements in us_gpu do not match us_cpu.
+Maximum absolute error:   0.2000000000000000E+01
+Min and Max of us_gpu:   0.0000000000000000E+00   0.2000000000000000E+01
+Min and Max of us_cpu:   0.0000000000000000E+00   0.2000000000000000E+01
+ 
