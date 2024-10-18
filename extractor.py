@@ -51,7 +51,7 @@ class Extractor:
             self.call_subroutines = {}
             self.call_within_sub = {}
             self.loop_dict = {}
-            self.exclude = {'kjpindex', 'nslm', 'nstm', 'nvm', 'DIM', 'MASK', 'next_calc_loop'}
+            self.exclude = {'kjpindex', 'nslm', 'nstm', 'nvm', 'nsnow', 'DIM', 'MASK', 'next_calc_loop'}
             self.cases_to_exclude = ['clear', 'finalize', 'init', 'initialize', 'read']
             self.allowed_external_subroutines = {'ipslerr_p', 'xios_orchidee_send_field'}
             self.dec_global = {}
@@ -123,6 +123,27 @@ class Extractor:
         self.external_subroutines = {item for item in self.actual_arg_spec_list.keys() \
                 if item not in self.dummy_arg_list.keys()}
 
+    def extract_names(self, var_local):
+        """
+        Extracts variable names from the given list of local variables 
+        and stores them in the var_local_names set, resetting the set each time.
+        
+        Args:
+            var_local (list): A list of local variables, where each item is 
+                              a Fortran code structure.
+        
+        Raises:
+            Exception: Captures and prints any exceptions encountered during
+                       the name extraction process.
+        """
+        var_local_names = set() 
+        for item in var_local:
+            for entity in walk(item, F23.Entity_Decl):
+                for child in entity.children:
+                    if isinstance(child, F23.Name):
+                        var_local_names.add(child.tostr())
+        return var_local_names
+
     def find_variables(self, subroutine_tree, subroutine_name):
         self.var_global = set()
         self.var_in_local = set()
@@ -179,6 +200,8 @@ class Extractor:
         self.var_global -= self.exclude
         shapes -= self.exclude
         self.var_global.update(shapes)
+
+        #self.extract_names(self.var_local)
 
         for stmt in walk(subroutine_tree, F23.Execution_Part):
             for assign_stmt in walk(stmt, F23.Assignment_Stmt):
