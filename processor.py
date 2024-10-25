@@ -812,8 +812,19 @@ class Processor:
                 os.system("make clean -f {}".format(os.path.join(base_dir, "Makefile")))
                 os.system("make -f {}".format(os.path.join(base_dir, "Makefile")))
                 if os.path.exists(subdir):
-                    os.system("./{}".format(subdir))
-                    print('\033[32m' + f"Compilation and execution completed in {subdir_path}" + '\033[0m')
+                    print('\033[32m' + "Compilation process completed!" + '\033[0m')
+                    dummy_bin = os.path.join(self.benchmark_dir, subdir, "dummy.bin")
+                    global_bin = os.path.join(self.benchmark_dir, subdir, "global.bin")
+                    if os.path.exists(dummy_bin) and os.path.exists(global_bin):
+                        print('\033[32m' + "Benchmark files exist. Now running the unit tests ..." + '\033[0m')
+                        os.system("./{}".format(subdir))
+                        print('\033[32m' + f"Execution completed in {subdir_path}" + '\033[0m')
+                    else:
+                         if not os.path.exists(dummy_bin):
+                             print('\033[31m' + f"Missing file: {dummy_bin}" + '\033[0m')
+                         if not os.path.exists(global_bin):
+                             print('\033[31m' + f"Missing file: {global_bin}" + '\033[0m')
+                         print('\033[31m' + f"Benchmark files do not exist yet. Run the modified main code and then python executive.py " + '\033[0m')
                 else:
                     print('\033[31m' + "Compilation failed or main_program not generated." + '\033[0m')
                     return 1

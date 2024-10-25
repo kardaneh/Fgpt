@@ -289,12 +289,10 @@ class Isolator:
             self.parent_subroutine_call = set()
             self.separate_parent_subroutine(cls, subroutine)
         '''
-        '''subs = ['hydrol_diag_soil','hydrol_diag_soil_flux','hydrol_nudge_mc','hydrol_root_profile',
+        subs = ['hydrol_diag_soil','hydrol_diag_soil_flux','hydrol_nudge_mc','hydrol_root_profile',
                 'hydrol_soil_coef','hydrol_soil_froz','hydrol_soil_infilt','hydrol_soil_setup',
                 'hydrol_soil_smooth_over_mcs2','hydrol_soil_smooth_under_mcr','hydrol_soil_tridiag',
                 'hydrol_split_soil']
-        '''
-        subs = ['hydrol_diag_soil']
         for subroutine in subs:
             self.separate_child_subroutine(cls, subroutine)
         
@@ -306,7 +304,7 @@ class Isolator:
 if __name__ == "__main__":
     rest_of_path = "modipsl_truck_opt/modeles/ORCHIDEE/src_sechiba/"
     target_module = "hydrol"
-    work = os.getenv("WORK")
+    work = os.getenv("work")
     isolator = Isolator(rest_of_path, target_module, work)
     isolator.run()
 
