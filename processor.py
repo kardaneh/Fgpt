@@ -298,11 +298,12 @@ class Processor:
         integer, parameter :: r_std = 8
         integer(kind = i_std), parameter :: nsnow=3
         integer(kind = i_std), parameter :: nslm=11
-        integer(kind = i_std), parameter :: nvm = 13
+        integer(kind = i_std), parameter :: nvm = 15
         integer(kind = i_std), parameter :: nstm = 3
-        integer(kind = i_std), parameter :: kjpindex = 4716
+        integer(kind = i_std), parameter :: kjpindex = 4717
         integer                          :: ier
-        integer                          :: seed(64) = 1
+        integer(kind = i_std)            :: ic0, ic
+        real(kind = r_std)               :: icr, start_time, stop_time
         contains
         subroutine declaration_initialization()
         open(unit=1363, file='{self.benchmark_dir}/{subroutine_name}/global.bin', form='unformatted', status='old')
@@ -500,9 +501,9 @@ class Processor:
                     if call.children[0].tostr() == subroutine_name:
                         arg_string = [string.strip() for string in call.children[1].tostr().split(',')]
                         for rstmt in initialization_part:
-                            assert isinstance(rstmt.children[2], F23.Input_Item_List)
-                            assert len(rstmt.children[2].children) == 1
-                            arg = rstmt.children[2].tostr()
+                            assert isinstance(rstmt.children[0].children[2], F23.Input_Item_List)
+                            assert len(rstmt.children[0].children[2].children) == 1
+                            arg = rstmt.children[0].children[2].tostr()
                             corresponding_element = arg_string[dummy_args.index(arg)]
                             self.write_stmt.append(F23.Write_Stmt(f"write(1363){corresponding_element}").tostr())
                         write_dummy_code = "\n".join(self.write_stmt)
@@ -540,7 +541,25 @@ class Processor:
 
                             subnode.content.insert(kdx + 1, self.create_call_stmt(block_tree))
                             kdx += 1
+
+                            code_start = """
+                            call SYSTEM_CLOCK(ic0, icr, ic)
+                            start_time = ic0*1.0/icr
+                            """
+
+                            subnode.content.insert(kdx + 1, self.parse_fortran_statement(code_start))
+                            kdx += 1
+
                             subnode.content.insert(kdx + 1, call_stmts[0])
+                            kdx += 1
+
+                            code_end = """
+                            call SYSTEM_CLOCK(ic0, icr, ic)
+                            stop_time = ic0*1.0/icr
+                            WRITE(*,*) "Execution time : ",stop_time - start_time
+                            """
+
+                            subnode.content.insert(kdx + 1, self.parse_fortran_statement(code_end))
                             kdx += 1
 
                             for modified_var in var_modif:
@@ -571,12 +590,20 @@ class Processor:
                                 kdx += 1
                             acc_kernels_cmd, acc_end_kernels_cmd = Processor().parse_fortran_comment(f"!$ACC PARALLEL LOOP INDEPENDENT {reductions}"),\
                                     Processor().parse_fortran_comment(f"!$ACC END PARALLEL")
+
+                            subnode.content.insert(kdx + 1, self.parse_fortran_statement(code_start))
+                            kdx += 1
+
                             subnode.content.insert(kdx + 1, acc_kernels_cmd)
                             kdx += 1
                             subnode.content.insert(kdx + 1, call_stmts[1])
                             kdx += 1
                             subnode.content.insert(kdx + 1, acc_end_kernels_cmd)
                             kdx += 1
+
+                            subnode.content.insert(kdx + 1, self.parse_fortran_statement(code_end))
+                            kdx += 1
+
                             acc_update_self_str = ', '.join([modified_var for modified_var in var_modif])# \
                                     #if modified_var in self.acc_declare_create])
                             acc_update_self_cmd = self.parse_fortran_comment(f"!$ACC UPDATE SELF({acc_update_self_str})")
@@ -692,7 +719,14 @@ class Processor:
                         raise NotImplementedError(f"Variable type not implemented: {var_type}")
                     read_list.append(self.parse_fortran_statement(stmt_str))
                     '''
-                    read_list.append(F23.Read_Stmt(f"read(1363){var_name}"))
+                    code_template = f"""
+                    read(1363, iostat = ier){var_name}
+                    if (ier /= 0) then
+                    write(*,*) 'Error reading from file for {var_name}. ',' IOSTAT : ', ier
+                    endif
+                    """
+                    read_list.append(self.parse_fortran_statement(code_template))
+                    #read_list.append(F23.Read_Stmt(f"read(1363){var_name}"))
                     self.write_stmt.append(F23.Write_Stmt(f"write(1363){var_name}").tostr())
             #read_list.append(F23.Close_Stmt(f"close(1363)"))
             logging.info(f"processing initialization completed!")
@@ -801,13 +835,14 @@ class Processor:
             logging.error(f"An error occurred while processing the queue: {e}")
             raise
 
-    def compile_and_run(self, base_dir, modules_dir):
+    def compile_and_run(self, base_dir, modules_dir, mode="CPU"):
         target_module_dir_path = os.path.join(base_dir, modules_dir)
         for subdir in os.listdir(target_module_dir_path):
             subdir_path = os.path.join(target_module_dir_path, subdir)
             if os.path.isdir(subdir_path):
                 print('\033[32m' + f"Compiling and running in {subdir_path}..." + '\033[0m')
                 os.environ["SUBDIR_PATH"] = subdir_path
+                os.environ["MODE"] = mode
                 os.chdir(subdir_path)
                 os.system("make clean -f {}".format(os.path.join(base_dir, "Makefile")))
                 os.system("make -f {}".format(os.path.join(base_dir, "Makefile")))

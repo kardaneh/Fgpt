@@ -71,8 +71,8 @@ class Isolator:
             self.module_file_sp =  self.path_to_target
         self.processor_sp = Processor()
         self.module_tree_sp = self.processor_sp.parse_fortran_file(self.module_file_sp)
-        #self.module_string = self.module_tree_sp.tostr()
-        #self.module_tree_cp = self.processor_sp.parse_fortran_string(self.module_string)
+        self.module_string = self.module_tree_sp.tostr()
+        self.module_tree_cp = self.processor_sp.parse_fortran_string(self.module_string)
         self.target_module_dir = os.path.join(os.getcwd(), self.target_module.split('.')[0])
         self.global_vars_decl_sp = {}
         self.child_subroutine_call_sp = {}
@@ -88,11 +88,11 @@ class Isolator:
         os.makedirs(self.target_module_dir)
 
     def separate_child_subroutine(self, cls, child_subroutine_key, local_var_parent=None):
-        assert os.path.exists(self.processor_sp.benchmark_dir), "benchmark directory does not exist!"
+        '''assert os.path.exists(self.processor_sp.benchmark_dir), "benchmark directory does not exist!"
         sub_dir = os.path.join(self.processor_sp.benchmark_dir, child_subroutine_key)
         os.makedirs(sub_dir, exist_ok=True)
         logging.info(f"{child_subroutine_key} directory created inside benchmark: {sub_dir}")
-
+        '''
         dummy_as_local = set() 
         if local_var_parent is not None:
             for actual_arg_list in cls.actual_arg_spec_list[child_subroutine_key]:
@@ -150,6 +150,12 @@ class Isolator:
         modified_subroutine_tree = modifier.add_vector_loop(modified_block)
 
         if not dummy_as_local:
+
+            assert os.path.exists(self.processor_sp.benchmark_dir), "benchmark directory does not exist!"
+            sub_dir = os.path.join(self.processor_sp.benchmark_dir, child_subroutine_key)
+            os.makedirs(sub_dir, exist_ok=True)
+            logging.info(f"{child_subroutine_key} directory created inside benchmark: {sub_dir}")
+
             subroutine_dir = os.path.join(self.target_module_dir, child_subroutine_key)
             os.makedirs(subroutine_dir)
 
@@ -158,7 +164,7 @@ class Isolator:
         
             self.processor_sp.add_declarations(cls.dec_global, cls.var_modif_info)
             file_path = os.path.join(subroutine_dir, self.module_global_file)
-            self.processor_sp.update_global_module(cls.dec_global, file_path, child_subroutine_key, self.module_tree_sp)
+            self.processor_sp.update_global_module(cls.dec_global, file_path, child_subroutine_key, self.module_tree_cp)
             file_path = os.path.join(subroutine_dir, self.main_program_file)
             sub_trees = [subroutine_tree, modified_subroutine_tree]
             call_stmts = [call_stmt_org, call_stmt_vec]
@@ -168,13 +174,18 @@ class Isolator:
                     modifier.error_flag, \
                     modifier.acc_enter_data_copyin, \
                     cls.var_modif_info, file_path, child_subroutine_key, \
-                    cls.dummy_arg_list[child_subroutine_key], self.module_tree_sp)
+                    cls.dummy_arg_list[child_subroutine_key], self.module_tree_cp)
             error_status = self.processor_sp.compile_and_run(os.getcwd(), self.target_module_dir)
             assert error_status == 0, "Error: Compilation failed or main_program not generated."
-            self.processor_sp.write_fortran_code_to_file(self.module_tree_sp, self.path_to_target)
+            self.processor_sp.write_fortran_code_to_file(self.module_tree_cp, self.path_to_target)
         return modified_subroutine_tree, modifier.error_flag
 
     def separate_parent_subroutine(self, cls, subroutine_key, subroutines_parent=None):
+        assert os.path.exists(self.processor_sp.benchmark_dir), "benchmark directory does not exist!"
+        sub_dir = os.path.join(self.processor_sp.benchmark_dir, subroutine_key)
+        os.makedirs(sub_dir, exist_ok=True)
+        logging.info(f"{subroutine_key} directory created inside benchmark: {sub_dir}")
+
         subroutine_tree = cls.subroutines[subroutine_key]
         cls.find_variables(subroutine_tree, subroutine_key)
         local_var_parent = cls.extract_names(cls.var_local)
@@ -201,7 +212,7 @@ class Isolator:
             #    self.separate_parent_subroutine(cls, child_subroutine_key, self.parent_subroutine_call)
 
 
-        print("Trying to separate a parent subroutine .... ", subroutine_key)
+        print("Now, trying to separate a parent subroutine .... ", subroutine_key)
         subroutine_dir = os.path.join(self.target_module_dir, subroutine_key)
         os.makedirs(subroutine_dir)
 
@@ -255,7 +266,7 @@ class Isolator:
 
         self.processor_sp.add_declarations(self.global_vars_decl_sp, cls.var_modif_info)
         file_path = os.path.join(subroutine_dir, self.module_global_file)
-        self.processor_sp.update_global_module(self.global_vars_decl_sp, file_path)
+        self.processor_sp.update_global_module(self.global_vars_decl_sp, file_path, subroutine_key, self.module_tree_cp)
         file_path = os.path.join(subroutine_dir, self.main_program_file)
         sub_trees = [subroutine_tree, modified_subroutine_tree]
         call_stmts = [call_stmt_org, call_stmt_vec]
@@ -269,11 +280,13 @@ class Isolator:
                 modifier.dummy_add_decl,\
                 modifier.error_flag,\
                 modifier.acc_enter_data_copyin, \
-                cls.var_modif_info, file_path, self.child_subroutine_call_sp[subroutine_key])
+                cls.var_modif_info, file_path, subroutine_key, \
+                cls.dummy_arg_list[subroutine_key], self.module_tree_cp, \
+                self.child_subroutine_call_sp[subroutine_key])
 
         error_status = self.processor_sp.compile_and_run(os.getcwd(), self.target_module_dir)
         assert error_status == 0, "Error: Compilation failed or main_program not generated."
-        
+        self.processor_sp.write_fortran_code_to_file(self.module_tree_cp, self.path_to_target) 
 
     def merge_global_vars_decl(self, in_dict):
         for child_key, child_value in in_dict.items():
@@ -289,13 +302,15 @@ class Isolator:
             self.parent_subroutine_call = set()
             self.separate_parent_subroutine(cls, subroutine)
         '''
-        subs = ['hydrol_diag_soil','hydrol_diag_soil_flux','hydrol_nudge_mc','hydrol_root_profile',
+        '''subs = ['hydrol_diag_soil','hydrol_diag_soil_flux','hydrol_nudge_mc','hydrol_root_profile',
                 'hydrol_soil_coef','hydrol_soil_froz','hydrol_soil_infilt','hydrol_soil_setup',
                 'hydrol_soil_smooth_over_mcs2','hydrol_soil_smooth_under_mcr','hydrol_soil_tridiag',
                 'hydrol_split_soil']
+        '''
+        '''subs = ['hydrol_soil_tridiag']
         for subroutine in subs:
             self.separate_child_subroutine(cls, subroutine)
-        
+        '''
     def run(self):
         #self.setup_environment()
         self.create_target_directory()

@@ -1147,6 +1147,10 @@ class Modifier:
                             code = f"IF({child.children[0]})THEN\n{child.children[1]}\nENDIF\n"
                             block.content[idc] = Processor().parse_fortran_statement(code)
                             idc -= 1
+                    elif isinstance(child, (F23.Open_Stmt, F23.Write_Stmt, F23.Close_Stmt)):
+                        if '1363' in child.tostr():
+                            del block.content[idc]
+                            continue
                     elif isinstance(child, F23.Return_Stmt):
                         if isinstance(block.content[idc+2], F23.End_If_Stmt):
                             block.content[idc+2] = F23.Else_Stmt("ELSE")
@@ -1220,6 +1224,8 @@ class Modifier:
                                     if isinstance(child, F23.Subroutine_Subprogram)), None)
 
             for write_stmt in write_stmts:
+                if '1363' in write_stmt.tostr():
+                    continue
                 parent = write_stmt.parent
                 parent_str = parent.tostr()
                 parent_to_writes[parent_str].append(write_stmt)
