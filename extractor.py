@@ -51,7 +51,7 @@ class Extractor:
             self.call_subroutines = {}
             self.call_within_sub = {}
             self.loop_dict = {}
-            self.exclude = {'kjpindex', 'nslm', 'nstm', 'nvm', 'nsnow', 'DIM', 'MASK', 'next_calc_loop'}
+            self.exclude = {'kjpindex', 'nslm', 'nstm', 'nvm', 'nsnow', 'DIM', 'dim', 'MASK', 'next_calc_loop'}
             self.cases_to_exclude = ['clear', 'finalize', 'init', 'initialize', 'read']
             self.allowed_external_subroutines = {'ipslerr_p', 'xios_orchidee_send_field'}
             self.dec_global = {}
