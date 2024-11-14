@@ -105,6 +105,8 @@ class Isolator:
         print("Trying to separate a child subroutine .... ", child_subroutine_key)
 
         subroutine_tree = cls.subroutines[child_subroutine_key]
+        cls.extract_intent(child_subroutine_key, subroutine_tree)
+        cls.clean_subroutine(child_subroutine_key, subroutine_tree)
         code_string = subroutine_tree.tofortran()
         parse_tree = Processor().parse_fortran_string(code_string)
         #assert parse_tree == subroutine_tree, 'Error: Parsed code differs from original subroutine tree.'
@@ -179,6 +181,7 @@ class Isolator:
             assert error_status == 0, "Error: Compilation failed or main_program not generated."
             self.processor_sp.write_fortran_code_to_file(self.module_tree_cp, self.path_to_target)
         return modified_subroutine_tree, modifier.error_flag
+        
 
     def separate_parent_subroutine(self, cls, subroutine_key, subroutines_parent=None):
         assert os.path.exists(self.processor_sp.benchmark_dir), "benchmark directory does not exist!"
@@ -217,6 +220,8 @@ class Isolator:
         os.makedirs(subroutine_dir)
 
         subroutine_tree = cls.subroutines[subroutine_key]
+        cls.extract_intent(subroutine_key, subroutine_tree, cls.call_within_sub[subroutine_key])
+        cls.clean_subroutine(subroutine_key, subroutine_tree)
         code_string = subroutine_tree.tofortran()
         parse_tree = Processor().parse_fortran_string(code_string)
         #assert parse_tree == subroutine_tree, 'Error: Parsed code differs from original subroutine tree.'
@@ -298,16 +303,16 @@ class Isolator:
         cls.find_subroutines()
         cls.extract_loop_indices()
 
-        '''for subroutine in ['hydrol_soil']:#cls.subroutine_keys_ncl:
+        for subroutine in ['hydrol_soil']:#cls.subroutine_keys_ncl:
             self.parent_subroutine_call = set()
             self.separate_parent_subroutine(cls, subroutine)
         '''
-        '''subs = ['hydrol_diag_soil','hydrol_diag_soil_flux','hydrol_nudge_mc','hydrol_root_profile',
+        subs = ['hydrol_diag_soil','hydrol_diag_soil_flux','hydrol_nudge_mc','hydrol_root_profile',
                 'hydrol_soil_coef','hydrol_soil_froz','hydrol_soil_infilt','hydrol_soil_setup',
                 'hydrol_soil_smooth_over_mcs2','hydrol_soil_smooth_under_mcr','hydrol_soil_tridiag',
                 'hydrol_split_soil']
-        '''
-        '''subs = ['hydrol_soil_tridiag']
+        
+        subs = ['hydrol_diag_soil']
         for subroutine in subs:
             self.separate_child_subroutine(cls, subroutine)
         '''
