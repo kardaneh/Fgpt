@@ -4,6 +4,7 @@ from fparser.two.utils import walk
 from fparser.two import Fortran2003 as F23
 from navigator import Navigator
 from shaper import Shaper
+import re
 
 class Extractor:
     """
@@ -59,6 +60,7 @@ class Extractor:
             self.imp_shape = {}
             self.scalar_variables = set()
             self.shapes_variables = set()
+            self.general_usage_dict = {}
         except Exception as e:
             raise RuntimeError(f"Error in __init__: {str(e)}")
 
@@ -144,6 +146,218 @@ class Extractor:
                         var_local_names.add(child.tostr())
         return var_local_names
 
+    def extract_intent(self, subroutine_key, subroutine_tree, within_calls=None):
+        """
+        """
+        dummy_arg_list = self.dummy_arg_list[subroutine_key]
+        usage = {arg: {'intent': None, 'first_use_parent': None} for arg in dummy_arg_list}
+        def traverse_block(block):
+            if hasattr(block, "content"):
+                for child in block.content:
+                    if isinstance(child, F23.Assignment_Stmt):
+                        lhs_expr = child.items[0].tostr()
+                        rhs_expr = child.items[-1].tostr()
+                        for name in walk(child, F23.Name):
+                            var_name = name.tostr()
+                            pattern = r'\b' + re.escape(var_name) + r'\b'
+                            if var_name in dummy_arg_list:
+                                if isinstance(name.parent, F23.Section_Subscript_List):
+                                    if usage[var_name]['intent'] is None:
+                                        usage[var_name]['intent'] = 'IN'
+                                    if usage[var_name]['first_use_parent'] is None:
+                                        usage[var_name]['first_use_parent'] = child
+                                else:
+                                    if re.search(pattern, lhs_expr):
+                                        if usage[var_name]['intent'] is None:
+                                            usage[var_name]['intent'] = 'OUT'
+                                        elif usage[var_name]['intent'] == 'IN':
+                                            usage[var_name]['intent'] = 'INOUT'
+                                        if usage[var_name]['first_use_parent'] is None:
+                                            usage[var_name]['first_use_parent'] = child
+
+                                    if re.search(pattern, rhs_expr):
+                                        if usage[var_name]['intent'] is None:
+                                            usage[var_name]['intent'] = 'IN'
+                                        elif usage[var_name]['intent'] == 'OUT' and usage[var_name]['first_use_parent'] == child:
+                                            usage[var_name]['intent'] = 'INOUT'
+                                        if usage[var_name]['first_use_parent'] is None:
+                                            usage[var_name]['first_use_parent'] = child
+
+                    elif isinstance(child, F23.Nonlabel_Do_Stmt):
+                        for name in walk(child, F23.Name):
+                            var_name = name.tostr()
+                            if var_name in dummy_arg_list:
+                                if usage[var_name]['intent'] is None:
+                                    usage[var_name]['intent'] = 'IN'
+                                if usage[var_name]['first_use_parent'] is None:
+                                    usage[var_name]['first_use_parent'] = child
+
+                    elif isinstance(child, (F23.If_Then_Stmt, F23.Else_If_Stmt)):
+                        for name in walk(child, F23.Name):
+                            var_name = name.tostr()
+                            if var_name in dummy_arg_list:
+                                if usage[var_name]['intent'] is None:
+                                    usage[var_name]['intent'] = 'IN'
+                                if usage[var_name]['first_use_parent'] is None:
+                                    usage[var_name]['first_use_parent'] = child
+
+                    elif isinstance(child, (F23.Where_Construct_Stmt, F23.Masked_Elsewhere_Stmt)):
+                        for name in walk(child, F23.Name):
+                            var_name = name.tostr()
+                            if var_name in dummy_arg_list:
+                                if usage[var_name]['intent'] is None:
+                                    usage[var_name]['intent'] = 'IN'
+                                if usage[var_name]['first_use_parent'] is None:
+                                    usage[var_name]['first_use_parent'] = child
+
+                    elif isinstance(child, F23.Call_Stmt):
+                        call_name = None
+                        if child.children[0].tostr() not in self.allowed_external_subroutines:
+                            for grandchild in child.children:
+                                if grandchild is None:
+                                    continue
+                                if isinstance(grandchild, F23.Name):
+                                    call_name = grandchild.tostr()
+                                    assert call_name in within_calls, f"Error: {call_name} not found in within_calls"
+                                    assert call_name in self.general_usage_dict, f"Error: {call_name} not found in self.general_usage_dict"
+                                elif isinstance(grandchild, F23.Actual_Arg_Spec_List):
+                                    assert call_name is not None, 'call_name is not defined yet'
+                                    for name in grandchild.children:
+                                        if name.tostr() in dummy_arg_list:
+                                            var_name = name.tostr()
+                                            current_intent = usage[var_name]['intent']
+                                            call_intent = self.general_usage_dict[call_name][var_name]
+                                            if current_intent is None:
+                                                usage[var_name]['intent'] = call_intent
+                                            elif current_intent == 'IN' and call_intent in {'OUT', 'INOUT'}:
+                                                usage[var_name]['intent'] ='INOUT'
+                                            elif current_intent == 'OUT' and call_intent == 'INOUT':
+                                                usage[var_name]['intent'] == 'INOUT'
+
+                                            if usage[var_name]['first_use_parent'] is None:
+                                                usage[var_name]['first_use_parent'] = child
+                    else:
+                        traverse_block(child)
+        execution_part = walk(subroutine_tree, F23.Execution_Part)[0]
+        traverse_block(execution_part)
+        self.general_usage_dict[subroutine_key] = {var: props['intent'] for var, props in usage.items()}
+
+    @staticmethod
+    def add_intent(block, intent):
+        """
+        Adds intent to a Fortran block by extracting the intrinsic type, explicit shape, and entity declaration list.
+
+        Parameters:
+            block: The Fortran block to traverse.
+            intent (str): The intent specifier (e.g., "IN", "OUT", "INOUT").
+
+        Returns:
+            F23.Type_Declaration_Stmt: A Type Declaration Statement with the specified intent.
+        """
+        assert isinstance(block, F23.Type_Declaration_Stmt), (
+            f"Expected block to be of type 'F23.Type_Declaration_Stmt', "
+            f"but got '{type(block).__name__}' instead."
+        )
+        intrinsic_type_spec = None
+        explicit_shape_spec_list = None
+        entity_decl_list = None
+
+        def traverse_block(block):
+            nonlocal intrinsic_type_spec, explicit_shape_spec_list, entity_decl_list
+            if hasattr(block, "children"):
+                for child in block.children:
+                    if isinstance(child, F23.Intrinsic_Type_Spec):
+                        intrinsic_type_spec = child.tostr()
+                    elif isinstance(child, F23.Explicit_Shape_Spec_List):
+                        explicit_shape_spec_list = child.tostr()
+                    elif isinstance(child, F23.Entity_Decl_List):
+                        entity_decl_list = child.tostr()
+                    else:
+                        traverse_block(child)
+
+        traverse_block(block)
+        return F23.Type_Declaration_Stmt(
+            f'{intrinsic_type_spec},dimension({explicit_shape_spec_list}),intent({intent})::{entity_decl_list}'
+        )
+
+    def clean_subroutine(self, subroutine_key, subroutine_tree):
+        def traverse_subroutine(block):
+            if hasattr(block, "content"):
+                idc = 0
+                while idc < len(block.content):
+                    child = block.content[idc]
+                    if isinstance(child, F23.Type_Declaration_Stmt):
+                        intent = walk(child, F23.Intent_Spec)
+                        if intent:
+                            intent_spec = intent[0].tostr()
+                        if len(walk(child, F23.Entity_Decl)) > 1:
+                            for stmt in Processor().separate_entity_declarations(child):
+                                entity_decls = walk(stmt, F23.Entity_Decl)
+                                assert len(entity_decls) == 1,\
+                                        "walk(declaration_stmt, F23.Entity_Decl), but got a different number."
+                                name = entity_decls[0].tostr()
+                                if intent:
+                                    intent_spec_exp = self.general_usage_dict[subroutine_key][name]
+                                    if intent_spec_exp is None:
+                                        print('\033[38;5;214m' + "Warning: Name %s is not used %s."%(name, stmt.tostr()) + '\033[0m')
+                                    else:
+                                        if intent_spec_exp != intent_spec:
+                                            print('\033[38;5;214m' + "Warning: The intent is incorrect. Correction block" + '\033[0m')
+                                            print('\033[38;5;214m' + "Name:%s, Expected:%s, Found: %s"%(name, intent_spec_exp, intent_spec) + '\033[0m')
+                                            obj_org = F23.Intent_Attr_Spec('INTENT(%s)'%intent_spec)
+                                            obj_mod = F23.Intent_Attr_Spec('INTENT(%s)'%intent_spec_exp)
+                                            print('\033[38;5;214m' + "Original Declaration Statement: %s"%(stmt.tostr()) + '\033[0m')
+                                            child_string = stmt.tostr().replace(obj_org.tostr(), obj_mod.tostr())
+                                            stmt = F23.Type_Declaration_Stmt(child_string)
+                                            print('\033[32m' + 'Modified Declaration Statement: %s'%child_string + '\033[0m')
+                                else:
+                                    if name in self.dummy_arg_list[subroutine_key]:
+                                        print('\033[38;5;214m' + "Warning: Name %s is a dummy arguments without intent."%(name)+'\033[0m')
+                                        print('\033[38;5;214m' + "Original Declaration Statement: %s"%(stmt.tostr()) + '\033[0m')
+                                        intent_spec_exp = self.general_usage_dict[subroutine_key][name]
+                                        if intent_spec_exp is not None:
+                                            print('\033[38;5;214m' + "The expected intent is :  %s"%intent_spec_exp + '\033[0m')
+                                            stmt = self.add_intent(stmt, intent_spec_exp)
+                                            print('\033[32m' + 'Modified Declaration Statement: %s'%(stmt.tostr()) + '\033[0m')
+                                        else:
+                                            print('\033[38;5;214m' + "Warning: Name %s is not used %s."%(name, stmt.tostr()) + '\033[0m')
+                                block.content.insert(idc + 1, stmt)
+                            del block.content[idc]
+                        else:
+                            entity_decls = walk(child, F23.Entity_Decl)
+                            assert len(entity_decls) == 1,\
+                                    "walk(declaration_stmt, F23.Entity_Decl), but got a different number."
+                            name = entity_decls[0].tostr()
+                            if intent:
+                                intent_spec_exp = self.general_usage_dict[subroutine_key][name]
+                                if intent_spec_exp is None:
+                                    print('\033[38;5;214m' + "Warning: Name %s is not used %s."%(name, child.tostr()) + '\033[0m')
+                                else:
+                                    if intent_spec_exp != intent_spec:
+                                        print('\033[38;5;214m' + "Warning: incorrect intent for %s. Expected : %s, Found : %s. Correct it!" \
+                                                %(name, intent_spec_exp, intent_spec) + '\033[0m')
+                                        obj_org = F23.Intent_Attr_Spec('INTENT(%s)'%intent_spec)
+                                        obj_mod = F23.Intent_Attr_Spec('INTENT(%s)'%intent_spec_exp)
+                                        print('\033[38;5;214m' + "Original Declaration Statement: %s"%(child.tostr()) + '\033[0m')
+                                        child_string = child.tostr().replace(obj_org.tostr(), obj_mod.tostr())
+                                        block.content[idc] = F23.Type_Declaration_Stmt(child_string)
+                                        print('\033[32m' + 'Modified Declaration Statement: %s'%child_string + '\033[0m')
+                            else:
+                                if name in self.dummy_arg_list[subroutine_key]:
+                                    print('\033[38;5;214m' + "Warning: Name %s is a dummy arguments without intent."%(name)+'\033[0m')
+                                    print('\033[38;5;214m' + "Original Declaration Statement: %s"%(child.tostr()) + '\033[0m')
+                                    intent_spec_exp = self.general_usage_dict[subroutine_key][name]
+                                    if intent_spec_exp is not None:
+                                        print('\033[38;5;214m' + "Its expected intent is :  %s"%intent_spec_exp + '\033[0m')
+                                        block.content[idc] = self.add_intent(child, intent_spec_exp)
+                                        print('\033[32m' + 'Modified Declaration Statement: %s'%(block.content[idc].tostr()) + '\033[0m')
+                                    else:
+                                        print('\033[38;5;214m' + "Warning: Name %s is not used %s."%(name, child.tostr()) + '\033[0m')
+                    else:
+                        traverse_subroutine(child)
+                    idc += 1
+        traverse_subroutine(subroutine_tree)
+
     def find_variables(self, subroutine_tree, subroutine_name):
         self.var_global = set()
         self.var_in_local = set()
@@ -180,11 +394,18 @@ class Extractor:
                     if entity_decl not in self.imp_shape:
                         self.imp_shape[entity_decl] = node
                 intent = walk(node, F23.Intent_Spec)
+                entity_decls = walk(node, F23.Entity_Decl)
+                assert len(entity_decls) == 1,\
+                        "walk(declaration_stmt, F23.Entity_Decl), but got a different number."
+                name = entity_decls[0].tostr()
                 if intent:
+                    intent_spec = intent[0].tostr()
                     if walk(walk(node,F23.Entity_Decl),F23.Name)[0].string not in self.exclude:
                         self.var_dummy.append(node)
                         if F23.Intent_Attr_Spec('INTENT(IN)') in walk(node, F23.Intent_Attr_Spec):
-                            self.var_in_local = {name.tostr() for name in  walk(node, F23.Entity_Decl)}
+                            #self.var_in_local = {name.tostr() for name in  walk(node, F23.Entity_Decl)}
+                            for name in  walk(node, F23.Entity_Decl):
+                                self.var_in_local.add(name.string)
                 else:
                     for name in walk(node, F23.Entity_Decl):
                         if name.string in self.dummy_arg_list[subroutine_name]:
