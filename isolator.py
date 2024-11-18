@@ -275,12 +275,7 @@ class Isolator:
         file_path = os.path.join(subroutine_dir, self.main_program_file)
         sub_trees = [subroutine_tree, modified_subroutine_tree]
         call_stmts = [call_stmt_org, call_stmt_vec]
-        '''cls.var_dummy.append(modifier.dummy_add_decl)
-
-        if modifier.error_flag.keys():
-            for key in modifier.error_flag.keys():
-                cls.var_dummy.append(modifier.error_flag[key]['error_flag_decl'])
-        '''
+        
         self.processor_sp.update_main_program(cls.var_dummy, sub_trees, call_stmts, \
                 modifier.dummy_add_decl,\
                 modifier.error_flag,\

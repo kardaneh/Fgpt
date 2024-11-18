@@ -1,0 +1,12 @@
+declaration_initialization:
+     84, Generating update device(smtot_corr,profil_froz_hydro_ns(:,:,:),ok_thermodynamical_freezing,mc(:,:,:),max_froz_hydro,froz_frac_corr,fr_dt,fr_center,dh(:))
+main:
+     25, Generating enter data copyin(stempdiag(:,:),nvan(:),mcs(:),mcr(:),avan(:),njsc(:))
+     28, Generating Tesla code
+         29, !$acc loop gang, vector(128) ! blockidx%x threadidx%x
+     28, Generating implicit copyin(njsc(:),.S0000,avan(:),mcr(:),mcs(:),stempdiag(:,:),nvan(:)) [if not already present]
+     36, Generating update self(profil_froz_hydro_ns(:,:,:))
+     37, Generating exit data delete(stempdiag(:,:),nvan(:),mcs(:),mcr(:),avan(:),njsc(:))
+hydrol_soil_froz_acc:
+     73, Generating acc routine seq
+         Generating Tesla code

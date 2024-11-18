@@ -1,0 +1,10 @@
+declaration_initialization:
+    136, Generating update device(one_day,gp(:,:),g1(:,:),free_drain_coef(:,:),fp(:,:),f(:,:),ep(:,:),e(:,:),dz(:),dt_sechiba,d(:,:),a(:,:))
+main:
+     26, Generating Tesla code
+         27, !$acc loop gang, vector(128) ! blockidx%x threadidx%x
+     26, Generating implicit copyin(.S0000) [if not already present]
+     34, Generating update self(ep(:,:),e(:,:),fp(:,:),f(:,:),g1(:,:),gp(:,:))
+hydrol_soil_setup_acc:
+    119, Generating acc routine seq
+         Generating Tesla code

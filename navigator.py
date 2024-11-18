@@ -24,7 +24,7 @@ class Navigator:
         main_dir (str): Directory of the main Fortran driver file.
         full_scout (bool): Flag indicating if the search has been extended to the main program.
     """
-    def __init__(self, subroutine_dir, module_tree):
+    def __init__(self, subroutine_dir, module_tree, parsed_modules):
         self.module_dir_sc = subroutine_dir
         self.module_tree_sc = module_tree
         self.variable_name_sc = ''
@@ -38,7 +38,7 @@ class Navigator:
         self.main_fortran_file = "orchideedriver.f90"
         self.main_dir = 'src_driver'
         self.full_scout = False
-
+        self.parsed_modules = parsed_modules
     def find_variable_in_module(self):
         """
         Search for the variable in the current module and update the relevant attributes.
@@ -207,14 +207,38 @@ class Navigator:
                 if module_name in self.visited_modules_sc:
                     print('\033[38;5;208m' + f"Pass! Module {module_name} has already been visited." + '\033[0m')
                     continue
+                module_found = False
                 self.child_modules_sc.add(module_name)
-                module_filename_lower = os.path.join(self.module_dir_sc, module_name + ".f90")
-                module_filename_upper = os.path.join(self.module_dir_sc, module_name + ".F90")
-
-                # Check for module files and parse them
-                if os.path.exists(module_filename_lower) or os.path.exists(module_filename_upper):
-                    child_module_tree = Processor().parse_fortran_file(
-                        module_filename_lower if os.path.exists(module_filename_lower) else module_filename_upper)
+                if module_name in self.parsed_modules:
+                    module_found = True
+                    child_module_tree = self.parsed_modules[module_name]
+                else:
+                    module_filename_lower = os.path.join(self.module_dir_sc, module_name + ".f90")
+                    module_filename_upper = os.path.join(self.module_dir_sc, module_name + ".F90")
+                    # Check for module files and parse them
+                    if os.path.exists(module_filename_lower) or os.path.exists(module_filename_upper):
+                        selected_filename = module_filename_lower if os.path.exists(module_filename_lower) else module_filename_upper
+                        child_module_tree = Processor().parse_fortran_file(selected_filename)
+                        module_found = True
+                        self.parsed_modules[module_name] = child_module_tree
+                    else:
+                        parent_directory = os.path.abspath(os.path.join(self.module_dir_sc, '../'))
+                        for directory in os.listdir(parent_directory):
+                            if directory.startswith(".") or directory == "__pycache__":
+                                continue
+                            if directory.startswith('src_'):
+                                full_directory = os.path.join(parent_directory, directory)
+                                if os.path.isdir(full_directory):
+                                    module_filename_lower = os.path.join(full_directory, module_name + ".f90")
+                                    module_filename_upper = os.path.join(full_directory, module_name + ".F90")
+                                    if os.path.exists(module_filename_lower) or os.path.exists(module_filename_upper):
+                                        selected_filename = module_filename_lower if os.path.exists(module_filename_lower) else module_filename_upper
+                                        child_module_tree = Processor().parse_fortran_file(selected_filename)
+                                        self.module_dir_sc = full_directory
+                                        module_found = True
+                                        self.parsed_modules[module_name] = child_module_tree
+                                        break 
+                if module_found:
                     self.visited_modules_sc.add(module_name)
                     self.module_tree_sc = child_module_tree
                     self.add_modules_to_queue()
@@ -224,29 +248,6 @@ class Navigator:
                         self.find_external_subroutine_in_module()
                     if self.return_key_sc:
                         return
-                else:
-                    parent_directory = os.path.abspath(os.path.join(self.module_dir_sc, '../'))
-                    for directory in os.listdir(parent_directory):
-                        if directory.startswith(".") or directory == "__pycache__":
-                            continue
-                        if directory.startswith('src_'):
-                            full_directory = os.path.join(parent_directory, directory)
-                            if os.path.isdir(full_directory):
-                                module_filename_lower = os.path.join(full_directory, module_name + ".f90")
-                                module_filename_upper = os.path.join(full_directory, module_name + ".F90")
-                                if os.path.exists(module_filename_lower) or os.path.exists(module_filename_upper):
-                                    child_module_tree = Processor().parse_fortran_file(
-                                        module_filename_lower if os.path.exists(module_filename_lower) else module_filename_upper)
-                                    self.visited_modules_sc.add(module_name)
-                                    self.module_dir_sc = full_directory
-                                    self.module_tree_sc = child_module_tree
-                                    self.add_modules_to_queue()
-                                    if key == 'variable':
-                                        self.find_variable_in_module()
-                                    elif key == 'subroutine':
-                                        self.find_external_subroutine_in_module()
-                                    if self.return_key_sc:
-                                        return
 
                 # Handle empty queue and reset if needed
                 if not self.queue_sc and not self.return_key_sc and not self.full_scout:

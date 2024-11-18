@@ -1,0 +1,12 @@
+declaration_initialization:
+     56, Generating update device(tmc_aux(:,:),mc_read_current(:,:,:),dz(:),alpha_nudge_mc)
+main:
+     21, Generating enter data copyin(mc_loc(:,:,:))
+     24, Generating Tesla code
+         25, !$acc loop gang, vector(128) ! blockidx%x threadidx%x
+     24, Generating implicit copy(.S0000,mc_loc(:,:,:)) [if not already present]
+     32, Generating update self(tmc_aux(:,:),mc_loc(:,:,:))
+     33, Generating exit data delete(mc_loc(:,:,:))
+hydrol_nudge_mc_acc:
+     73, Generating acc routine seq
+         Generating Tesla code
