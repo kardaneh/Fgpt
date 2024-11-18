@@ -1,0 +1,10 @@
+declaration_initialization:
+     56, Generating update device(tmat(:,:,:),rhs(:,:),resolv(:),mcl(:,:,:))
+main:
+     21, Generating Tesla code
+         22, !$acc loop gang, vector(128) ! blockidx%x threadidx%x
+     21, Generating implicit copyin(.S0000) [if not already present]
+     29, Generating update self(mcl(:,:,:))
+hydrol_soil_tridiag_acc:
+     65, Generating acc routine seq
+         Generating Tesla code

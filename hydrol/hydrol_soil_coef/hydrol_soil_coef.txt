@@ -1,0 +1,12 @@
+declaration_initialization:
+    134, Generating update device(profil_froz_hydro_ns(:,:,:),ok_freeze_cwrr,mc(:,:,:),kfact_root(:,:,:),k_lin(:,:,:),k(:,:),imax,d_lin(:,:,:),d(:,:),b_lin(:,:,:),b(:,:),a_lin(:,:,:),a(:,:))
+main:
+     25, Generating enter data copyin(mcs(:),njsc(:),mcr(:))
+     28, Generating Tesla code
+         29, !$acc loop gang, vector(128) ! blockidx%x threadidx%x
+     28, Generating implicit copyin(.S0000,mcr(:),njsc(:),mcs(:)) [if not already present]
+     36, Generating update self(k(:,:),d(:,:),b(:,:),a(:,:))
+     37, Generating exit data delete(njsc(:),mcs(:),mcr(:))
+hydrol_soil_coef_acc:
+    107, Generating acc routine seq
+         Generating Tesla code

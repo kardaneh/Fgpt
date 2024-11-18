@@ -61,6 +61,7 @@ class Extractor:
             self.scalar_variables = set()
             self.shapes_variables = set()
             self.general_usage_dict = {}
+            self.parsed_modules = {}
         except Exception as e:
             raise RuntimeError(f"Error in __init__: {str(e)}")
 
@@ -377,8 +378,6 @@ class Extractor:
         shapes = {name.string for name in shape}
 
         for declaration_stmt in walk(declared, F23.Type_Declaration_Stmt):
-            #implicit_shape = walk(declaration_stmt, F23.Assumed_Shape_Spec)
-            #if implicit_shape and len(walk(declaration_stmt, F23.Entity_Decl)) > 1:
             if len(walk(declaration_stmt, F23.Entity_Decl)) > 1:
                 node_list = Processor().separate_entity_declarations(declaration_stmt)
             else:
@@ -386,7 +385,7 @@ class Extractor:
             for node in node_list:
                 implicit_shape = walk(node, F23.Assumed_Shape_Spec)
                 if implicit_shape:
-                    shape_finder = Shaper(self.module_dir, self.dummy_arg_list, self.actual_arg_spec_list, self.call_subroutines)
+                    shape_finder = Shaper(self.module_dir, self.dummy_arg_list, self.actual_arg_spec_list, self.call_subroutines, self.parsed_modules)
                     nodes = shape_finder.find_implicit_shape(node, subroutine_name)
                     print('\033[32m' + 'found :' + '\033[0m', nodes, '\033[32m' + 'for :' + '\033[0m', node)
                     node = Processor().map_declaration(node, nodes)
@@ -415,6 +414,7 @@ class Extractor:
                             self.var_in_local.add(name.string)
                     self.var_local.append(node)
 
+        self.var_dummy.sort(key=lambda node: node.children[-1].tostr().lower())
         shape ={name.string for name in  walk(walk(self.var_dummy, F23.Explicit_Shape_Spec), F23.Name)}
         shapes.update(shape)
 
@@ -438,7 +438,7 @@ class Extractor:
     
     def find_global_variables(self, module_dir, module_tree, var_global):
         for declaration in var_global:
-            self.finder = Navigator(module_dir, module_tree)
+            self.finder = Navigator(module_dir, module_tree, self.parsed_modules)
             if declaration not in self.external_subroutines:
                 sys.stdout.write('\r' + '\033[32m' + 'Searching for variable: ' + declaration + ' ... ⏳' + '\033[0m\n')
                 sys.stdout.flush()

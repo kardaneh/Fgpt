@@ -745,7 +745,7 @@ class Processor:
             self.reads_in_decleration_routine = []
             self.reads_in_read_routine = []
             self.write_stmt = []
-            for key in input_dict.keys():
+            for key in sorted(input_dict):
                 var_in_modif = False
                 if key in var_modif:
                     var_in_modif = True

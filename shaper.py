@@ -19,7 +19,7 @@ class Shaper:
         module_tree_imp (object): The abstract syntax tree of the currently processed module.
     """
 
-    def __init__(self, module_dir, dummy_arg_list, actual_arg_spec_list, call_subroutines):
+    def __init__(self, module_dir, dummy_arg_list, actual_arg_spec_list, call_subroutines, parsed_modules):
         """
         Initialize the Shaper with the given directory and argument lists.
 
@@ -36,6 +36,7 @@ class Shaper:
         self.fortran_file_queue_imp = deque()
         self.current_module_imp = ''
         self.module_tree_imp = None
+        self.parsed_modules = parsed_modules
 
     def find_fortran_files(self, subroutine_name):
         """
@@ -52,12 +53,18 @@ class Shaper:
                 if file.endswith(('.f90', '.F90')):
                     file_base, _ = os.path.splitext(file)
                     if file_base != self.current_module_imp:
-                        module_filename = os.path.join(self.module_dir_imp, file)
-                        self.fortran_file_queue_imp.append(module_filename)
+                        module_file_path = os.path.join(self.module_dir_imp, file)
+                        self.fortran_file_queue_imp.append(module_file_path)
             
             while self.fortran_file_queue_imp:
-                module_filename = self.fortran_file_queue_imp.popleft()
-                self.module_tree_imp = Processor().parse_fortran_file(module_filename)
+                module_file_path = self.fortran_file_queue_imp.popleft()
+                module_file_name = os.path.basename(module_file_path)
+                module_name, _ = os.path.splitext(module_file_name)
+                if module_name in self.parsed_modules:
+                    self.module_tree_imp = self.parsed_modules[module_name]
+                else:
+                    self.module_tree_imp = Processor().parse_fortran_file(module_file_path)
+                    self.parsed_modules[module_name] = self.module_tree_imp
                 
                 for sub in walk(self.module_tree_imp, F23.Subroutine_Subprogram):
                     call_stmt = walk(sub, F23.Call_Stmt)
@@ -131,7 +138,7 @@ class Shaper:
             self.module_tree_imp = call.get_root()
             module_name = walk(self.module_tree_imp, F23.Name)[0].string
             print(f'"{corresponding_element}" is not a dummy argument in subroutine "{subroutine_key}". Searching in module "{module_name}"...')
-            self.finder = Navigator(self.module_dir_imp, self.module_tree_imp)
+            self.finder = Navigator(self.module_dir_imp, self.module_tree_imp, self.parsed_modules)
             self.finder.variable_finder(corresponding_element)
             return Processor().combine_allocate_declaration(self.finder.var_declaration)
         
