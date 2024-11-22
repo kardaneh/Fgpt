@@ -823,7 +823,11 @@ class Processor:
                 attr_spec = [case.string for case in walk(element, F23.Attr_Spec)]
                 array = walk(element, F23.Explicit_Shape_Spec)
                 if 'PARAMETER' in attr_spec and not array:
-                    left_list.append(element)
+                    initialization = walk(walk(element, F23.Initialization), F23.Name)
+                    if initialization:
+                        left_list.append(element)
+                    else:
+                        left_list.insert(0, element)
                 elif 'ALLOCATABLE' in attr_spec or array:
                     right_list.append(element)
                 else:

@@ -82,9 +82,9 @@ class Extractor:
                 start_end_stride_values = line_parts[1].split(',')
                 loop_start = start_end_stride_values[0].strip()
                 loop_end = start_end_stride_values[1].strip()
-                loop_end = ''.join(filter(str.isalpha, loop_end))
+                #loop_end = ''.join(filter(str.isalpha, loop_end))
                 if loop_end:
-                    if loop_end == 'kjpindex' and loop_index != replacement_pattern:
+                    '''if loop_end == 'kjpindex' and loop_index != replacement_pattern:
                         print('\033[38;5;214m' + f"'kjpindex' loop index is {loop_index} instead of {replacement_pattern}" + '\033[0m')
                         pattern = r'\b' + re.escape(loop_index) + r'\b'
                         tree = loop
@@ -104,25 +104,26 @@ class Extractor:
                                     continue
                                 child_str = child.tostr()
                                 if re.search(pattern, child_str):
-                                    print('\033[38;5;214m' + "Original block: %s" % child_str + '\033[0m')
+                                    #print('\033[38;5;214m' + "Original block: %s" % child_str + '\033[0m')
                                     fparser_class = getattr(F23, type(child).__name__)
                                     updated_child_str = re.sub(pattern, replacement_pattern, child_str)
-                                    print('\033[32m' + 'Modified block: %s' % updated_child_str + '\033[0m')
+                                    #print('\033[32m' + 'Modified block: %s' % updated_child_str + '\033[0m')
                                     reader = FortranStringReader(updated_child_str, ignore_comments=False)
                                     block.children[block.children.index(child)] = fparser_class(reader)
                             idc += 1
                         loop_index = replacement_pattern
+                    '''
                     if loop_end not in self.loop_dict:
                         self.loop_dict[loop_end] = set()
                     self.loop_dict[loop_end].add(loop_index)
-            assert 'kjpindex' in self.loop_dict, "'kjpindex' not found in loop_dict"
-            assert len(self.loop_dict['kjpindex']) == 1 and 'ji' in self.loop_dict['kjpindex'], (
-                "'kjpindex' must have exactly one value, and that value must be 'ji'."
-            )
-            assert not [key for key, values in self.loop_dict.items() if key != 'kjpindex' and 'ji' in values], (
-                    "'ji' is found in the values of one or more keys other than 'kjpindex'. "
-                    "Please ensure 'ji' is exclusive to 'kjpindex'."
-                    )
+            #assert 'kjpindex' in self.loop_dict, "'kjpindex' not found in loop_dict"
+            #assert len(self.loop_dict['kjpindex']) == 1 and 'ji' in self.loop_dict['kjpindex'], (
+            #    "'kjpindex' must have exactly one value, and that value must be 'ji'."
+            #)
+            #assert not [key for key, values in self.loop_dict.items() if key != 'kjpindex' and 'ji' in values], (
+            #        "'ji' is found in the values of one or more keys other than 'kjpindex'. "
+            #        "Please ensure 'ji' is exclusive to 'kjpindex'."
+            #        )
 
         except Exception as e:
             raise RuntimeError(f"Error in extract_loop_indices: {str(e)}")
@@ -190,10 +191,11 @@ class Extractor:
         """
         """
         dummy_arg_list = self.dummy_arg_list[subroutine_key]
-        usage = {arg: {'intent': None, 'first_use_assign': None} for arg in dummy_arg_list}
+        usage = {arg: {'intent': None, 'first_use_assign': None, 'first_use_update': False} for arg in dummy_arg_list}
         def traverse_block(block):
             if hasattr(block, "content"):
                 for child in block.content:
+                    child_parent = child.parent
                     if isinstance(child, F23.Assignment_Stmt):
                         lhs_expr = child.items[0].tostr()
                         rhs_expr = child.items[-1].tostr()
@@ -201,54 +203,81 @@ class Extractor:
                             var_name = name.tostr()
                             pattern = r'\b' + re.escape(var_name) + r'\b'
                             if var_name in dummy_arg_list:
+
+                                if isinstance(child_parent, F23.If_Construct) and \
+                                        usage[var_name]['first_use_assign'] is not None and \
+                                        usage[var_name]['first_use_assign'].parent == child_parent:
+                                    usage[var_name]['first_use_update'] = True
+
+                                if usage[var_name]['first_use_assign'] is None or usage[var_name]['first_use_update']:
+                                    usage[var_name]['first_use_assign'] = child
+
                                 if isinstance(name.parent, F23.Section_Subscript_List):
                                     if usage[var_name]['intent'] is None:
                                         usage[var_name]['intent'] = 'IN'
-                                    if usage[var_name]['first_use_assign'] is None:
-                                        usage[var_name]['first_use_assign'] = child
+                                    #if usage[var_name]['first_use_assign'] is None:
+                                    #    usage[var_name]['first_use_assign'] = child
                                 else:
                                     if re.search(pattern, lhs_expr):
                                         if usage[var_name]['intent'] is None:
                                             usage[var_name]['intent'] = 'OUT'
                                         elif usage[var_name]['intent'] == 'IN':
                                             usage[var_name]['intent'] = 'INOUT'
-                                        if usage[var_name]['first_use_assign'] is None:
-                                            usage[var_name]['first_use_assign'] = child
+                                        #if usage[var_name]['first_use_assign'] is None:
+                                        #    usage[var_name]['first_use_assign'] = child
 
                                     if re.search(pattern, rhs_expr):
                                         if usage[var_name]['intent'] is None:
                                             usage[var_name]['intent'] = 'IN'
                                         elif usage[var_name]['intent'] == 'OUT' and usage[var_name]['first_use_assign'] == child:
                                             usage[var_name]['intent'] = 'INOUT'
-                                        if usage[var_name]['first_use_assign'] is None:
-                                            usage[var_name]['first_use_assign'] = child
+                                        #if usage[var_name]['first_use_assign'] is None:
+                                        #    usage[var_name]['first_use_assign'] = child
 
                     elif isinstance(child, F23.Nonlabel_Do_Stmt):
                         for name in walk(child, F23.Name):
                             var_name = name.tostr()
                             if var_name in dummy_arg_list:
+                                if isinstance(child_parent, F23.If_Construct) and \
+                                        usage[var_name]['first_use_assign'] is not None and \
+                                        usage[var_name]['first_use_assign'].parent == child_parent:
+                                    usage[var_name]['first_use_update'] = True
+                                if usage[var_name]['first_use_assign'] is None or usage[var_name]['first_use_update']:
+                                    usage[var_name]['first_use_assign'] = child
                                 if usage[var_name]['intent'] is None:
                                     usage[var_name]['intent'] = 'IN'
-                                if usage[var_name]['first_use_assign'] is None:
-                                    usage[var_name]['first_use_assign'] = child
+                                #if usage[var_name]['first_use_assign'] is None or usage[var_name]['first_use_update']:
+                                #    usage[var_name]['first_use_assign'] = child
 
                     elif isinstance(child, (F23.If_Then_Stmt, F23.Else_If_Stmt)):
                         for name in walk(child, F23.Name):
                             var_name = name.tostr()
                             if var_name in dummy_arg_list:
+                                if isinstance(child_parent, F23.If_Construct) and \
+                                        usage[var_name]['first_use_assign'] is not None and \
+                                        usage[var_name]['first_use_assign'].parent == child_parent:
+                                    usage[var_name]['first_use_update'] = True
+                                if usage[var_name]['first_use_assign'] is None or usage[var_name]['first_use_update']:
+                                    usage[var_name]['first_use_assign'] = child
                                 if usage[var_name]['intent'] is None:
                                     usage[var_name]['intent'] = 'IN'
-                                if usage[var_name]['first_use_assign'] is None:
-                                    usage[var_name]['first_use_assign'] = child
+                                #if usage[var_name]['first_use_assign'] is None:
+                                #    usage[var_name]['first_use_assign'] = child
 
                     elif isinstance(child, (F23.Where_Construct_Stmt, F23.Masked_Elsewhere_Stmt)):
                         for name in walk(child, F23.Name):
                             var_name = name.tostr()
                             if var_name in dummy_arg_list:
+                                if isinstance(child_parent, F23.If_Construct) and \
+                                        usage[var_name]['first_use_assign'] is not None and \
+                                        usage[var_name]['first_use_assign'].parent == child_parent:
+                                    usage[var_name]['first_use_update'] = True
+                                if usage[var_name]['first_use_assign'] is None or usage[var_name]['first_use_update']:
+                                    usage[var_name]['first_use_assign'] = child
                                 if usage[var_name]['intent'] is None:
                                     usage[var_name]['intent'] = 'IN'
-                                if usage[var_name]['first_use_assign'] is None:
-                                    usage[var_name]['first_use_assign'] = child
+                                #if usage[var_name]['first_use_assign'] is None:
+                                #    usage[var_name]['first_use_assign'] = child
 
                     elif isinstance(child, F23.Call_Stmt):
                         call_name = None
@@ -265,6 +294,13 @@ class Extractor:
                                     for name in grandchild.children:
                                         if name.tostr() in dummy_arg_list:
                                             var_name = name.tostr()
+                                            if isinstance(child_parent, F23.If_Construct) and \
+                                                    usage[var_name]['first_use_assign'] is not None and \
+                                                    usage[var_name]['first_use_assign'].parent == child_parent:
+                                                usage[var_name]['first_use_update'] = True
+                                            if usage[var_name]['first_use_assign'] is None or usage[var_name]['first_use_update']:
+                                                usage[var_name]['first_use_assign'] = child
+                                            #var_name = name.tostr()
                                             current_intent = usage[var_name]['intent']
                                             call_intent = self.general_usage_dict[call_name][var_name]
                                             if current_intent is None:
@@ -273,9 +309,8 @@ class Extractor:
                                                 usage[var_name]['intent'] ='INOUT'
                                             elif current_intent == 'OUT' and call_intent == 'INOUT':
                                                 usage[var_name]['intent'] == 'INOUT'
-
-                                            if usage[var_name]['first_use_assign'] is None:
-                                                usage[var_name]['first_use_assign'] = child
+                                            #if usage[var_name]['first_use_assign'] is None:
+                                            #    usage[var_name]['first_use_assign'] = child
                     else:
                         traverse_block(child)
         execution_part = walk(subroutine_tree, F23.Execution_Part)[0]
@@ -520,7 +555,7 @@ class Extractor:
                     entity_decls = walk(item, F23.Entity_Decl)
                     assert len(entity_decls) == 1,\
                             "In extract_array_info: walk(item, F23.Entity_Decl)=1, but got a different number."
-                    entity_decl = entity_decls[0].tostr()
+                    entity_decl = entity_decls[0].children[0].tostr()
                     if entity_decl in self.var_modif:
                         is_var_modified = True
                         self.var_modif_info[entity_decl] = []
@@ -561,7 +596,7 @@ class Extractor:
 
         for item in normalized_items:
             current_var_info = []
-            array_name = walk(item, F23.Entity_Decl)[0].tostr()
+            array_name = walk(item, F23.Entity_Decl)[0].children[0].tostr()
             for dim in walk(item, F23.Explicit_Shape_Spec):
                 start_end = [part.strip() for part in dim.tostr().split(':')]
                 lse = len(start_end)
