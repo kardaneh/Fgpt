@@ -311,7 +311,7 @@ class Isolator:
                 'explicitsnow_levels','explicitsnow_maxmass','explicitsnow_melt_refrz','explicitsnow_profile','explicitsnow_subli',
                 'explicitsnow_transf'}
         '''
-        subs = ['explicitsnow_age']
+        subs = ['explicitsnow_transf']#'explicitsnow_subli','explicitsnow_profile','explicitsnow_maxmass','explicitsnow_levels','explicitsnow_iceprofile', 'explicitsnow_icemelt','explicitsnow_icelevels','explicitsnow_age', 'explicitsnow_compactn', 'explicitsnow_drift', 'explicitsnow_gone']
         for subroutine in subs:
             self.separate_child_subroutine(cls, subroutine)
         

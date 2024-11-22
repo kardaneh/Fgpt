@@ -219,15 +219,45 @@ class Modifier:
             for intrinsic in walk(stmt, F23.Intrinsic_Name):
                 if intrinsic.tostr() in self.fortran_math_functions_no_dim:
                     continue
-                intrinsic_parent = intrinsic.parent.tostr()
+                '''intrinsic_parent = intrinsic.parent.tostr()
                 if intrinsic_parent not in intrinsic_name:
                     dict_list = []
                 dict_list.append({'intrinsic': intrinsic.tostr()})
                 if any(dim in intrinsic_parent for dim in ['dim', 'DIM']):
                     old_arg_spec = walk(intrinsic.parent, F23.Actual_Arg_Spec)[0].tostr()
                     dict_list.append({'dim': old_arg_spec})
+                '''
+                dim_value = None
+                intrinsic_parent = intrinsic.parent
+                fparser_class = getattr(F23, type(intrinsic_parent).__name__)
+                assert len(intrinsic_parent.children) == 2, "Intrinsic parent must have exactly two children."
+                assert intrinsic_parent.children[0] == intrinsic, "First child must be the intrinsic function itself."
+                intrinsic_args = intrinsic.parent.children[1]
+                assert isinstance(intrinsic_args, F23.Actual_Arg_Spec_List), "Second child must be an Actual_Arg_Spec_List."
+                args = intrinsic_args.children
+                if len(args) == 1:
+                    print(f"Reduction operation detected for {args[0].tostr()} without an explicit 'DIM'. "
+                            "This implies a vector reduction across all dimensions.")
+                if len(args) == 2:
+                    if isinstance(args[1], F23.Actual_Arg_Spec):
+                        dim_key, dim_value_node = args[1].items
+                        assert isinstance(dim_key, F23.Name), "First item in Actual_Arg_Spec must be a Name."
+                        assert isinstance(dim_value_node, F23.Int_Literal_Constant), "Second item in Actual_Arg_Spec must be an Int_Literal_Constant."
+                        assert dim_key.tostr().lower() == 'dim', "First item must be 'dim'."
+                        dim_value = dim_value_node.tostr()
+                    elif isinstance(args[1], F23.Int_Literal_Constant):
+                        raise ValueError(
+                                f"Unexpected argument structure in intrinsic. Expected 'dim={args[1].tostr()}' but found: {args[1].tostr()}")
+                    else:
+                        raise ValueError("Unexpected structure for intrinsic arguments.")
+                intrinsic_parent_str = intrinsic_parent.tostr()
+                if intrinsic_parent_str not in intrinsic_name:
+                    dict_list = []
+                dict_list.append({'intrinsic': intrinsic.tostr()})
+                if dim_value:
+                    dict_list.append({'dim': F23.Actual_Arg_Spec(f'DIM={dim_value}').tostr()})
                 merged_dict = {k: v for d in dict_list for k, v in d.items()}
-                intrinsic_name[intrinsic_parent] = merged_dict
+                intrinsic_name[intrinsic_parent_str] = merged_dict
             return intrinsic_name
         except Exception as e:
             raise Exception(f"Error in extract_intrinsic_names: {e}")
@@ -368,6 +398,7 @@ class Modifier:
                                 )
                                 index = list(self.loop_dict[ub] & self.var_declared)
                                 shape[idim] = index[0]
+                                colon_dim -= 1
                             else:
                                 shape[idim] = dim.tostr()
                         else:
@@ -608,9 +639,8 @@ class Modifier:
                             mod_node, new_arg_spec = self.modify_colon_array(node, intrinsic_parent, reduction_dim)
                             mod_intrinsic_parent = re.sub(re.escape(node_str), mod_node.tostr(), intrinsic_parent)
                             if new_arg_spec is not None:
-                                mod_intrinsic_parent = re.sub(
-                                    re.escape(old_arg_spec), new_arg_spec.tostr(), mod_intrinsic_parent
-                                )
+                                mod_intrinsic_parent = re.sub(re.escape(old_arg_spec), new_arg_spec.tostr(), mod_intrinsic_parent,
+                                        flags=re.IGNORECASE)
                             input_stmt = re.sub(re.escape(intrinsic_parent), mod_intrinsic_parent, input_stmt)
                             node = mod_node
                     else:
@@ -887,35 +917,20 @@ class Modifier:
                     if node_in_intrinsic:
                         for intrinsic_parent in intrinsic_name.keys():
                             reduction_dim = 'ALL'
-                            print(f'node {node.tostr()} found within '
-                                  f'intrinsic parent {intrinsic_parent}')
+                            print(f'node {node.tostr()} found within intrinsic parent {intrinsic_parent}')
                             if 'dim' in intrinsic_name[intrinsic_parent]:
                                 old_arg_spec = intrinsic_name[intrinsic_parent]['dim']
                                 reduction_dim = old_arg_spec.split('=')[-1].strip()
-                                print(f'{reduction_dim}th of :s in '
-                                      f'{node.tostr()} must stay as < : >.')
-                                reduction_dim = self.process_section_subscript_list(
-                                    node, reduction_dim
-                                )
-                                print(f'dimension {reduction_dim} of '
-                                      f'{node.tostr()} must stay as < : >.')
-                            mod_node, new_arg_spec = self.modify_colon_array_vec(
-                                node, intrinsic_parent, reduction_dim
-                            )
-                            node = mod_node
-                            mod_intrinsic_parent = re.sub(
-                                re.escape(node.tostr()), mod_node.tostr(),
-                                intrinsic_parent
-                            )
+                                print(f'{reduction_dim}th of :s in {node.tostr()} must stay as < : >.')
+                                reduction_dim = self.process_section_subscript_list(node, reduction_dim)
+                                print(f'dimension {reduction_dim} of {node.tostr()} must stay as < : >.')
+                            mod_node, new_arg_spec = self.modify_colon_array_vec(node, intrinsic_parent, reduction_dim)
+                            mod_intrinsic_parent = re.sub(re.escape(node.tostr()), mod_node.tostr(),intrinsic_parent)
                             if new_arg_spec is not None:
-                                mod_intrinsic_parent = re.sub(
-                                    re.escape(old_arg_spec), new_arg_spec.tostr(),
-                                    mod_intrinsic_parent
-                                )
-                            input_stmt = re.sub(
-                                re.escape(intrinsic_parent), mod_intrinsic_parent,
-                                input_stmt
-                            )
+                                mod_intrinsic_parent = re.sub(re.escape(old_arg_spec), new_arg_spec.tostr(),mod_intrinsic_parent,
+                                        flags=re.IGNORECASE)
+                            input_stmt = re.sub(re.escape(intrinsic_parent), mod_intrinsic_parent,input_stmt)
+                            node = mod_node
                     else:
                         mod_node, new_arg_spec = self.modify_colon_array_vec(node)
                         input_stmt = re.sub(
@@ -1311,16 +1326,16 @@ def main():
 
 if __name__ == "__main__":
     # Initialize SubroutineFinder with paths to module directory and module tree.
-    '''cls = Extractor(isolator.module_dir_sp, isolator.module_tree_sp)
+    cls = Extractor(isolator.module_dir_sp, isolator.module_tree_sp)
     cls.find_subroutines()
-    subroutine_key = 'hydrol_soil_froz'
+    subroutine_key = 'explicitsnow_gone'
     subroutine_tree = cls.subroutines[subroutine_key]
     cls.find_variables(subroutine_tree, subroutine_key)
     cls.dec_global = {}
     cls.dec_child = {}
     cls.find_global_variables(isolator.module_dir_sp, isolator.module_tree_sp, cls.var_global)
     cls.extract_loop_indices()
-    '''
+    
     # Call the main function to process the Fortran code.
     main()
 
