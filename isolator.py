@@ -298,9 +298,10 @@ class Isolator:
         cls.find_subroutines()
         cls.extract_loop_indices()
 
-        #for subroutine in ['hydrol_soil']:#cls.subroutine_keys_ncl:
-        #    self.parent_subroutine_call = set()
-        #    self.separate_parent_subroutine(cls, subroutine)
+        '''for subroutine in ['hydrol_vegupd','hydrol_soil']:#cls.subroutine_keys_ncl:
+            self.parent_subroutine_call = set()
+            self.separate_parent_subroutine(cls, subroutine)
+        '''
         '''
         subs = ['hydrol_diag_soil','hydrol_diag_soil_flux','hydrol_nudge_mc','hydrol_root_profile',
                 'hydrol_soil_coef','hydrol_soil_froz','hydrol_soil_infilt','hydrol_soil_setup',
@@ -311,7 +312,11 @@ class Isolator:
                 'explicitsnow_levels','explicitsnow_maxmass','explicitsnow_melt_refrz','explicitsnow_profile','explicitsnow_subli',
                 'explicitsnow_transf'}
         '''
-        subs = ['explicitsnow_transf']#'explicitsnow_subli','explicitsnow_profile','explicitsnow_maxmass','explicitsnow_levels','explicitsnow_iceprofile', 'explicitsnow_icemelt','explicitsnow_icelevels','explicitsnow_age', 'explicitsnow_compactn', 'explicitsnow_drift', 'explicitsnow_gone']
+        '''subs = ['explicitsnow_transf','explicitsnow_subli','explicitsnow_profile','explicitsnow_maxmass','explicitsnow_levels',
+                'explicitsnow_iceprofile', 'explicitsnow_icemelt','explicitsnow_icelevels','explicitsnow_age', 'explicitsnow_compactn',
+                'explicitsnow_drift', 'explicitsnow_gone']
+        '''
+        subs = ['explicitsnow_grain']
         for subroutine in subs:
             self.separate_child_subroutine(cls, subroutine)
         
@@ -323,7 +328,7 @@ class Isolator:
 if __name__ == "__main__":
     rest_of_path = "modipsl_truck_opt/modeles/ORCHIDEE/src_sechiba/"
     target_module = "explicitsnow"
-    work = os.getenv("work")
+    work = "/leonardo_work/EUHPC_D05_042" #os.getenv("WORK")
     isolator = Isolator(rest_of_path, target_module, work)
     isolator.run()
 

@@ -83,6 +83,9 @@ class Navigator:
                             self.var_declaration.append(stmt)
                             print('\033[32m' + f"<{self.variable_name_sc}> is found in <<{morr}>> of the module <<< {module_name} >>>" + '\033[0m')
                             print('\033[32m' + str(stmt) + '\033[0m')
+                        if isinstance(child.parent, F23.Function_Stmt):
+                            print('\033[38;5;214m' + f"Warning: <{self.variable_name_sc}> is a function" + '\033[0m')
+
             if self.var_declaration:
                 self.return_key_sc = True
                 allocate_stmt, attr_spec = walk(self.var_declaration, F23.Allocate_Stmt), walk(self.var_declaration, F23.Attr_Spec)
