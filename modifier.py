@@ -242,9 +242,9 @@ class Modifier:
                     if isinstance(args[1], F23.Actual_Arg_Spec):
                         dim_key, dim_value_node = args[1].items
                         assert isinstance(dim_key, F23.Name), "First item in Actual_Arg_Spec must be a Name."
-                        assert isinstance(dim_value_node, F23.Int_Literal_Constant), "Second item in Actual_Arg_Spec must be an Int_Literal_Constant."
-                        assert dim_key.tostr().lower() == 'dim', "First item must be 'dim'."
-                        dim_value = dim_value_node.tostr()
+                        if dim_key.tostr().lower() == 'dim':
+                            assert isinstance(dim_value_node, F23.Int_Literal_Constant), "Second item in Actual_Arg_Spec must be an Int_Literal_Constant."
+                            dim_value = dim_value_node.tostr()
                     elif isinstance(args[1], F23.Int_Literal_Constant):
                         raise ValueError(
                                 f"Unexpected argument structure in intrinsic. Expected 'dim={args[1].tostr()}' but found: {args[1].tostr()}")

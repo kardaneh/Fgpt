@@ -553,10 +553,13 @@ class Processor:
                             subnode.content.insert(kdx + 1, call_stmts[0])
                             kdx += 1
 
-                            code_end = """
+                            code_end = f"""
                             call SYSTEM_CLOCK(ic0, icr, ic)
                             stop_time = ic0*1.0/icr
                             WRITE(*,*) "Execution time : ",stop_time - start_time
+                            open(unit=1363, file='{self.benchmark_dir}/{subroutine_name}/time.txt', status='unknown', position='append')
+                            WRITE(1363,*) stop_time - start_time
+                            close(1363)
                             """
 
                             subnode.content.insert(kdx + 1, self.parse_fortran_statement(code_end))
