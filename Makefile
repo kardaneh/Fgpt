@@ -1,4 +1,4 @@
-WORK = /leonardo_work/EUHPC_D05_042
+WORK = /leonardo_work/EUHPC_D17_070
 FC_NVIDIA = mpif90
 
 NETCDF_INCDIR = -I$(NETCDF_C_HOME)/include -I$(NETCDF_FORTRAN_HOME)/include

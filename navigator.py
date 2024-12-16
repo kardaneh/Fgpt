@@ -85,6 +85,11 @@ class Navigator:
                             print('\033[32m' + str(stmt) + '\033[0m')
                         if isinstance(child.parent, F23.Function_Stmt):
                             print('\033[38;5;214m' + f"Warning: <{self.variable_name_sc}> is a function" + '\033[0m')
+                            print('\033[38;5;214m' + f"The containing directory is: {self.module_dir_sc}" + '\033[0m')
+                            function_name = child
+                            function_subprogram = child.parent.parent
+                            function_module = child.get_root()
+                            self.var_declaration.extend([function_subprogram, function_module, self.module_dir_sc])
 
             if self.var_declaration:
                 self.return_key_sc = True
