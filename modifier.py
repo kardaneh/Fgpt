@@ -861,6 +861,9 @@ class Modifier:
                          if dim.tostr() == ':' and idim == int(reduction_dim):
                             lb = array_info[idim]['dim_str']
                             ub = array_info[idim]['dim_end']
+                            print('lb, ub', ub)
+                            print(self.loop_dict[ub])
+                            print(self.var_declared)
                             index = list(self.loop_dict[ub] & self.var_declared)
                             shape[idim] = index[0]
                          else:
@@ -1310,10 +1313,8 @@ def main():
     #assert parse_tree == subroutine_tree, "Parsed tree does not match the original subroutine_tree"
     file_path = './org.f90'
     Processor().write_fortran_code_to_file(parse_tree, file_path)
-    all_array_info = cls.extract_array_info(cls.dec_global, cls.var_dummy)
-    local_var_child = cls.extract_names(cls.var_local)
-    modifier = Modifier(all_array_info, cls.loop_dict, cls.var_declared, cls.imp_shape,
-                                  cls.allowed_external_subroutines, local_var_child)
+    modifier = Modifier(cls.all_array_info[subroutine_key], cls.loop_dict, cls.var_declared[subroutine_key], cls.imp_shape[subroutine_key],
+                                  cls.allowed_external_subroutines, cls.var_local_names[subroutine_key])
     parse_tree = modifier.replace_gpu_unsupported(parse_tree)
     modified_block = modifier.merge_vector_loop(parse_tree)
     assert modifier.do_index == 0 and modifier.enddo_index == 0, (
@@ -1328,14 +1329,14 @@ if __name__ == "__main__":
     # Initialize SubroutineFinder with paths to module directory and module tree.
     cls = Extractor(isolator.module_dir_sp, isolator.module_tree_sp)
     cls.find_subroutines()
-    subroutine_key = 'explicitsnow_gone'
+    subroutine_key = 'hydrol_root_profile'
     subroutine_tree = cls.subroutines[subroutine_key]
     cls.find_variables(subroutine_tree, subroutine_key)
-    cls.dec_global = {}
-    cls.dec_child = {}
-    cls.find_global_variables(isolator.module_dir_sp, isolator.module_tree_sp, cls.var_global)
+    cls.find_global_variables(isolator.module_dir_sp, isolator.module_tree_sp, cls.var_global[subroutine_key], subroutine_key)
     cls.extract_loop_indices()
-    
+    cls.extract_array_info(cls.dec_global[subroutine_key], cls.var_dummy[subroutine_key], subroutine_key)
+    cls.extract_names(subroutine_key)
     # Call the main function to process the Fortran code.
+    
     main()
 

@@ -196,7 +196,7 @@ class Processor:
             logging.error(f"Failed to generate allocation statements, Error: {e}")
             raise
 
-    def map_declaration(self, implicit_dec, explicit_dec):
+    def map_declaration(self, implicit_dec, explicit_dec=None, dimensions=None):
         try:
             if walk(implicit_dec, F23.Intrinsic_Type_Spec):
                 type_and_attributes = walk(implicit_dec, F23.Intrinsic_Type_Spec)[0].tostr()
@@ -208,13 +208,15 @@ class Processor:
             else:
                 raise ValueError("variable name is not present!")
             
-            if walk(explicit_dec, F23.Explicit_Shape_Spec):
-                shape = []
-                for dim in walk(explicit_dec, F23.Explicit_Shape_Spec):
-                    shape.append(dim.tostr())
-                dimensions = ', '.join([name for name in shape])
-            else:
-                raise ValueError("array shape is not present!")
+            if dimensions is None:
+                assert explicit_dec is not None, "explicit_dec must be provided when assumed_shape is not None."
+                if walk(explicit_dec, F23.Explicit_Shape_Spec):
+                    shape = []
+                    for dim in walk(explicit_dec, F23.Explicit_Shape_Spec):
+                        shape.append(dim.tostr())
+                    dimensions = ', '.join([name for name in shape])
+                else:
+                    raise ValueError("array shape is not present!")
             
             if walk(implicit_dec, F23.Intent_Attr_Spec):
                 intent_attr = walk(implicit_dec, F23.Intent_Attr_Spec)[0].tostr()
