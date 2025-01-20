@@ -137,7 +137,7 @@ class Shaper:
                                 dims = act_arg.children[1].children
                                 shape = []
                                 assert array_name in all_array_info, (
-                                        f"Error in modify_colon_array_vec: Array '{array_name}' not present in all_array_info."
+                                        f"Error in shaper_function: Array '{array_name}' not present in all_array_info."
                                         )
                                 array_info = all_array_info[array_name]
                                 for idim, dim in enumerate(dims):
@@ -148,7 +148,7 @@ class Shaper:
                             elif isinstance(act_arg, F23.Name):
                                 array_name = act_arg.tostr()
                                 assert array_name in all_array_info, (
-                                        f"Error in modify_colon_array_vec: Array '{array_name}' not present in all_array_info."
+                                        f"Error in shaper_function: Array '{array_name}' not present in all_array_info."
                                         )
                                 array_info = all_array_info[array_name]
                                 shape = []
@@ -194,7 +194,7 @@ class Shaper:
                             entity_decl = walk(gchild, F23.Entity_Decl)[0].tostr()
                             if entity_decl == name:
                                 child.children[child.children.index(gchild)] = new_dec
-            #return new_dec
+            return new_dec
         except Exception as e:
             raise RuntimeError(f"An error occurred in method 'shaper_subroutine': {e}")
 
@@ -220,7 +220,7 @@ class Shaper:
                         args = intrinsic_args.children
                         if len(args) == 1:
                             print(f"SIZE for {args[0].tostr()} without an explicit 'DIM'. "
-                                    "This implies sum of all dimensions.")
+                                    "This implies size of all dimensions.")
                             dim_value = 'ALL'
                         if len(args) == 2:
                             if isinstance(args[1], F23.Actual_Arg_Spec):
@@ -230,8 +230,7 @@ class Shaper:
                                     assert isinstance(dim_value_node, F23.Int_Literal_Constant), "Second item in must be an Int_Literal_Constant."
                                     dim_value = dim_value_node.tostr()
                             elif isinstance(args[1], F23.Int_Literal_Constant):
-                                raise ValueError(
-                                        f"Unexpected argument structure in intrinsic. Expected 'dim={args[1].tostr()}' but found: {args[1].tostr()}")
+                                dim_value = args[1].tostr()
                             else:
                                 raise ValueError("Unexpected structure for intrinsic arguments.")
                         
@@ -241,7 +240,6 @@ class Shaper:
                             entity_decls = walk(declaration_stmt, F23.Entity_Decl)
                             assert len(entity_decls) == 1,"walk(declaration_stmt, F23.Entity_Decl), but got a different number."
                             if entity_decls[0].tostr() == args[0].tostr():
-                                print('the shape is find')
                                 size = '1'
                                 for idim, explicit_shape in enumerate(walk(declaration_stmt, F23.Explicit_Shape_Spec), start=1):
                                     parts = [part.strip() for part in explicit_shape.tostr().split(':')]
@@ -266,6 +264,7 @@ class Shaper:
                     entity_decl = walk(gchild, F23.Entity_Decl)[0].tostr()
                     if entity_decl == name:
                         node.parent.children[node.parent.children.index(gchild)] = new_dec
+            return new_dec
         except Exception as e:
             raise RuntimeError(f"An error occurred in method 'find_enclosing_subroutine': {e}")
 

@@ -39,7 +39,7 @@ class Isolator:
             shutil.rmtree(self.target_module_dir)
         os.makedirs(self.target_module_dir)
 
-    def isolate_child_function(self, cls, function_values):
+    def isolate_child_function(self, cls, function_values, parent_subroutine_key):
         """
         """
         assert isinstance(function_values[0], F23.Function_Subprogram), \
@@ -67,6 +67,26 @@ class Isolator:
         if arg_list is not None:
             for child in arg_list.children:
                 cls.dummy_arg_list[function_key].append(child.tostr())
+        cls.find_variables(function_tree, function_key, parent_subroutine_key)
+        cls.extract_names(function_key)
+        if cls.var_global[function_key]:
+            cls.find_global_variables(self.module_dir_sp, self.module_tree_sp, cls.var_global[function_key], function_key)
+        if cls.var_dummy[function_key]:
+            cls.process_declaration_variables(cls.var_dummy[function_key], function_key)
+        if cls.dec_global[function_key]:
+            for key in cls.dec_global[function_key].keys():
+                cls.process_declaration_variables(cls.dec_global[function_key][key], function_key)
+        shape_to_search = cls.shapes_variables[function_key] - cls.scalar_variables[function_key] - cls.var_global[function_key]
+        if shape_to_search:
+            cls.find_global_variables(self.module_dir_sp, self.module_tree_sp, shape_to_search, function_key)
+            cls.var_global[function_key].update(shape_to_search)
+
+        cls.extract_array_info(cls.dec_global[function_key], cls.var_dummy[function_key], function_key)
+
+        for key, values in cls.dec_global[function_key].items():
+            if walk(values, F23.Function_Subprogram):
+                raise ValueError(f"Calling Function_Subprogram {key} in Function_Subprogram {function_key}. Not yet implimented")
+
         raise ValueError(f"Variable {function_key}")
 
     def isolate_child_subroutine(self, cls, subroutine_key, local_var_parent=None):
@@ -110,8 +130,9 @@ class Isolator:
 
         for key, values in cls.dec_global[subroutine_key].items():
              if walk(values, F23.Function_Subprogram):
+                 print(f"Calling Function_Subprogram {key} in Subroutine_Subprogram {subroutine_key}.")
                  print("Trying to isolate a child function .... ", key)
-                 self.isolate_child_function(cls, values)
+                 self.isolate_child_function(cls, values, subroutine_key)
 
 
         if dummy_as_local:
@@ -119,7 +140,10 @@ class Isolator:
         if dummy_as_local:
             cls.var_local_names[subroutine_key].update(dummy_as_local)
 
+        cls.extract_loop_vect(subroutine_key, subroutine_tree)
+
         modifier = Modifier(
+                cls.loop_vect[subroutine_key],
                 cls.all_array_info[subroutine_key], 
                 cls.loop_dict, 
                 cls.var_declared[subroutine_key], 
@@ -222,8 +246,10 @@ class Isolator:
             cls.var_global[subroutine_key].update(shape_to_search)
 
         cls.extract_array_info(cls.dec_global[subroutine_key], cls.var_dummy[subroutine_key], subroutine_key)
+        cls.extract_loop_vect(subroutine_key, subroutine_tree)
 
         modifier = Modifier(
+                cls.loop_vect[subroutine_key],
                 cls.all_array_info[subroutine_key], 
                 cls.loop_dict, 
                 cls.var_declared[subroutine_key], 
@@ -274,10 +300,10 @@ class Isolator:
         cls.find_subroutines()
         cls.extract_loop_indices()
 
-        '''for subroutine in ['hydrol_soil']:#cls.subroutine_keys_ncl:
+        for subroutine in ['hydrol_soil']:#cls.subroutine_keys_ncl:
             self.parent_subroutine_call = set()
             self.isolate_parent_subroutine(cls, subroutine)
-        '''
+        
         '''
         subs = ['hydrol_diag_soil','hydrol_diag_soil_flux','hydrol_nudge_mc','hydrol_root_profile',
                 'hydrol_soil_coef','hydrol_soil_froz','hydrol_soil_infilt','hydrol_soil_setup',
@@ -288,20 +314,20 @@ class Isolator:
                 'explicitsnow_levels','explicitsnow_maxmass','explicitsnow_melt_refrz','explicitsnow_profile','explicitsnow_subli',
                 'explicitsnow_transf'}
         '''
-        subs = ['explicitsnow_transf','explicitsnow_subli','explicitsnow_profile','explicitsnow_maxmass','explicitsnow_levels',
+        '''subs = ['explicitsnow_transf','explicitsnow_subli','explicitsnow_profile','explicitsnow_maxmass','explicitsnow_levels',
                 'explicitsnow_iceprofile', 'explicitsnow_icemelt','explicitsnow_icelevels','explicitsnow_age', 'explicitsnow_compactn',
                 'explicitsnow_drift', 'explicitsnow_gone']
         subs = ['explicitsnow_grain']
         for subroutine in subs:
             self.isolate_child_subroutine(cls, subroutine)
-        
+        '''
     def run(self):
         self.create_target_directory()
         self.process_subroutines()
 
 if __name__ == "__main__":
     rest_of_path = "modipsl_truck_opt/modeles/ORCHIDEE/src_sechiba/"
-    target_module = "explicitsnow"
+    target_module = "hydrol" #"explicitsnow"
     work = os.getenv("WORK")
     isolator = Isolator(rest_of_path, target_module, work)
     isolator.run()
