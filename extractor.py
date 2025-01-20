@@ -28,6 +28,7 @@ class Extractor:
             self.call_subroutines = defaultdict(list)
             self.call_within_sub = defaultdict(set)
             self.loop_dict = defaultdict(set)
+            self.loop_vect = defaultdict(lambda: None)
             self.exclude = {'kjpindex', 'nslm', 'nstm', 'nvm', 'nsnow', 'DIM', 'dim', 'MASK', 'next_calc_loop'}
             self.cases_to_exclude = ['clear', 'finalize', 'init', 'initialize', 'read']
             self.allowed_external_subroutines = {'ipslerr_p', 'xios_orchidee_send_field'}
@@ -66,6 +67,31 @@ class Extractor:
         except Exception as e:
             raise RuntimeError(f"Error in extract_loop_indices: {str(e)}")
 
+
+    def extract_loop_vect(self, subroutine_key, subroutine_tree):
+        """
+        """
+        try:
+            for loop in walk(subroutine_tree, F23.Nonlabel_Do_Stmt):
+                if walk(loop, F23.Or_Operand) or walk(loop, F23.Part_Ref):
+                    continue
+                line_parts = loop.tostr().split('=')
+                loop_index = line_parts[0].split()[-1]
+                start_end_stride_values = line_parts[1].split(',')
+                loop_start = start_end_stride_values[0].strip()
+                loop_end = start_end_stride_values[1].strip()
+                if loop_end and loop_end == 'kjpindex':
+                    loop_string = loop.tostr()
+                    if self.loop_vect[subroutine_key] is not None:
+                        if self.loop_vect[subroutine_key] != loop_string:
+                            raise ValueError(
+                                    f"Inconsistent vector loops for {subroutine_key}: "
+                                    f"existing '{self.loop_vect[subroutine_key]}' and new '{loop_string}' do not match."
+                                    )
+                    else:
+                        self.loop_vect[subroutine_key] = loop_string
+        except Exception as e:
+            raise RuntimeError(f"Error in extract_loop_indices: {str(e)}")
 
     def find_subroutines(self):
         """
@@ -349,9 +375,8 @@ class Extractor:
                     idc += 1
         traverse_subroutine(subroutine_tree)
 
-    def find_variables(self, subroutine_tree, subroutine_key):
+    def find_variables(self, subroutine_tree, subroutine_key, parent_subroutine_key=None):
 
-        procedure = type(subroutine_tree)
         var_in_local = set()
         shapes = set()
         self.var_dummy[subroutine_key].clear()
@@ -375,14 +400,40 @@ class Extractor:
                 node_list = [declaration_stmt]
             for node in node_list:
                 implicit_shape = walk(node, F23.Assumed_Shape_Spec)
+                intrinsic_name = walk(node, F23.Intrinsic_Name)
                 if implicit_shape:
-                    shape_finder = Shaper(self.module_dir, self.parsed_modules, self.dummy_arg_list, self.actual_arg_spec_list, self.call_subroutines)
-                    nodes = shape_finder.shaper_subroutine(node, subroutine_key)
-                    print('\033[32m' + 'found :' + '\033[0m', nodes, '\033[32m' + 'for :' + '\033[0m', node)
-                    node = Processor().map_declaration(node, explicit_dec=nodes, dimensions=None)
-                    entity_decl = walk(node, F23.Entity_Decl)[0].tostr()
-                    if entity_decl not in self.imp_shape[subroutine_key]:
-                        self.imp_shape[subroutine_key][entity_decl] = node
+                    print('\033[38;5;214m' + "Warning: Implicit shape detected in the decleration!" + '\033[0m')
+                    print(f'\033[38;5;214mNode: {node}\033[0m')
+                    if isinstance(subroutine_tree, F23.Subroutine_Subprogram):
+                        shape_finder = Shaper(self.module_dir, self.parsed_modules, \
+                                self.dummy_arg_list, self.actual_arg_spec_list, \
+                                self.call_subroutines)
+                        nodes = shape_finder.shaper_subroutine(node, subroutine_key)
+                        print(f'\033[32mfound: {nodes}\033[0m')
+                        node = Processor().map_declaration(node, explicit_dec=nodes, dimensions=None)
+                        entity_decl = walk(node, F23.Entity_Decl)[0].tostr()
+                        if entity_decl not in self.imp_shape[subroutine_key]:
+                            self.imp_shape[subroutine_key][entity_decl] = node
+                    elif isinstance(subroutine_tree, F23.Function_Subprogram):
+                        assert parent_subroutine_key is not None, "Error: 'parent_subroutine_key' must not be None."
+                        shape_finder = Shaper(self.module_dir, self.parsed_modules, self.dummy_arg_list)
+                        nodes = shape_finder.shaper_function(node, subroutine_tree, subroutine_key, self.all_array_info[parent_subroutine_key])
+                        print(f'\033[32mfound: {nodes}\033[0m')
+                        node = nodes
+                        entity_decl = walk(node, F23.Entity_Decl)[0].tostr()
+                        if entity_decl not in self.imp_shape[subroutine_key]:
+                            self.imp_shape[subroutine_key][entity_decl] = node
+                if intrinsic_name:
+                    print(f'\033[38;5;214mWarning: Intrinsic name detected in the decleration!\033[0m')
+                    print(f'\033[38;5;214mNode: {node}\033[0m')
+                    if isinstance(subroutine_tree, F23.Function_Subprogram):
+                        shape_finder = Shaper(self.module_dir, self.parsed_modules, self.dummy_arg_list)
+                        nodes = shape_finder.shaper_intrinsic_size(node)
+                        print(f'\033[32mfound: {nodes}\033[0m')
+                        node = nodes
+                    else:
+                        raise ValueError(f"intrinsic_name found in {type(subroutine_tree).__name__} declarations! "
+                                f"This case is not implemented yet!")
                 intent = walk(node, F23.Intent_Spec)
                 entity_decls = walk(node, F23.Entity_Decl)
                 assert len(entity_decls) == 1,\

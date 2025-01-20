@@ -50,7 +50,7 @@ class Modifier:
         create_act_call_stmt(subroutine_stmt):
             Creates and modifies a call statement for a subroutine with dummy arguments and vector dimensions.
     """
-    def __init__(self, all_array_info, loop_dict, var_declared, imp_shape, io_subroutines, var_local,\
+    def __init__(self, loop_vect_value, all_array_info, loop_dict, var_declared, imp_shape, io_subroutines, var_local,\
             within_calls=None, child_error_flag=None):
         self.all_array_info = all_array_info
         self.loop_dict = loop_dict
@@ -65,8 +65,10 @@ class Modifier:
         self.enddo_index = 0
         self.remove_return = False
         self.acc_enter_data_copyin = None
-        self.vector_loop = F23.Nonlabel_Do_Stmt('DO ji = 1, kjpindex')
-        self.dummy_add = self.vector_loop.tostr().split('=')[0].split()[-1]
+        self.vector_loop = F23.Nonlabel_Do_Stmt(loop_vect_value) if loop_vect_value else None
+        self.dummy_add = (
+                self.vector_loop.tostr().split('=')[0].split()[-1] if loop_vect_value else None
+                )
         self.unsupported_functions = ['MINLOC', 'MAXLOC']
         self.fortran_math_functions_no_dim = ["ABS", "SQRT", "EXP", "LOG", "SIN", "COS",\
                 "TAN", "ASIN", "ACOS", "ATAN", "MOD", "SIGN", "MAX", "MIN", "FLOOR",\
@@ -1011,25 +1013,6 @@ class Modifier:
                 elif isinstance(child, F23.Dummy_Arg_List):
                     for grandchild in child.children:
                         grandchild_name = grandchild.tostr()
-                        #  it is indeed necessary to pass the array slices as dummy arguments?
-                        #  Error: Out of memory
-                        '''if grandchild_name in self.all_array_info:
-                            array_info = self.all_array_info[grandchild_name]
-                            has_vec_dim = any('kjpindex' in dim.values() for dim in array_info)
-                            if has_vec_dim:
-                                shape = []
-                                for idim in range(len(array_info)):
-                                    ub = array_info[idim]['dim_end']
-                                    if ub == 'kjpindex':
-                                        shape.append(self.dummy_add)
-                                    else:
-                                        shape.append(':')
-                                dimensions = ', '.join(shape)
-                                dummy_arg_list.append(f"{grandchild_name}({dimensions})")
-                            else:
-                                raise ValueError(f"Error: Vector dimension not found in array '{grandchild_name}'")
-                        else:
-                        '''
                         dummy_arg_list.append(grandchild_name)
             arg_list = ', '.join(dummy_arg_list)
             code = (
@@ -1060,8 +1043,9 @@ class Modifier:
                     if isinstance(child, F23.Subroutine_Stmt):
                         subroutine_name, arg_list = None, None
                         subroutine_stmt = "subroutine "
-                        add_decl = f"INTEGER(KIND = i_std), INTENT(IN) :: {self.dummy_add}"
-                        self.dummy_add_decl = F23.Type_Declaration_Stmt(add_decl)
+                        if loop_vect_value:
+                            add_decl = f"INTEGER(KIND = i_std), INTENT(IN) :: {self.dummy_add}"
+                            self.dummy_add_decl = F23.Type_Declaration_Stmt(add_decl)
                         for grandchild in child.children:
                             if grandchild is None:
                                 continue 
@@ -1069,21 +1053,21 @@ class Modifier:
                                 subroutine_name = grandchild.tostr()
                                 subroutine_stmt += f"{grandchild.tostr()}_acc"
                             elif isinstance(grandchild, F23.Dummy_Arg_List):
-                                #if self.error_flag.keys():
-                                #    error_flag_keys = ', '.join([name for name in self.error_flag.keys()])
                                 arg_list = grandchild.tostr()
-                                self.dummy_arg_list = set()
+                                if loop_vect_value:
+                                    dummy_arg_list_new = f"{self.dummy_add}, {arg_list}"
+                                else:
+                                    dummy_arg_list_new = arg_list
                                 self.acc_enter_data_copyin = []
                                 for grandgrandchild in grandchild.children:
                                     grandgrandchild_str = grandgrandchild.tostr()
-                                    self.dummy_arg_list.add(grandgrandchild_str)
                                     if grandgrandchild_str in self.all_array_info:
                                         self.acc_enter_data_copyin.append(grandgrandchild_str)
                                 if self.error_flag.keys():
                                     error_flag_keys = ', '.join([name for name in self.error_flag.keys()])
-                                    subroutine_stmt += f"({error_flag_keys}, {self.dummy_add}, {grandchild.tostr()})"
+                                    subroutine_stmt += f"({error_flag_keys}, {dummy_arg_list_new})"
                                 else:
-                                    subroutine_stmt += f"({self.dummy_add}, {grandchild.tostr()})"
+                                    subroutine_stmt += f"({dummy_arg_list_new})"
                             else:
                                 raise ValueError(f"Unexpected type '{type(grandchild)}' encountered in children.")
                         assert subroutine_name is not None, "Subroutine name cannot be None."
