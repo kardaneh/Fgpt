@@ -1043,7 +1043,7 @@ class Modifier:
                     if isinstance(child, F23.Subroutine_Stmt):
                         subroutine_name, arg_list = None, None
                         subroutine_stmt = "subroutine "
-                        if loop_vect_value:
+                        if self.dummy_add:
                             add_decl = f"INTEGER(KIND = i_std), INTENT(IN) :: {self.dummy_add}"
                             self.dummy_add_decl = F23.Type_Declaration_Stmt(add_decl)
                         for grandchild in child.children:
@@ -1054,7 +1054,7 @@ class Modifier:
                                 subroutine_stmt += f"{grandchild.tostr()}_acc"
                             elif isinstance(grandchild, F23.Dummy_Arg_List):
                                 arg_list = grandchild.tostr()
-                                if loop_vect_value:
+                                if self.dummy_add:
                                     dummy_arg_list_new = f"{self.dummy_add}, {arg_list}"
                                 else:
                                     dummy_arg_list_new = arg_list
