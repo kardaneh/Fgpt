@@ -26,7 +26,7 @@ class Executive:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Execute the specified Fortran module.")
-    parser.add_argument("target_module", type=str, help="The Fortran file name to compile and run.")
+    parser.add_argument("--target_module", type=str, help="The Fortran file name to compile and run.")
     parser.add_argument("--mode", type=str, default="CPU", choices=["CPU", "GPU"], 
                         help="The compilation mode: 'CPU' or 'GPU' (default: 'CPU').")
     
