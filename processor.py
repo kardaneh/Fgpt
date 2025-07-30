@@ -150,7 +150,7 @@ class Processor:
     def separate_entity_allocation(self, allocate_stmt):
         try:
             lst = []
-            opt = ""
+            opt = None
 
             for child in allocate_stmt.children:
                 if child is None:
@@ -164,7 +164,10 @@ class Processor:
 
             new_allocation = []
             for variable in lst:
-                allocation = f"allocate({variable}, {opt})"
+                if opt is not None:
+                    allocation = f"allocate({variable}, {opt})"
+                else:
+                    allocation = f"allocate({variable})"
                 new_allocation.append(F23.Allocate_Stmt(allocation))
 
             logging.info("Successfully generated allocation statements")

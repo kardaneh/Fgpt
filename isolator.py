@@ -326,9 +326,9 @@ class Isolator:
         self.process_subroutines()
 
 if __name__ == "__main__":
-    rest_of_path = "modipsl_truck_opt_OLD/modeles/ORCHIDEE/src_sechiba/"
+    rest_of_path = "modipsl_truck_opt/modeles/ORCHIDEE/src_sechiba/"
     target_module = "hydrol" #"explicitsnow"
-    work = os.getenv("WORK")
+    work = os.getenv("works")
     isolator = Isolator(rest_of_path, target_module, work)
     isolator.run()
 
