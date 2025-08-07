@@ -97,7 +97,7 @@ class Processor:
             parse_tree = self.parser(reader)
             return parse_tree.children[0]
         except Exception as e:
-            logging.error(f"Failed to generate Fortran code for routine {routine_name}, Error: {e}")
+            logging.error(f"Failed to generate Fortran code for routine {subroutine_name}, Error: {e}")
             raise
 
     def separate_entity_declarations(self, declaration_stmt):
@@ -150,7 +150,7 @@ class Processor:
     def separate_entity_allocation(self, allocate_stmt):
         try:
             lst = []
-            opt = ""
+            opt = None
 
             for child in allocate_stmt.children:
                 if child is None:
@@ -164,7 +164,12 @@ class Processor:
 
             new_allocation = []
             for variable in lst:
-                allocation = f"allocate({variable}, {opt})"
+
+                if opt is not None:                                                                                                              
+                    allocation = f"allocate({variable}, {opt})"                                      
+                else:                                                                                  
+                    allocation = f"allocate({variable})"   
+
                 new_allocation.append(F23.Allocate_Stmt(allocation))
 
             logging.info("Successfully generated allocation statements")
@@ -565,6 +570,20 @@ class Processor:
                             """
 
                             subnode.content.insert(kdx + 1, self.parse_fortran_statement(code_end))
+                            kdx += 1
+
+                            write_statements = []
+                            for modified_var in var_modif:
+                                stmt = F23.Write_Stmt(f"write(1363) {modified_var}") 
+                                write_statements.append(stmt.tostr()) 
+                            write_stmt_code = "\n".join(write_statements)
+                            code_template = (
+                                f"open(unit=1363, file='{self.benchmark_dir}/{subroutine_name}/output.bin', form='unformatted', status='replace')\n"
+                                f"{write_stmt_code}\n"
+                                "close(1363)"
+                            )
+                            
+                            subnode.content.insert(kdx + 1, self.parse_fortran_statement(code_template))
                             kdx += 1
 
                             for modified_var in var_modif:

@@ -1,0 +1,141 @@
+Python_templates:
+    Python_global_normal_template:
+        name: "Python_global_normal_template"
+        template: | 
+            import numpy as np
+            from scipy.io import FortranFile
+            import os
+            
+            i_std = np.int32   
+            r_std = np.float64
+            
+            nsnow = i_std(3)
+            nslm = i_std(11)
+            nvm = i_std(15)
+            nstm = i_std(3)
+            kjpindex = i_std(4717)
+            
+            ier = i_std(0)
+            ic0 = i_std(0)
+            ic = i_std(0)
+            icr = r_std(0.0)
+            start_time = r_std(0.0)
+            stop_time = r_std(0.0)
+            
+            def declaration_initialization():
+                print("--- add the declaration and initialization in module global ---")
+
+    Python_global_class_template:
+        name: "Python_global_class_template"
+        template: |
+            import numpy as np
+            import os
+            from scipy.io import FortranFile
+            
+            class Global_module:
+                def __init__(self):
+                    i_std = np.int32   
+                    r_std = np.float64
+                    
+                    self.nsnow = i_std(3)
+                    self.nslm = i_std(11)
+                    self.nvm = i_std(15)
+                    self.nstm = i_std(3)
+                    self.kjpindex = i_std(4717)
+                    
+                    self.ier = i_std(0)
+                    self.ic0 = i_std(0)
+                    self.ic = i_std(0)
+                    self.icr = r_std(0.0)
+                    self.start_time = r_std(0.0)
+                    self.stop_time = r_std(0.0)
+            
+                def declaration_initialization(self):
+                    pass
+
+    Python_main_template:
+        name: "Python_main_template"
+        template: |
+            import os
+            import time
+            import numpy as np
+            from scipy.io import FortranFile
+            
+            def main():
+                print('--- inside the main program ---')
+
+
+            if __name__ == "__main__":
+                main()
+
+    Python_read_template:
+        name: "Python_read_template"
+        template: |
+            path = f'{benchmark_dir}/{subroutine_name}/global.bin'
+            ffile = FortranFile(path, 'r')
+
+    Python_read_for_loop_template:
+        name: "Python_read_for_loop_template"
+        template: |
+            path = f'{benchmark_dir}/{subroutine_name}/global.bin'
+            ffile = FortranFile(path, 'r')
+            for name in []:
+                variable = globals()[name]
+                if variable.dtype == np.float64 and (not isinstance(variable, np.ndarray)):
+                    globals()[name] = ffile.read_reals(np.float64)[0]
+                elif variable.dtype == np.float64 and isinstance(variable, np.ndarray):
+                    arr_shape = variable.shape
+                    globals()[name] = ffile.read_reals(np.float64).reshape(arr_shape, order='F')
+                elif variable.dtype == np.bool or (variable.dtype == np.int32 and (not isinstance(variable, np.ndarray))):
+                    globals()[name] = ffile.read_ints(np.int32)[0]
+                elif variable.dtype == np.int32 and isinstance(variable, np.ndarray):
+                    arr_shape = variable.shape
+                    globals()[name] = ffile.read_ints(np.int32).reshape(arr_shape, order='F')
+
+    Python_read_for_loop_class_template:
+        name: "Python_read_for_loop_class_template"
+        template: |
+            path = f'{benchmark_dir}/{subroutine_name}/global.bin'
+            ffile = FortranFile(path, 'r')
+            for attr_name in []:
+                attribute = getattr(self,attr_name)
+                if attribute.dtype == np.float64 and isinstance(attribute, np.ndarray):
+                    arr_shape = attribute.shape
+                    setattr(self,attr_name, ffile.read_reals(np.float64).reshape(arr_shape, order='F'))
+                elif attribute.dtype == np.int32 and isinstance(attribute, np.ndarray):
+                    arr_shape = attribute.shape
+                    setattr(self,attr_name, ffile.read_ints(np.int32).reshape(arr_shape, order='F'))
+            
+    Python_read_dummy_template:
+        name: "Python_read_dummy_template"
+        template: |
+            def read_dummy():
+                path = f'{benchmark_dir}/{subroutine_name}/dummy.bin'
+                ffile = FortranFile(path, 'r')
+                for var in []:
+                    if isinstance(var, np.ndarray):
+                        arr_shape = var.shape
+                        if var.dtype == np.float64:
+                            var[:] = ffile.read_reals(np.float64).reshape(arr_shape, order='F')
+                        elif var.dtype == np.int32:
+                            var[:] = ffile.read_ints(np.int32).reshape(arr_shape, order='F')
+                
+                    
+                    
+                    
+
+
+
+
+
+
+
+
+
+
+
+
+            
+            
+                                
+            
