@@ -59,6 +59,7 @@ class F2NP:
                 r'\bTHEN\b': ':'
                 }
         self.intrinsic_replacements = {
+                r'\bINT\b': 'int',
                 r'\bMIN\b': 'min',
                 r'\bMAX\b': 'max',
                 r'\bMAXVAL\b': 'np.max',
@@ -223,6 +224,8 @@ class F2NP:
                     dtype = 'float32'
                 elif child.children[0]=='INTEGER':
                     dtype = 'int'
+                elif child.children[0]=='LOGICAL':
+                    dtype = 'bool'
                 else:
                     raise ValueError("unknown dtype")
             elif isinstance(child, F23.Entity_Decl_List):

@@ -144,6 +144,16 @@ class Extractor:
 
     def extract_names(self, subroutine_key):
         """
+        Extracts the names of the local variables using the var_local attribute based on the given subroutine key argument. 
+        The var_local attribute contains a list of Type_Declaration_Stmt from which extraction of the variables names is done. 
+
+        params
+        ------
+        - subroutine_key (str):  
+        
+        return
+        ------
+        - None 
         """
         for item in self.var_local[subroutine_key]:
             for entity in walk(item, F23.Entity_Decl):
@@ -582,7 +592,10 @@ class Extractor:
                 else:
                     raise ValueError("dimension control error!")
             self.all_array_info[subroutine_key][array_name] = [part for part in current_var_info]
-
+        
+        for key in self.var_modif_info:
+            sorted_inner = sorted(self.var_modif_info[key].items())
+            self.var_modif_info[key] = defaultdict(list,sorted_inner)
 
     def process_declaration_variables(self, items, subroutine_key):
         for item in items:
