@@ -1,5 +1,4 @@
-WORK=/data/ssivanes
-
+WORK = /scratchu/kardaneh
 FC_NVIDIA = mpif90
 
 NETCDF_INCDIR = -I$(NETCDF_C_ROOT)/include -I$(NETCDF_FORTRAN_ROOT)/include

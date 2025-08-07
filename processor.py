@@ -164,7 +164,6 @@ class Processor:
 
             new_allocation = []
             for variable in lst:
-
                 if opt is not None:                                                                                                              
                     allocation = f"allocate({variable}, {opt})"                                      
                 else:                                                                                  
