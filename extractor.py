@@ -14,6 +14,96 @@ class Extractor:
 
     def __init__(self, module_dir, module_tree):
         """
+        The Extractor class is responsible for analyzing a parsed Fortran module and extracting
+        all relevant structural and dependency information needed to isolate subroutines or functions.
+
+        It builds an internal representation of:
+            - Subroutines and their relationships (calls, dependencies, dummy args)
+            - Variables (local, global, dummy, modified)
+            - Loops and vectorization patterns
+            - Shape and type declarations
+            - Cross-module dependencies
+
+        This information is critical for use in:
+            - Fortran subroutine isolation (used by the `Isolator` class)
+            - Source-to-source transformation (e.g., Fortran to Python)
+            - Refactoring or static analysis
+
+        Parameters
+        ----------
+        module_dir : str
+            Path to the directory containing the target module source.
+        module_tree : fparser.two.Fortran2008.Program
+            The parsed AST of the target Fortran module.
+
+        Attributes
+        ----------
+        subroutine_keys_all : set
+            All subroutine/function names found in the module.
+        subroutine_keys_ncl : set
+            Subroutines without any `CALL` statements inside.
+        subroutines : defaultdict
+            Mapping from subroutine names to their AST node representations.
+        func_result : defaultdict
+            Return variable names of functions (if applicable).
+        dummy_arg_list : defaultdict[list]
+            List of dummy arguments for each subroutine.
+        actual_arg_spec_list : defaultdict[list]
+            Actual arguments used in calls within each subroutine.
+        external_subroutines : set
+            Subroutines that are declared external (outside the current module).
+        call_subroutines : defaultdict[list]
+            All `CALL` statements found within each subroutine.
+        call_within_sub : defaultdict[set]
+            Subroutines invoked from within each subroutine.
+        loop_dict : defaultdict[set]
+            Loops associated with each subroutine (parsed structurally).
+        loop_vect : defaultdict
+            Optional vectorization-related loops (used in optimizations).
+        exclude : set
+            Reserved variable names that are ignored during extraction.
+        cases_to_exclude : list
+            Naming patterns used to skip uninteresting subroutines.
+        allowed_external_subroutines : set
+            External calls allowed during isolation or transformation.
+        dec_global : defaultdict[dict[list]]
+            Global declarations (e.g., types, dimensions) extracted from modules.
+        all_array_info : defaultdict[dict[list]]
+            Metadata about arrays (e.g., shape, intent).
+        imp_shape : defaultdict[dict]
+            Mapping of implicitly shaped variables and their dimensions.
+        scalar_variables : defaultdict[set]
+            Set of scalar variables for each subroutine.
+        shapes_variables : defaultdict[set]
+            Set of shaped (array) variables per subroutine.
+        var_modif_info : defaultdict[dict[list]]
+            Variables modified within each subroutine and how.
+        general_usage_dict : defaultdict
+            Generalized usage metadata (e.g., access patterns).
+        parsed_modules : defaultdict
+            Cache of other parsed modules for dependency resolution.
+        var_global : defaultdict[set]
+            Global variables accessed within each subroutine.
+        var_dummy : defaultdict[list]
+            Dummy arguments declared for each subroutine.
+        var_local : defaultdict[list]
+            Locally declared variables in each subroutine.
+        var_modif : defaultdict[set]
+            Variables modified (assigned) in each subroutine.
+        var_local_names : defaultdict[set]
+            Set of all local variable names in each subroutine.
+        var_declared : defaultdict[set]
+            All explicitly declared variables per subroutine.
+
+        Notes
+        -----
+        The Extractor class serves as the central analysis engine for understanding the full
+        semantic structure of a Fortran module. It supports and powers transformations such as:
+        - Isolating subroutines
+        - Rewriting declarations
+        - Tracing variable usage and modifications
+        - Validating or rewriting loop patterns
+        This makes it ideal for high-level program understanding, static analysis, or test-case generation.
         """
         try:
             self.module_dir = module_dir
@@ -51,6 +141,17 @@ class Extractor:
 
     def extract_loop_indices(self):
         """
+        Extract loop indices and their associated loop bounds from all non-labeled DO loops in the module.
+
+        This method traverses the parsed Fortran module tree to find all DO loops without labels. For each loop, 
+        it parses the loop control statement to identify the loop index variable and the loop's end bound. It skips 
+        loops that involve complex expressions (such as logical OR operands or part references).
+
+        The extracted loop indices are stored in a dictionary (`self.loop_dict`), where each key is a loop end bound 
+        and the corresponding value is a set of loop index variables that iterate up to that bound.
+
+        This information is useful for analyzing loop structures, dependencies, and vectorization opportunities 
+        within the module's subroutines.
         """
         try:
             for loop in walk(self.module_tree, F23.Nonlabel_Do_Stmt):
@@ -70,6 +171,29 @@ class Extractor:
 
     def extract_loop_vect(self, subroutine_key, subroutine_tree):
         """
+        Identifies and extracts the vector loop structure from a given subroutine.
+
+        This method searches for non-labeled `DO` loops in the subroutine body
+        that are structured like:
+        DO index = start, end, stride
+        Specifically, it looks for loops whose end value is `'kjpindex'`, 
+        which is used here as an indicator of a vectorized loop.
+
+        For each such loop:
+            - If `kjpindex` is used as the upper bound, the loop is stored.
+            - If a vector loop is already stored and a new one is found,
+                the method checks for consistency. If they differ, it raises an error.
+
+        Skips any loops that involve logical operations (e.g., `Or_Operand`) or 
+        part references (e.g., array accesses) in their structure.
+
+        Parameters:
+            subroutine_key (str): Name of the current subroutine.
+            subroutine_tree (Fparser node): Parsed tree of the subroutine.
+
+        Raises:
+            RuntimeError: If an error occurs during parsing or inconsistency is detected.
+            ValueError: If multiple inconsistent vector loops are found in the same subroutine.
         """
         try:
             for loop in walk(subroutine_tree, F23.Nonlabel_Do_Stmt):
@@ -95,6 +219,22 @@ class Extractor:
 
     def find_subroutines(self):
         """
+        Extracts all subroutines from the parsed Fortran module and gathers metadata for each one.
+
+        This method performs the following:
+        - Walks the module tree to identify all `Subroutine_Subprogram` nodes.
+        - Extracts the subroutine name (`subroutine_key`) and its dummy argument list.
+        - Filters out subroutines whose names match patterns in `self.cases_to_exclude` (e.g., 'init', 'clear', 'read').
+        - Saves the full subroutine structure in `self.subroutines`, and tracks the name in `self.subroutine_keys_all`.
+        - Detects all internal and external subroutine calls:
+            - Internal calls are stored in `self.call_within_sub[subroutine_key]`.
+            - External calls (e.g., library or unrelated modules) are detected by checking against `self.allowed_external_subroutines`.
+        - Records all actual arguments passed during calls in `self.actual_arg_spec_list`.
+        - Stores all call statements in `self.call_subroutines`.
+        - Tracks subroutines that are considered "having no call" in `self.subroutine_keys_ncl`.
+        - Determines external subroutines as those that are called but not defined within the current module.
+
+        This function is essential for analyzing dependencies between procedures and for enabling subroutine isolation.
         """
         for sub in walk(self.module_tree, F23.Subroutine_Subprogram):
             subroutine_key, arg_list = None, None
@@ -164,6 +304,54 @@ class Extractor:
 
     def extract_intent(self, subroutine_key, subroutine_tree, within_calls=None):
         """
+        Analyze the usage of dummy arguments within a Fortran subroutine and 
+        infer their INTENT attribute (IN, OUT, or INOUT).
+
+        This function traverses the execution part of the given subroutine and 
+        tracks how each dummy argument is used:
+    
+        - If a variable is used only on the right-hand side of expressions (e.g., in conditions or RHS of assignments), 
+            it is classified as INTENT(IN).
+        - If a variable appears on the left-hand side (LHS) of an assignment, it is classified as INTENT(OUT).
+        - If a variable is both read and written (RHS and LHS), or passed to a child subroutine with a known 
+            INTENT(INOUT), it is classified as INTENT(INOUT).
+    
+        The function handles various Fortran constructs:
+            - Assignment statements
+            - Loop headers (e.g., DO loops)
+            - Conditional branches (IF-THEN, ELSEIF)
+            - WHERE and ELSEWHERE constructs
+            - Nested subroutine calls
+    
+        In the case of subroutine calls, if a dummy argument is passed to a child subroutine, the method also 
+        references the intent already extracted for the child (from `self.general_usage_dict`) to propagate 
+        intent information upward through the call hierarchy.
+
+        The results are stored in `self.general_usage_dict` under the corresponding `subroutine_key`.
+
+        Parameters:
+        -----------
+        subroutine_key : str
+            The name of the subroutine being analyzed.
+    
+        subroutine_tree : Fparser node (Subroutine_Subprogram)
+            The parsed tree representation of the subroutine.
+
+        within_calls : set[str], optional
+            Set of subroutine names called within the current subroutine. Used for validating and propagating
+            intent information when dummy arguments are passed to internal calls.
+
+        Raises:
+        -------
+        AssertionError:
+            If expected subroutine calls or argument lists are not found.
+    
+        RuntimeError:
+            If traversal encounters unexpected structures.
+
+        Returns:
+        --------
+        None (results stored in self.general_usage_dict)
         """
         dummy_arg_list = self.dummy_arg_list[subroutine_key]
         usage = {arg: {'intent': None, 'first_use_assign': None, 'first_use_update': False} for arg in dummy_arg_list}
@@ -280,6 +468,25 @@ class Extractor:
     @staticmethod
     def add_intent(block, intent):
         """
+        Adds an `INTENT` attribute to a Fortran type declaration block.
+
+        This function inspects a given `F23.Type_Declaration_Stmt` AST node, extracts its type,
+        shape, and declared variables, and reconstructs it with the specified `INTENT` attribute 
+        (e.g., `INTENT(IN)`, `INTENT(OUT)`, or `INTENT(INOUT)`).
+
+        Parameters:
+            block (F23.Type_Declaration_Stmt): 
+                The Fortran type declaration statement node to modify. Must contain
+                intrinsic type, shape specification, and entity declarations.
+            intent (str): 
+                The desired INTENT attribute to inject (e.g., "in", "out", "inout").
+
+        Returns:
+            F23.Type_Declaration_Stmt: 
+                A new type declaration node with the added INTENT attribute.
+
+        Raises:
+            AssertionError: If `block` is not of type `F23.Type_Declaration_Stmt`.
         """
         assert isinstance(block, F23.Type_Declaration_Stmt), (
             f"Expected block to be of type 'F23.Type_Declaration_Stmt', "
@@ -308,6 +515,42 @@ class Extractor:
         )
 
     def clean_subroutine(self, subroutine_key, subroutine_tree):
+        """
+        Validates and corrects INTENT specifications for dummy arguments in a given subroutine.
+
+        This method traverses all type declaration statements in the subroutine and ensures that:
+            - Each dummy argument (from the subroutine's signature) has an `INTENT` attribute.
+            - The `INTENT` (IN, OUT, or INOUT) matches the intent previously inferred using `extract_intent`.
+            - If multiple variables are declared in one statement, they are separated into individual declarations 
+                for more accurate handling.
+            - If the existing `INTENT` is missing or incorrect, it modifies the statement accordingly.
+            - Warnings are printed for any inconsistencies found (e.g., undeclared usage or missing intents).
+
+        The method modifies the subroutine tree **in-place** by:
+            - Replacing or inserting corrected declaration statements.
+            - Using `self.general_usage_dict[subroutine_key]` to lookup expected intents.
+            - Calling `self.add_intent()` to apply missing intent attributes.
+
+        Parameters:
+        -----------
+        subroutine_key : str
+            The name of the subroutine to clean.
+
+        subroutine_tree : Fortran2003.Subroutine_Subprogram
+            The parsed tree (AST node) of the subroutine being cleaned.
+
+        Notes:
+        ------
+        - This method assumes that `extract_intent()` has already been run, and intent info is available in 
+      `     self.general_usage_dict`.
+        - Color-coded terminal warnings (`\033[38;5;214m`) and confirmations (`\033[32m`) are printed for user visibility.
+        - The processor internally uses `walk()` and `Processor().separate_entity_declarations()` to navigate and 
+            restructure declaration blocks where needed.
+    
+        Returns:
+        --------
+        None (modifies subroutine_tree in-place)
+        """
         def traverse_subroutine(block):
             if hasattr(block, "content"):
                 idc = 0
@@ -386,6 +629,56 @@ class Extractor:
         traverse_subroutine(subroutine_tree)
 
     def find_variables(self, subroutine_tree, subroutine_key, parent_subroutine_key=None):
+        """
+        Analyzes a subroutine or function's declarations and execution to extract and categorize variables.
+
+        This method performs a full scan of a subroutine's abstract syntax tree to identify:
+            - **Declared** vs **Used** variables.
+            - **Dummy arguments** (with or without `INTENT`).
+            - **Local variables** (non-dummy and declared within the subroutine).
+            - **Global variables** (used but not declared in the subroutine).
+            - **Modified variables** (i.e., appearing on the LHS of an assignment).
+            - **Array shape dependencies** (variables that define array bounds).
+            - Handles implicit and intrinsic shape declarations, and replaces them with explicit forms when possible.
+
+        The analysis is stored internally in various class attributes:
+            - `self.var_dummy[subroutine_key]` — List of dummy arguments.
+            - `self.var_local[subroutine_key]` — List of local variables.
+            - `self.var_global[subroutine_key]` — Set of global variables (used but undeclared).
+            - `self.var_declared[subroutine_key]` — Set of explicitly declared variable names.
+            - `self.var_modif[subroutine_key]` — Set of modified variable names.
+            - `self.imp_shape[subroutine_key]` — Dictionary of array variables with implicitly shaped declarations.
+    
+        If any dummy argument is found without an `INTENT`, an error is raised (for strict isolation handling).
+
+        Parameters
+        ----------
+        subroutine_tree : Fortran2003.Subroutine_Subprogram or Function_Subprogram
+            Parsed Fortran AST of the subroutine or function to be analyzed.
+
+        subroutine_key : str
+            Name of the subroutine (or function) being analyzed.
+
+        parent_subroutine_key : str, optional
+            Required when analyzing a function, used to retrieve array shape info from its caller.
+
+        Raises
+        ------
+        ValueError
+            If a dummy argument is declared without an `INTENT` or intrinsic shape handling is not implemented
+            for some specific cases.
+
+        Notes
+        -----
+        - This method relies on `Shaper` to resolve implicit or intrinsic shapes into explicit ones.
+        - Multiple variable declarations in one line are separated for clarity and safety.
+        - Warnings are printed for intrinsic names or implicit shapes found during traversal.
+        - `self.exclude` is used to filter out known indices or ignored variables from global list.
+
+        Returns
+        -------
+        None (modifies internal state of the Extractor instance)
+        """
 
         var_in_local = set()
         shapes = set()
@@ -501,6 +794,51 @@ class Extractor:
                     raise ValueError(f"Unexpected assignment left-hand side type: {type(lhs)} in statement: {assign_stmt.tostr()}")
     
     def find_global_variables(self, module_dir, module_tree, var_global, subroutine_key):
+        """
+        Recursively searches for the declarations of global variables and external procedures
+        within the module hierarchy starting from a given module directory and parse tree.
+
+        Parameters
+        ----------
+        module_dir : str
+            The directory path of the current module where the search starts.
+
+        module_tree : F23.Module
+            The parse tree of the current module, typically obtained via a Fortran parser.
+
+        var_global : set or list
+            A collection of variable or procedure names (strings) that are considered global
+            and need to be resolved within the module or its children.
+
+        subroutine_key : str
+            The name of the subroutine whose global variables are being resolved; used as a key
+            in `self.dec_global` to store found declarations.
+
+        Behavior
+        --------
+        - For each variable/procedure name in `var_global`, determines whether it is an external
+            subroutine or a variable.
+        - If it is a variable (not external), uses `Navigator.variable_finder` to search for its
+            declaration within the given module tree and directory.
+        - If found, stores the declarations in `self.dec_global[subroutine_key]` keyed by the variable name.
+        - If additional unresolved variables are discovered during the search (`var_initial`),
+            recursively searches child modules for these variables.
+        - For external subroutines, uses `Navigator.external_subroutine_finder` to locate the
+            procedure declarations and similarly stores them.
+        - Raises an error if a variable or external procedure cannot be found in the accessible modules.
+
+        Outputs
+        -------
+        - Prints progress messages with color highlighting to indicate the status of each search:
+            - Searching (with spinner)
+            - Found (success)
+            - Attention messages for additional recursive searches.
+
+        Raises
+        ------
+        ValueError
+            When a global variable or external procedure is not found in the module hierarchy.
+        """
         for declaration in var_global:
             self.finder = Navigator(module_dir, module_tree, self.parsed_modules)
             if declaration not in self.external_subroutines:
@@ -533,6 +871,56 @@ class Extractor:
                     raise ValueError(f"Procedure '{declaration}' is not found in any child modules.")
 
     def extract_array_info(self, dec_global, var_dummy_list, subroutine_key):
+        """
+        Extracts detailed dimensional information for arrays used within a given subroutine, 
+        and stores this information in `self.all_array_info`.
+
+        The method processes:
+            - Global variable declarations (from other modules)
+            - Dummy argument declarations (with potential shape info)
+            - Local variable declarations
+        and normalizes array-related declarations to extract shape dimensions such as:
+            - Lower and upper bounds
+            - Dimensionality (rank)
+    
+        It also tracks whether a variable has been modified and annotates it with additional 
+        properties like `DIMENSION` or type information (e.g., REAL, INTEGER, etc.) 
+        in `self.var_modif_info`.
+
+        Parameters
+        ----------
+        dec_global : dict
+            Dictionary of external/global declarations used in the subroutine, typically obtained 
+            from imported modules. Keys are module names; values are lists of `Type_Declaration_Stmt`.
+    
+        var_dummy_list : list
+            List of dummy argument declaration statements (`Type_Declaration_Stmt`) for the current subroutine.
+    
+        subroutine_key : str
+            Identifier (name) for the current subroutine being analyzed.
+
+        Populates
+        ---------
+        - self.all_array_info[subroutine_key]: dict
+            Stores detailed dimension info for each array variable in the subroutine.
+            Example:
+            {
+                'arr': [
+                    {'dim_str': '1', 'dim_end': 'N'},
+                    {'dim_str': '1', 'dim_end': 'M'}
+                ],
+            }
+
+        - self.var_modif_info[subroutine_key]: defaultdict
+            Annotates modified variables with associated types and whether they're arrays.
+
+        Notes
+        -----
+        - The method combines `ALLOCATE` statements and declaration statements for `ALLOCATABLE` arrays.
+        - It skips scalars and focuses only on variables with `Explicit_Shape_Spec`.
+        - Dimensions are normalized into a list of dicts containing start and end bounds.
+        - If dimensions are improperly formatted or too many colon-separated parts are found, it raises an error.
+        """
         normalized_items = []
         for key in dec_global:
             for item in dec_global[key]:
@@ -598,6 +986,42 @@ class Extractor:
             self.var_modif_info[key] = defaultdict(list,sorted_inner)
 
     def process_declaration_variables(self, items, subroutine_key):
+        """
+        Analyze a list of declaration-related statements within a subroutine and 
+        categorize variables as either scalar or array (with explicit shape).
+
+        Parameters
+        ----------
+        items : list
+            A list of parsed Fortran statements (typically from the Specification_Part)
+            to analyze. These may include type declarations and allocation statements.
+    
+        subroutine_key : str
+            The name of the subroutine being processed, used as a key to store 
+            results in class-level dictionaries.
+
+        Behavior
+        --------
+        - Skips irrelevant statements (e.g., USE statements).
+        - For `Allocate_Stmt` or `Type_Declaration_Stmt` with explicit shape info,
+            it extracts the array shape variables and stores them in `shapes_variables[subroutine_key]`.
+        - For scalar variable declarations (i.e., without DIMENSION attributes), 
+            it identifies and stores them in `scalar_variables[subroutine_key]`.
+        - Excludes specific names defined in `self.exclude` from both scalar and shape tracking.
+
+        Notes
+        -----
+        - This method helps differentiate between scalar and shaped variables in
+            preparation for isolation, dependency resolution, and rewriting.
+        - If a declaration is neither a type declaration nor an allocation, it's ignored.
+        - Dimension attributes (e.g., `DIMENSION(:,:)`) are used to distinguish arrays 
+            when shape specs are not explicitly present.
+
+        Raises
+        ------
+        AssertionError
+            If an unshaped variable is not declared with a `Type_Declaration_Stmt`.
+        """
         for item in items:
             dec_stmt = isinstance(item, F23.Type_Declaration_Stmt)
             alo_stmt = isinstance(item, F23.Allocate_Stmt)

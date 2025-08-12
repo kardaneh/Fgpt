@@ -11,8 +11,55 @@ from fparser.two import Fortran2008 as F28
 
 class Isolator:
     """
+    The Isolator class is designed to extract and prepare a Fortran procedure (e.g., subroutine or function)
+    so that it can be compiled and executed independently of the rest of the original codebase.
+
+    This process is particularly useful for:
+    - Isolated testing or debugging of specific Fortran routines
+    - Simplified transformation, such as source-to-source translation (e.g., to Python)
+    - Generating standalone reproducible test cases from large code bases
+
+    Functionality:
+    -------------
+    - Identifies and loads the specified Fortran module (`target_module`)
+    - Parses the source file into an abstract syntax tree (AST) using `fparser`
+    - Stores both original and parsed versions of the module
+    - Sets up paths for temporary isolated compilation and execution
+    - Prepares metadata about subroutine calls and dependencies
+
+    Initialization Parameters:
+    --------------------------
+    rest_of_path : str
+        The relative path to the directory containing the target Fortran module.
+    target_module : str
+        The name of the module to be isolated (without `.f90`).
+    work : str
+        The working directory root (typically an environment variable like `$works`).
+
+    Attributes:
+    -----------
+    module_file_sp : str
+        Path to the original or copied source file of the target module.
+    module_tree_sp : Fortran2008.Program
+        AST representation of the module using `fparser`.
+    module_tree_cp : Fortran2008.Program
+        A re-parsed version of the module tree for structural transformation.
+    module_string : str
+        Stringified source code of the module (used for copying or rewriting).
+    target_module_dir : str
+        Output directory for the isolated module artifacts.
+    child_subroutine_call : dict
+        Tracks subroutine calls made within other subroutines.
+    child_error_flag : dict
+        Tracks compilation or transformation errors during isolation.
+
+    Notes:
+    ------
+    The isolation workflow is designed to be extendable. This class can later be
+    used in conjunction with automatic input generation, test harness creation,
+    or source-to-source translation routines.
     """
-    def __init__(self, rest_of_path, target_module, work):
+    def __init__(self, rest_of_path, target_module, work, openacc):
         self.module_global_file = "module_global.f90"
         self.main_program_file = "main.f90"
         self.rest_of_path = rest_of_path
@@ -33,6 +80,7 @@ class Isolator:
         self.target_module_dir = os.path.join(os.getcwd(), self.target_module.split('.')[0])
         self.child_subroutine_call = defaultdict(list)
         self.child_error_flag = defaultdict(lambda: defaultdict(dict))
+        self.openacc = openacc
     
     def create_target_directory(self):
         if os.path.exists(self.target_module_dir):
@@ -142,23 +190,36 @@ class Isolator:
 
         cls.extract_loop_vect(subroutine_key, subroutine_tree)
 
-        modifier = Modifier(
+        modified_subroutine_tree = None
+        call_stmt_vec = None
+        dummy_add_decl = None
+        error_flag = None
+        acc_enter_data_copyin = None
+
+        if self.openacc:
+            modifier = Modifier(
                 cls.loop_vect[subroutine_key],
-                cls.all_array_info[subroutine_key], 
-                cls.loop_dict, 
-                cls.var_declared[subroutine_key], 
+                cls.all_array_info[subroutine_key],
+                cls.loop_dict,
+                cls.var_declared[subroutine_key],
                 cls.imp_shape[subroutine_key],
-                cls.allowed_external_subroutines, 
-                cls.var_local_names[subroutine_key])
-        working_tree = modifier.replace_gpu_unsupported(working_tree)
-        modified_block = modifier.merge_vector_loop(working_tree)
-        
-        assert modifier.do_index == 0 and modifier.enddo_index == 0, (
+                cls.allowed_external_subroutines,
+                cls.var_local_names[subroutine_key]
+                )
+
+            working_tree = modifier.replace_gpu_unsupported(working_tree)
+            modified_block = modifier.merge_vector_loop(working_tree)
+
+            assert modifier.do_index == 0 and modifier.enddo_index == 0, (
                 f"Error: do_index and enddo_index are not reset properly. "
                 f"do_index={modifier.do_index}, enddo_index={modifier.enddo_index}"
                 )
-        
-        modified_subroutine_tree = modifier.add_vector_loop(modified_block)
+
+            modified_subroutine_tree = modifier.add_vector_loop(modified_block)
+            call_stmt_vec = modifier.subroutine_call_act_vec
+            dummy_add_decl = modifier.dummy_add_decl
+            error_flag = modifier.error_flag
+            acc_enter_data_copyin = modifier.acc_enter_data_copyin
 
         if not dummy_as_local:
 
@@ -169,27 +230,50 @@ class Isolator:
 
             subroutine_dir = os.path.join(self.target_module_dir, subroutine_key)
             os.makedirs(subroutine_dir)
-
-            call_stmt_org = modifier.subroutine_call_act_org
-            call_stmt_vec = modifier.subroutine_call_act_vec
         
-            self.processor_sp.add_declarations(cls.dec_global[subroutine_key], cls.var_modif_info[subroutine_key])
-            file_path = os.path.join(subroutine_dir, self.module_global_file)
-            self.processor_sp.update_global_module(cls.dec_global[subroutine_key], file_path, subroutine_key, self.module_tree_cp)
-            file_path = os.path.join(subroutine_dir, self.main_program_file)
-            sub_trees = [subroutine_tree, modified_subroutine_tree]
-            call_stmts = [call_stmt_org, call_stmt_vec]
+            self.processor_sp.add_declarations(
+                    cls.dec_global[subroutine_key], 
+                    cls.var_modif_info[subroutine_key],
+                    openacc=self.openacc
+                    )
 
-            self.processor_sp.update_main_program(cls.var_dummy[subroutine_key], sub_trees, call_stmts, \
-                    modifier.dummy_add_decl, \
-                    modifier.error_flag, \
-                    modifier.acc_enter_data_copyin, \
-                    cls.var_modif_info[subroutine_key], file_path, subroutine_key, \
-                    cls.dummy_arg_list[subroutine_key], self.module_tree_cp)
+            file_path = os.path.join(subroutine_dir, self.module_global_file)
+            self.processor_sp.update_global_module(
+                    cls.dec_global[subroutine_key], 
+                    file_path, subroutine_key, 
+                    self.module_tree_cp
+                    )
+            file_path = os.path.join(subroutine_dir, self.main_program_file)
+
+            sub_trees = [subroutine_tree]
+            arg_list = ', '.join([name for name in cls.dummy_arg_list[subroutine_key]])
+            call_stmt_org =  F23.Call_Stmt(f"CALL {subroutine_key}({arg_list})")
+            call_stmts = [call_stmt_org]
+
+            if self.openacc:
+                sub_trees.append(modified_subroutine_tree)
+                call_stmts.append(call_stmt_vec)
+
+            self.processor_sp.update_main_program(
+                    custom_dec_inout=cls.var_dummy[subroutine_key],
+                    custom_subroutine_trees=sub_trees,
+                    call_stmts=call_stmts,
+                    var_modif=cls.var_modif_info[subroutine_key],
+                    file_path=file_path,
+                    subroutine_name=subroutine_key,
+                    dummy_args=cls.dummy_arg_list[subroutine_key],
+                    module_tree=self.module_tree_cp,
+                    childs_subroutine_tree=None,
+                    openacc=self.openacc,
+                    dummy_add_decl=dummy_add_decl,
+                    error_flag=error_flag,
+                    acc_data_copyin=acc_enter_data_copyin
+                    )
+
             error_status = self.processor_sp.compile_and_run(os.getcwd(), self.target_module_dir)
             assert error_status == 0, "Error: Compilation failed or main_program not generated."
             self.processor_sp.write_fortran_code_to_file(self.module_tree_cp, self.path_to_target)
-        return modified_subroutine_tree, modifier.error_flag
+        return modified_subroutine_tree, error_flag
         
 
     def isolate_parent_subroutine(self, cls, subroutine_key, subroutines_parent=None):
@@ -213,8 +297,10 @@ class Isolator:
             #        self.child_subroutine_call[subroutine_key_parent].append(subroutine_tree)
             if child_subroutine_key not in cls.call_within_sub:
                 mod_child_subroutine_tree, error_flag = self.isolate_child_subroutine(cls, child_subroutine_key, cls.var_local_names[subroutine_key])
-                self.child_subroutine_call[subroutine_key].append(mod_child_subroutine_tree)
-                self.child_error_flag[subroutine_key][child_subroutine_key] = error_flag
+                if mod_child_subroutine_tree is not None:
+                    self.child_subroutine_call[subroutine_key].append(mod_child_subroutine_tree)
+                if error_flag is not None:
+                    self.child_error_flag[subroutine_key][child_subroutine_key] = error_flag
                 self.collect_global_vars_decl(cls.dec_global[child_subroutine_key], cls.dec_global[subroutine_key])
             #else:
             #    self.parent_subroutine_call.add(subroutine_key)
@@ -248,43 +334,73 @@ class Isolator:
         cls.extract_array_info(cls.dec_global[subroutine_key], cls.var_dummy[subroutine_key], subroutine_key)
         cls.extract_loop_vect(subroutine_key, subroutine_tree)
 
-        modifier = Modifier(
-                cls.loop_vect[subroutine_key],
-                cls.all_array_info[subroutine_key], 
-                cls.loop_dict, 
-                cls.var_declared[subroutine_key], 
-                cls.imp_shape[subroutine_key],
-                cls.allowed_external_subroutines, 
-                cls.var_local_names[subroutine_key],
-                cls.call_within_sub[subroutine_key],
-                self.child_error_flag[subroutine_key]
+        modified_subroutine_tree = None
+        call_stmt_vec = None
+        dummy_add_decl = None
+        error_flag = None
+        acc_enter_data_copyin = None
+
+        if self.openacc:
+            modifier = Modifier(
+                    cls.loop_vect[subroutine_key],
+                    cls.all_array_info[subroutine_key], 
+                    cls.loop_dict, 
+                    cls.var_declared[subroutine_key], 
+                    cls.imp_shape[subroutine_key],
+                    cls.allowed_external_subroutines, 
+                    cls.var_local_names[subroutine_key],
+                    cls.call_within_sub[subroutine_key],
+                    self.child_error_flag[subroutine_key]
+                    )
+            working_tree = modifier.replace_gpu_unsupported(working_tree)
+            modified_block = modifier.merge_vector_loop(working_tree)
+
+            assert modifier.do_index == 0 and modifier.enddo_index == 0, (
+                    f"Error: do_index and enddo_index are not reset properly. "
+                    f"do_index={modifier.do_index}, enddo_index={modifier.enddo_index}"
+                    )
+
+            modified_subroutine_tree = modifier.add_vector_loop(modified_block)
+            call_stmt_vec = modifier.subroutine_call_act_vec
+            dummy_add_decl = modifier.dummy_add_decl
+            error_flag = modifier.error_flag
+            acc_enter_data_copyin = modifier.acc_enter_data_copyin
+
+        self.processor_sp.add_declarations(
+                cls.dec_global[subroutine_key],
+                cls.var_modif_info[subroutine_key],
+                openacc=self.openacc
                 )
-        working_tree = modifier.replace_gpu_unsupported(working_tree)
-        modified_block = modifier.merge_vector_loop(working_tree)
-
-        assert modifier.do_index == 0 and modifier.enddo_index == 0, (
-                f"Error: do_index and enddo_index are not reset properly. "
-                f"do_index={modifier.do_index}, enddo_index={modifier.enddo_index}"
-                )
-
-        modified_subroutine_tree = modifier.add_vector_loop(modified_block)
-        call_stmt_org = modifier.subroutine_call_act_org
-        call_stmt_vec = modifier.subroutine_call_act_vec
-
-        self.processor_sp.add_declarations(cls.dec_global[subroutine_key], cls.var_modif_info[subroutine_key])
+        
         file_path = os.path.join(subroutine_dir, self.module_global_file)
         self.processor_sp.update_global_module(cls.dec_global[subroutine_key], file_path, subroutine_key, self.module_tree_cp)
         file_path = os.path.join(subroutine_dir, self.main_program_file)
-        sub_trees = [subroutine_tree, modified_subroutine_tree]
-        call_stmts = [call_stmt_org, call_stmt_vec]
+
+        sub_trees = [subroutine_tree]
+        arg_list = ', '.join([name for name in cls.dummy_arg_list[subroutine_key]])
+        call_stmt_org =  F23.Call_Stmt(f"CALL {subroutine_key}({arg_list})")
+        call_stmts = [call_stmt_org]
+
+        if self.openacc:
+            sub_trees.append(modified_subroutine_tree)
+            call_stmts.append(call_stmt_vec)
+
         
-        self.processor_sp.update_main_program(cls.var_dummy[subroutine_key], sub_trees, call_stmts, \
-                modifier.dummy_add_decl,\
-                modifier.error_flag,\
-                modifier.acc_enter_data_copyin, \
-                cls.var_modif_info[subroutine_key], file_path, subroutine_key, \
-                cls.dummy_arg_list[subroutine_key], self.module_tree_cp, \
-                self.child_subroutine_call[subroutine_key])
+        self.processor_sp.update_main_program(
+                custom_dec_inout=cls.var_dummy[subroutine_key],
+                custom_subroutine_trees=sub_trees,
+                call_stmts=call_stmts,
+                var_modif=cls.var_modif_info[subroutine_key],
+                file_path=file_path,
+                subroutine_name=subroutine_key,
+                dummy_args=cls.dummy_arg_list[subroutine_key],
+                module_tree=self.module_tree_cp,
+                childs_subroutine_tree=self.child_subroutine_call[subroutine_key],
+                openacc=self.openacc,
+                dummy_add_decl=dummy_add_decl,
+                error_flag=error_flag,
+                acc_data_copyin=acc_enter_data_copyin
+                )
 
         error_status = self.processor_sp.compile_and_run(os.getcwd(), self.target_module_dir)
         assert error_status == 0, "Error: Compilation failed or main_program not generated."
@@ -300,31 +416,35 @@ class Isolator:
         cls.find_subroutines()
         cls.extract_loop_indices()
         
-        '''
+        
         for subroutine in ['hydrol_soil']:#cls.subroutine_keys_ncl:
             self.parent_subroutine_call = set()
             self.isolate_parent_subroutine(cls, subroutine)
-        '''
-        '''
-        subs = ['hydrol_diag_soil']
+        
         '''
         subs = ['hydrol_diag_soil','hydrol_diag_soil_flux','hydrol_nudge_mc','hydrol_root_profile','hydrol_soil_coef','hydrol_soil_froz',
                 'hydrol_soil_infilt','hydrol_soil_setup','hydrol_soil_smooth_over_mcs2','hydrol_soil_smooth_under_mcr','hydrol_soil_tridiag','hydrol_split_soil']
+        '''
+
         '''
         subs = {'explicitsnow_age','explicitsnow_compactn','explicitsnow_compactn_up', 'explicitsnow_drift',
                 'explicitsnow_fall','explicitsnow_gone','explicitsnow_icelevels','explicitsnow_icemelt','explicitsnow_iceprofile',
                 'explicitsnow_levels','explicitsnow_maxmass','explicitsnow_melt_refrz','explicitsnow_profile','explicitsnow_subli',
                 'explicitsnow_transf'}
         '''
+
         '''
         subs = ['explicitsnow_transf','explicitsnow_subli','explicitsnow_profile','explicitsnow_maxmass','explicitsnow_levels',
                 'explicitsnow_iceprofile', 'explicitsnow_icemelt','explicitsnow_icelevels','explicitsnow_age', 'explicitsnow_compactn',
                 'explicitsnow_drift', 'explicitsnow_gone']
         subs = ['explicitsnow_grain']
         '''
+
+        '''
         for subroutine in subs:
             self.isolate_child_subroutine(cls, subroutine)
-        
+        '''
+
     def run(self):
         self.create_target_directory()
         self.process_subroutines()
@@ -332,7 +452,8 @@ class Isolator:
 if __name__ == "__main__":
     rest_of_path = "modipsl_truck_opt/modeles/ORCHIDEE/src_sechiba/"
     target_module = "hydrol" #"explicitsnow"
-    work = os.getenv("work")
-    isolator = Isolator(rest_of_path, target_module, work)
+    work = os.getenv("works")
+    openacc = False
+    isolator = Isolator(rest_of_path, target_module, work, openacc)
     isolator.run()
 
