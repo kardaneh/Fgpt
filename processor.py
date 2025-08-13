@@ -259,7 +259,7 @@ class Processor:
 
     def add_entity_to_declaration(self, declaration_stmt, var_modif):
         """
-        Modifies a Fortran declaration by appending new variables (with _cpu suffix)
+        Modifies a Fortran declaration by appending new variables (with _copy suffix)
         for those listed in var_modif.
 
         Parameters:
@@ -278,7 +278,7 @@ class Processor:
         Notes:
         ------
         - Preserves the left-hand part (e.g., REAL(KIND=f64), INTENT(OUT)).
-        - Duplicates any variable found in var_modif, adding a _cpu version.
+        - Duplicates any variable found in var_modif, adding a _copy version.
         - Useful for creating CPU/GPU variants of variables in transformed code.
         """
         try:
@@ -293,7 +293,7 @@ class Processor:
                     for child_child in walk(child, F23.Entity_Decl):
                         right_part.append(child_child.string)
                         if child_child.string in var_modif:
-                            right_part.append(child_child.string+'_cpu')
+                            right_part.append(child_child.string+'_copy')
 
             left_part_merged = ', '.join([name for name in left_part])
             right_part_merged = ', '.join([name for name in right_part])
@@ -360,10 +360,10 @@ class Processor:
             logging.error(f"Failed to generate allocation statements, Error: {e}")
             raise
 
-    def add_entity_to_allocation(self, allocate_stmt, var_modif):
+    def add_entity_to_allocation(self, allocate_stmt, var_modif, openacc=False):
         """
         Wraps allocation statements with `.not. allocated(...)` condition and adds
-        suffixed allocations (e.g., `_cpu`) for variables in var_modif.
+        suffixed allocations (e.g., `_copy`) for variables in var_modif.
 
         Parameters:
         -----------
@@ -371,7 +371,7 @@ class Processor:
             A parsed allocate statement, potentially allocating multiple variables.
 
         var_modif : list of str
-            A list of variable names that require shadow allocation (e.g., with '_cpu' suffix).
+            A list of variable names that require shadow allocation (e.g., with '_copy' suffix).
 
         Returns:
         --------
@@ -381,7 +381,7 @@ class Processor:
         Notes:
         ------
         - Wraps each allocation inside an `if (.not. allocated(...)) then` block.
-        - If variable is in var_modif, creates a duplicate allocation for `<var>_cpu`.
+        - If variable is in var_modif, creates a duplicate allocation for `<var>_copy`.
         - Prevents redundant allocations at runtime and supports CPU/GPU memory handling.
 
         Raises:
@@ -400,10 +400,11 @@ class Processor:
                         code = f"if(.not. allocated({allocate_name}))then\n{allocate_stmt.tostr()}\nend if"
                         new_allocation.append(self.parse_fortran_statement(code))
                         if allocate_name in var_modif:
-                            allocate_name_add = allocate_name + '_cpu'
-                            allocation = re.sub(rf'\b{allocate_name}\b', allocate_name_add, allocate_stmt.tostr())
-                            code = f"if(.not. allocated({allocate_name_add}))then\n{allocation}\nend if"
-                            new_allocation.append(self.parse_fortran_statement(code))
+                            if openacc:
+                                allocate_name_add = allocate_name + '_copy'
+                                allocation = re.sub(rf'\b{allocate_name}\b', allocate_name_add, allocate_stmt.tostr())
+                                code = f"if(.not. allocated({allocate_name_add}))then\n{allocation}\nend if"
+                                new_allocation.append(self.parse_fortran_statement(code))
             logging.info("Successfully generated allocation statements")
             return new_allocation
         except Exception as e:
@@ -639,7 +640,7 @@ class Processor:
             logging.error(f"Failed to parse module code, Error: {e}")
             raise
 
-    def check_point(self, var, var_cpu, info):
+    def check_point(self, var, var_copy, info):
         """
         Generates and parses a Fortran `IF` block that performs a runtime check 
         to compare two variables: typically a GPU version and a CPU reference.
@@ -653,8 +654,8 @@ class Processor:
         var : str
             The name of the GPU or test version of the variable (e.g., 'a').
     
-        var_cpu : str
-            The name of the CPU or reference version of the variable (e.g., 'a_cpu').
+        var_copy : str
+            The name of the CPU or reference version of the variable (e.g., 'a_copy').
     
         info : list of str
             A list of type/property descriptors, such as ['REAL', 'DIMENSION'] 
@@ -682,50 +683,50 @@ class Processor:
         if 'DIMENSION' in info:
             if 'LOGICAL' not in info:
                 code_template = f"""
-                IF (ALL({var} .EQ. {var_cpu})) THEN
-                    write(*,*) 'Test passed: All elements in {var}_gpu are equal to {var_cpu}.'
+                IF (ALL({var} .EQ. {var_copy})) THEN
+                    write(*,*) 'Test passed: All elements in {var}_comp are equal to {var_copy}.'
                 ELSE
                     write(*,*) ''
-                    write(*,*) 'Test failed: All elements in {var}_gpu do not match {var_cpu}.'
-                    write(*,'(A, E25.16)') 'Maximum absolute error:',  maxval(abs({var} - {var_cpu}))
-                    write(*,'(A, 2E25.16)') 'Min and Max of {var}_gpu:', minval({var}), maxval({var})
-                    write(*,'(A, 2E25.16)') 'Min and Max of {var_cpu}:', minval({var_cpu}), maxval({var_cpu})
+                    write(*,*) 'Test failed: All elements in {var}_comp do not match {var_copy}.'
+                    write(*,'(A, E25.16)') 'Maximum absolute error:',  maxval(abs({var} - {var_copy}))
+                    write(*,'(A, 2E25.16)') 'Min and Max of {var}_comp:', minval({var}), maxval({var})
+                    write(*,'(A, 2E25.16)') 'Min and Max of {var_copy}:', minval({var_copy}), maxval({var_copy})
                     write(*,*) ''
                 ENDIF
                 """
             else:
                 code_template = f"""
-                IF (ALL({var} .EQV. {var_cpu})) THEN
-                    write(*,*) 'LOGICAL EQV test passed: All elements in {var}_gpu are equal to {var_cpu}.'
+                IF (ALL({var} .EQV. {var_copy})) THEN
+                    write(*,*) 'LOGICAL EQV test passed: All elements in {var}_comp are equal to {var_copy}.'
                 ELSE
                     write(*,*) ''
-                    write(*,*) 'LOGICAL EQV test failed: Not all elements in {var}_gpu match {var_cpu}.'
+                    write(*,*) 'LOGICAL EQV test failed: Not all elements in {var}_comp match {var_copy}.'
                     write(*,*) ''
                 ENDIF
                 """
         else:
             if 'LOGICAL' not in info:
                 code_template = f"""
-                IF ({var} .EQ. {var_cpu}) THEN
-                    write(*,*) 'Test passed: {var}_gpu is equal to {var_cpu}.'
+                IF ({var} .EQ. {var_copy}) THEN
+                    write(*,*) 'Test passed: {var}_comp is equal to {var_copy}.'
                 ELSE
                     write(*,*) ''
-                    write(*,*) 'Test failed: {var}_gpu does not match {var_cpu}.'
-                    write(*,'(A, E25.16)') 'Absolute error:', abs({var} - {var_cpu})
-                    write(*,'(A, 2E25.16)') '{var}_gpu:', {var}
-                    write(*,'(A, 2E25.16)') '{var_cpu}:', {var_cpu}
+                    write(*,*) 'Test failed: {var}_comp does not match {var_copy}.'
+                    write(*,'(A, E25.16)') 'Absolute error:', abs({var} - {var_copy})
+                    write(*,'(A, 2E25.16)') '{var}_comp:', {var}
+                    write(*,'(A, 2E25.16)') '{var_copy}:', {var_copy}
                     write(*,*) ''
                 ENDIF
                 """
             else:
                 code_template = f"""
-                IF ({var} .EQV. {var_cpu}) THEN
-                    write(*,*) 'LOGICAL EQV test passed: {var}_gpu is equal to {var_cpu}.'
+                IF ({var} .EQV. {var_copy}) THEN
+                    write(*,*) 'LOGICAL EQV test passed: {var}_comp is equal to {var_copy}.'
                 ELSE
                     write(*,*) ''
-                    write(*,*) 'LOGICAL EQV test failed: {var}_gpu does not match {var_cpu}.'
-                    write(*,'(A, L1)') '{var}_gpu:', {var}
-                    write(*,'(A, L1)') '{var_cpu}:', {var_cpu}
+                    write(*,*) 'LOGICAL EQV test failed: {var}_comp does not match {var_copy}.'
+                    write(*,'(A, L1)') '{var}_comp:', {var}
+                    write(*,'(A, L1)') '{var_copy}:', {var_copy}
                     write(*,*) ''
                 ENDIF
                 """
@@ -1020,7 +1021,10 @@ class Processor:
                             for stmt in specification_part:
                                 is_modified = any(name.string in var_modif for name in walk(stmt, F23.Entity_Decl))
                                 if is_modified:
-                                    subnode.content.insert(kdx + 1, self.add_entity_to_declaration(stmt, var_modif))
+                                    if openacc:
+                                        subnode.content.insert(kdx + 1, self.add_entity_to_declaration(stmt, var_modif))
+                                    else:
+                                        subnode.content.insert(kdx + 1, stmt)
                                 else:
                                     subnode.content.insert(kdx + 1, stmt)
                                 kdx += 1
@@ -1073,7 +1077,7 @@ class Processor:
 
                             if openacc:
                                 for modified_var in var_modif:
-                                    stmt_str = modified_var + '_cpu' + '=' + modified_var
+                                    stmt_str = modified_var + '_copy' + '=' + modified_var
                                     subnode.content.insert(kdx + 1, F23.Assignment_Stmt(stmt_str))
                                     kdx += 1
 
@@ -1125,7 +1129,7 @@ class Processor:
 
                                 for modified_var in var_modif:
                                     var_info = var_modif[modified_var]
-                                    if_construct = self.check_point(modified_var, modified_var+'_cpu', var_info)
+                                    if_construct = self.check_point(modified_var, modified_var+'_copy', var_info)
                                     subnode.content.insert(kdx + 1, if_construct)
                                     kdx += 1
 
@@ -1344,7 +1348,10 @@ class Processor:
                     is_use_stmt = isinstance(item, F23.Use_Stmt)
                     if is_dec_stmt:
                         if var_in_modif:
-                            self.add_to_module.append(self.add_entity_to_declaration(item, var_modif))
+                            if openacc:
+                                self.add_to_module.append(self.add_entity_to_declaration(item, var_modif))
+                            else:
+                                self.add_to_module.append(item)
                         else:
                             self.add_to_module.append(item)
                         all_entity_names = walk(item, F23.Entity_Decl)
@@ -1365,7 +1372,7 @@ class Processor:
                                         if isinstance(child, F23.Name):
                                             self.acc_declare_copyin.append(child.tostr())
                     if is_alo_stmt:
-                        for allocation_stmt in self.add_entity_to_allocation(item, var_modif):
+                        for allocation_stmt in self.add_entity_to_allocation(item, var_modif, openacc):
                             self.add_to_routin.append(allocation_stmt.children[0])
                     if is_use_stmt:
                         self.add_to_usestm.append(item)
