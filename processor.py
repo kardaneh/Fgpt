@@ -7,6 +7,7 @@ from fparser.common.readfortran import FortranFileReader, FortranStringReader
 from fparser.two.parser import ParserFactory
 from collections import deque
 from line_length import FortLineLength 
+from rich.logging import RichHandler
 
 class Processor:
     """
@@ -20,13 +21,21 @@ class Processor:
         An instance of the Fortran 2008 parser created by fparser.
     """
     def __init__(self):
-        logging.basicConfig(level=logging.INFO)
+        #logging.basicConfig(level=logging.INFO)
+        logging.basicConfig(level="INFO", handlers=[RichHandler(show_time=False, show_level=True, show_path=False, enable_link_path=False, markup=False)])
         self.parser = ParserFactory().create(std="f2008")
         self.line_length = FortLineLength()
         current_dir = os.getcwd()
         self.benchmark_dir = os.path.join(current_dir, 'benchmark')
         os.makedirs(self.benchmark_dir, exist_ok=True)
-
+        self.add_to_module = []
+        self.add_to_routin = []
+        self.add_to_usestm = []
+        self.acc_declare_create = []
+        self.acc_declare_copyin = []
+        self.reads_in_decleration_routine = []
+        self.reads_in_read_routine = []
+        self.write_stmt = []
     def parse_fortran_file(self, file_path):
         """
         Parses a Fortran source file and returns its Abstract Syntax Tree (AST).
@@ -49,10 +58,10 @@ class Processor:
         try:
             reader = FortranFileReader(file_path, ignore_comments=False)
             parse_tree = self.parser(reader)
-            logging.info(f"Successfully parsed file: {file_path}")
+            logging.info("Successfully parsed file:\n%s", file_path)
             return parse_tree
         except Exception as e:
-            logging.error(f"Failed to parse file: {file_path}, Error: {e}")
+            logging.error("Failed to parse file:\n%s\nError: %s", file_path, e)
             raise
 
     def parse_fortran_string(self, string):
@@ -120,12 +129,12 @@ class Processor:
             for node in parse_tree.children:
                 for child in node.content:
                     if not isinstance(child, F23.Program_Stmt) and not isinstance(child, F23.End_Program_Stmt):
-                        logging.info(f"Successfully parsed statement: {stmt_str}")
+                        logging.info("Successfully parsed statement:\n%s", stmt_str)
                         return child
             logging.warning(f"No valid statements found in: {stmt_str}")
             return None
         except Exception as e:
-            logging.error(f"Failed to parse statement: {stmt_str}, Error: {e}")
+            logging.error("Failed to parse statement:\n%s\nError: %s", stmt_str, e)
             raise
 
     def parse_fortran_comment(self, stmt_str):
@@ -444,7 +453,7 @@ class Processor:
                 raise ValueError("variable type is not present!")
             
             if walk(implicit_dec, F23.Entity_Decl):
-                array_name = walk(implicit_dec, F23.Entity_Decl)[0].tostr()
+                array_name = walk(implicit_dec, F23.Entity_Decl)[0].children[0].tostr()
             else:
                 raise ValueError("variable name is not present!")
             
@@ -508,9 +517,14 @@ class Processor:
                     else:
                         raise ValueError("variable type is not present!")
                     if walk(item, F23.Entity_Decl):
-                        array_name = walk(item, F23.Entity_Decl)[0].tostr()
+                        array_name = walk(item, F23.Entity_Decl)[0].children[0].tostr()
                     else:
                         raise ValueError("variable name is not present!")
+                    if walk(item, F23.Explicit_Shape_Spec_List):
+                        shape = []
+                        for dim in walk(item, F23.Explicit_Shape_Spec_List):
+                            shape.append(dim.tostr())
+                        dimensions = ', '.join([name for name in shape])
                 else:
                     raise ValueError('Unrecognized statement')
             
@@ -558,7 +572,7 @@ class Processor:
                         left_part.append(child.tostr())
                     elif isinstance(child, F28.Attr_Spec_List) or isinstance(child, F23.Attr_Spec_List):
                         for grandchild in child.children:
-                            if not any(excl in grandchild.string for excl in exclude):
+                            if not any(excl in grandchild.tostr() for excl in exclude):
                                 left_part.append(grandchild.tostr())
                     elif isinstance(child, F23.Entity_Decl_List):
                         right_part = child.tostr()
@@ -1438,9 +1452,9 @@ class Processor:
                 if 'PARAMETER' in attr_spec and not array:
                     initialization = walk(walk(element, F23.Initialization), F23.Name)
                     if initialization:
-                        left_list.append(element)
-                    else:
                         left_list.insert(0, element)
+                    else:
+                        left_list.append(element)
                 elif 'ALLOCATABLE' in attr_spec or array:
                     right_list.append(element)
                 else:
@@ -1513,3 +1527,328 @@ class Processor:
                     return 1
         os.chdir(base_dir)
         return 0
+
+
+if __name__ == "__main__":
+    import unittest
+    import tempfile
+    import shutil
+
+    class TestProcessor(unittest.TestCase):
+        @classmethod
+        def setUpClass(cls):
+            cls.test_dir = tempfile.mkdtemp()
+            cls.processor = Processor()
+            
+            # Create test Fortran files
+            cls.simple_fortran = os.path.join(cls.test_dir, "simple.f90")
+            with open(cls.simple_fortran, "w") as f:
+                f.write("""
+                program simple
+                integer :: a = 10
+                end program simple
+                """)
+                
+            cls.complex_fortran = os.path.join(cls.test_dir, "complex.f90")
+            with open(cls.complex_fortran, "w") as f:
+                f.write("""
+                module test_mod
+                implicit none
+                contains
+                subroutine test_sub(a, b)
+                integer, intent(in) :: a
+                integer, intent(out) :: b
+                b = a * 2
+                end subroutine test_sub
+                end module test_mod
+                """)
+                
+            # Create benchmark directory structure
+            cls.benchmark_subdir = os.path.join(cls.processor.benchmark_dir, "test_sub")
+            os.makedirs(cls.benchmark_subdir, exist_ok=True)
+
+        @classmethod
+        def tearDownClass(cls):
+            shutil.rmtree(cls.test_dir)
+            shutil.rmtree(cls.processor.benchmark_dir)
+
+        def test_parse_fortran_file(self):
+            # Test parsing a simple Fortran file
+            parse_tree = self.processor.parse_fortran_file(self.simple_fortran)
+            self.assertIsInstance(parse_tree, F23.Program)
+            
+            # Test parsing a complex Fortran file
+            parse_tree = self.processor.parse_fortran_file(self.complex_fortran)
+            self.assertIsInstance(parse_tree.children[1], F23.Module)
+            
+            # Test invalid file
+            with self.assertRaises(Exception):
+                self.processor.parse_fortran_file("nonexistent.f90")
+
+        def test_parse_fortran_string(self):
+            # Test parsing a simple program
+            code = "program test\ninteger :: a\nend program test"
+            parse_tree = self.processor.parse_fortran_string(code)
+            self.assertIsInstance(parse_tree, F23.Program)
+            
+            # Test parsing a module
+            code = "module test\nimplicit none\nend module test"
+            parse_tree = self.processor.parse_fortran_string(code)
+            self.assertIsInstance(parse_tree.children[0], F23.Module)
+            
+            # Test invalid code
+            with self.assertRaises(Exception):
+                self.processor.parse_fortran_string("invalid fortran code")
+        
+        def test_parse_fortran_statement(self):
+            # Test assignment statement
+            stmt = "a = 10"
+            node = self.processor.parse_fortran_statement(stmt)
+            self.assertIsInstance(node.children[0], F23.Assignment_Stmt)
+            
+            # Test if statement
+            stmt = "if (a > 0) then\nb = 10\nend if"
+            node = self.processor.parse_fortran_statement(stmt)
+            self.assertIsInstance(node.children[0], F23.If_Construct)
+            
+            # Test invalid statement
+            with self.assertRaises(Exception):
+                self.processor.parse_fortran_statement("invalid statement")
+
+        def test_parse_fortran_comment(self):
+            # Test comment parsing
+            comment = "! This is a comment"
+            node = self.processor.parse_fortran_comment(comment)
+            self.assertEqual(node.tostr().strip(), "! This is a comment")
+            
+            # Test comment with program context
+            comment = "! Module comment"
+            node = self.processor.parse_fortran_comment(comment)
+            self.assertEqual(node.tostr().strip(), "! Module comment")
+
+        def test_initiate_empty_routine(self):
+            # Test creating a simple subroutine
+            subroutine_node = self.processor.initiate_empty_routine("test_sub")
+            self.assertIsInstance(subroutine_node, F23.Subroutine_Subprogram)
+            self.assertIn("read_dummy", subroutine_node.tostr())
+
+        def test_separate_entity_declarations(self):
+            # Test separating multiple declarations
+            decl = "integer :: a, b, c"
+            parsed_decl = self.processor.parse_fortran_statement(decl)
+            separated = self.processor.separate_entity_declarations(parsed_decl.children[0])
+            self.assertEqual(len(separated), 3)
+            self.assertIsInstance(separated[0], F23.Type_Declaration_Stmt)
+            
+            # Test single declaration
+            decl = "real :: x"
+            parsed_decl = self.processor.parse_fortran_statement(decl)
+            separated = self.processor.separate_entity_declarations(parsed_decl.children[0])
+            self.assertEqual(len(separated), 1)
+
+        def test_add_entity_to_declaration(self):
+            # Test adding entities to declaration
+            decl = "real :: a, b"
+            parsed_decl = self.processor.parse_fortran_statement(decl)
+            modified = self.processor.add_entity_to_declaration(parsed_decl.children[0], ["a"])
+            self.assertIn("a_copy", modified.tostr())
+            
+            # Test with multiple variables
+            modified = self.processor.add_entity_to_declaration(parsed_decl.children[0], ["a", "b"])
+            self.assertIn("a_copy", modified.tostr())
+            self.assertIn("b_copy", modified.tostr())
+
+        def test_separate_entity_allocation(self):
+            # Test separating allocation statements
+            alloc = "allocate(a(10), b(20), stat=ierr)"
+            parsed_alloc = self.processor.parse_fortran_statement(alloc)
+            separated = self.processor.separate_entity_allocation(parsed_alloc.children[0])
+            self.assertEqual(len(separated), 2)
+            self.assertIsInstance(separated[0], F23.Allocate_Stmt)
+            
+            # Test with stat option
+            self.assertIn(F23.Alloc_Opt_List("STAT = ierr").tostr(), separated[0].tostr())
+
+        def test_add_entity_to_allocation(self):
+            # Test adding entities to allocation
+            alloc = "allocate(a(10))"
+            parsed_alloc = self.processor.parse_fortran_statement(alloc)
+            modified = self.processor.add_entity_to_allocation(parsed_alloc.children[0], ["a"], openacc=True)
+            self.assertEqual(len(modified), 2)
+            self.assertIsInstance(modified[0].children[0], F23.If_Construct)
+            self.assertIn("a_copy", modified[1].tostr())
+
+        def test_map_declaration(self):
+            # Test mapping implicit to explicit declaration
+            implicit = "real, dimension(:) :: b"
+            explicit = "real, dimension(10) :: a"
+            
+            parsed_implicit = self.processor.parse_fortran_statement(implicit)
+            parsed_explicit = self.processor.parse_fortran_statement(explicit)
+            
+            mapped = self.processor.map_declaration(parsed_implicit, parsed_explicit)
+            self.assertIn(F23.Dimension_Attr_Spec("DIMENSION(10)").tostr(), mapped.tostr())
+            
+            # Test with direct dimensions
+            mapped = self.processor.map_declaration(parsed_implicit, dimensions="20")
+            self.assertIn(F23.Dimension_Attr_Spec("DIMENSION(20)").tostr(), mapped.tostr())
+
+        def test_combine_allocate_declaration(self):
+            # Test combining allocation and declaration
+            decl = "real, allocatable :: a(:)"
+            alloc = "allocate(a(10))"
+            
+            parsed_decl = self.processor.parse_fortran_statement(decl)
+            parsed_alloc = self.processor.parse_fortran_statement(alloc)
+            
+            combined = self.processor.combine_allocate_declaration([parsed_decl.children[0], parsed_alloc.children[0]])
+            self.assertIn(F23.Dimension_Attr_Spec("DIMENSION(10)").tostr(), combined.tostr())
+            self.assertNotIn( F23.Attr_Spec_List("allocatable").tostr(), combined.tostr())
+
+        def test_remove_intent_and_save(self):
+            # Test removing intent and save attributes
+            decl = "real, intent(in), save :: a"
+            parsed_decl = self.processor.parse_fortran_statement(decl)
+            cleaned = self.processor.remove_intent_and_save([parsed_decl.children[0]])
+            self.assertEqual(len(cleaned), 1)
+            self.assertNotIn(F23.Intent_Attr_Spec("intent(in)").tostr(), cleaned[0].tostr())
+            self.assertNotIn(F23.Attr_Spec("save").tostr(), cleaned[0].tostr())
+
+        def test_out_module_fortran(self):
+            # Test generating module code
+            module_tree = self.processor.out_module_fortran("test_sub")
+            self.assertIsInstance(module_tree.children[1], F23.Module)
+            self.assertIn("module_global", module_tree.tostr())
+            self.assertIn("declaration_initialization", module_tree.tostr())
+
+        def test_check_point(self):
+            # Test creating check point for real scalar
+            checkpoint = self.processor.check_point("a", "a_copy", ["REAL"])
+            self.assertIsInstance(checkpoint.children[0], F23.If_Construct)
+            self.assertIn(".EQ.", checkpoint.tostr())
+            
+            # Test for logical array
+            checkpoint = self.processor.check_point("flags", "flags_copy", ["LOGICAL", "DIMENSION"])
+            self.assertIsInstance(checkpoint.children[0], F23.If_Construct)
+            self.assertIn(".EQV.", checkpoint.tostr())
+
+        def test_out_main_fortran(self):
+            # Test generating main program
+            main_tree = self.processor.out_main_fortran()
+            self.assertIsInstance(main_tree, F23.Program)
+            self.assertIn(F23.Program_Stmt("program main").tostr(), main_tree.tostr())
+            self.assertIn(F23.Contains_Stmt("contains").tostr(), main_tree.tostr())
+
+        def test_write_fortran_code_to_file(self):
+            # Test writing code to file
+            test_file = os.path.join(self.test_dir, "test_output.f90")
+            code = "program test\ninteger :: a\nend program test"
+            parse_tree = self.processor.parse_fortran_string(code)
+            
+            self.processor.write_fortran_code_to_file(parse_tree, test_file)
+            self.assertTrue(os.path.exists(test_file))
+            
+            with open(test_file, "r") as f:
+                content = f.read()
+                self.assertIn(F23.Program_Stmt("program test").tostr(), content)
+
+        def test_update_global_module(self):
+            # Setup test data
+            input_dict = {}
+            test_file = os.path.join(self.test_dir, "updated_module.f90")
+            module_tree = self.processor.out_module_fortran("test_sub")
+            
+            # Test updating module
+            self.processor.update_global_module(input_dict, test_file, "test_sub", module_tree)
+            self.assertTrue(os.path.exists(test_file))
+            
+            with open(test_file, "r") as f:
+                content = f.read()
+                self.assertIn("module_global", content)
+                self.assertIn("global.bin", content)
+
+        def test_create_call_stmt(self):
+            # Test creating call statement
+            code = "subroutine test(a)\ninteger :: a\nend subroutine test"
+            subroutine_tree = self.processor.parse_fortran_string(code)
+            call_stmt = self.processor.create_call_stmt(subroutine_tree)
+            
+            self.assertIsInstance(call_stmt, F23.Call_Stmt)
+            self.assertEqual(call_stmt.tostr(), F23.Call_Stmt("CALL test(a)").tostr())
+
+        def test_generate_read_routine(self):
+            # Test generating read routine
+            decl = "integer :: a"
+            parsed_decl = self.processor.parse_fortran_statement(decl)
+            init = self.processor.initialization_statement([parsed_decl.children[0]])
+            
+            routine = self.processor.generate_read_routine([parsed_decl.children[0]], init, "test_sub")
+            self.assertIsInstance(routine, F23.Subroutine_Subprogram)
+            self.assertIn("READ(1363", routine.tostr())
+            self.assertIn("dummy.bin", routine.tostr())
+
+        def test_initialization_statement(self):
+            # Test creating initialization statements
+            decl = "integer :: a"
+            parsed_decl = self.processor.parse_fortran_statement(decl)
+            init = self.processor.initialization_statement([parsed_decl.children[0]])
+            
+            self.assertEqual(len(init), 1)
+            self.assertIsInstance(init[0].children[1], F23.If_Construct)
+            self.assertIn("READ(1363", init[0].tostr())
+            
+            # Test with OUT intent (should not create initialization)
+            decl = "integer, intent(out) :: b"
+            parsed_decl = self.processor.parse_fortran_statement(decl)
+            init = self.processor.initialization_statement([parsed_decl.children[0]])
+            self.assertEqual(len(init), 0)
+
+        def test_add_declarations(self):
+            # Test processing declarations
+            input_dict = {
+                "a": [self.processor.parse_fortran_statement("real :: a").children[0]],
+                "b": [self.processor.parse_fortran_statement("real, allocatable :: b(:)").children[0], 
+                    self.processor.parse_fortran_statement("allocate(b(10))").children[0]],
+                "c": [self.processor.parse_fortran_statement("real :: c(:)").children[0]]
+            }
+            
+            self.processor.add_declarations(input_dict, {"a"}, openacc=True)
+            
+            self.assertEqual(len(self.processor.add_to_module), 3)
+            self.assertEqual(len(self.processor.add_to_routin), 1)
+            self.assertIn("a_copy", self.processor.add_to_module[0].tostr())
+            self.assertIn("!$ACC DECLARE CREATE", self.processor.acc_declare_create_cmd.tostr())
+
+        def test_process_queue(self):
+            # Test processing declaration queue
+            declarations = [
+                self.processor.parse_fortran_statement("real :: b").children[0],
+                self.processor.parse_fortran_statement("integer, parameter :: a = 10").children[0],
+                self.processor.parse_fortran_statement("real, allocatable :: d(:)").children[0],
+                self.processor.parse_fortran_statement("integer, parameter :: c").children[0]
+            ]
+            
+            processed = self.processor.process_queue(declarations)
+            self.assertEqual(len(processed), 4)
+            # Check that parameter without initialization comes first
+            self.assertEqual(F23.Type_Declaration_Stmt("integer, parameter :: a = 10").tostr(), processed[0].tostr())
+            # Check that allocatable comes last
+            self.assertEqual(F23.Type_Declaration_Stmt("real, allocatable :: d(:)").tostr(), processed[-1].tostr())
+
+        def test_compile_and_run(self):
+            # This test would actually compile code - we'll just test the directory handling
+            # In a real scenario, you'd need a proper build environment
+            original_cwd = os.getcwd()
+            test_dir = os.path.join(self.test_dir, "compile_test")
+            os.makedirs(test_dir, exist_ok=True)
+            
+            # Create a simple Fortran file
+            test_file = os.path.join(test_dir, "test.f90")
+            with open(test_file, "w") as f:
+                f.write("program test\ninteger :: a\nend program test")
+                
+            result = self.processor.compile_and_run(self.test_dir, "./compile_test")
+            self.assertEqual(result, 0)
+            os.chdir(original_cwd)
+            shutil.rmtree(test_dir)
+    unittest.main()
