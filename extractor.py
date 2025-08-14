@@ -1042,3 +1042,279 @@ class Extractor:
                         name = walk(walk(item, F23.Entity_Decl), F23.Name)
                         if name[0].string not in self.exclude:
                             self.scalar_variables[subroutine_key].add(name[0].string)
+
+import unittest
+import tempfile
+import shutil
+
+class TestExtractor(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        # Create a temporary directory
+        cls.test_dir = tempfile.mkdtemp()
+        
+        # Create test Fortran files
+        cls.simple_module = os.path.join(cls.test_dir, "simple_mod.f90")
+        with open(cls.simple_module, "w") as f:
+            f.write("""
+            module simple_mod
+            implicit none
+            integer, parameter :: i_std = 4
+            
+            contains
+            
+            subroutine test_sub(a, b)
+            integer, intent(in) :: a
+            real, intent(inout) :: b(:)
+            integer :: i
+            do i = 1, size(b)
+                b(i) = a * 2.0
+            end do
+            end subroutine test_sub
+            
+            end module simple_mod
+            """)
+        
+        # Create a more complex module with dependencies
+        cls.complex_module = os.path.join(cls.test_dir, "complex_mod.f90")
+        with open(cls.complex_module, "w") as f:
+            f.write("""
+            module complex_mod
+            use simple_mod
+            implicit none
+            integer, parameter :: n = 10
+            
+            contains
+            
+            subroutine complex_sub(x, y)
+            real, intent(inout) :: x(n)
+            real, intent(out) :: y
+            integer :: j
+            call test_sub(5, x)
+            y = sum(x)
+            end subroutine complex_sub
+            
+            subroutine helper_fn(z, res)
+            real, intent(in) :: z(n)
+            real, intent(out):: res
+            res = sqrt(sum(z**2))
+            end subroutine  helper_fn
+            
+            end module complex_mod
+            """)
+        
+        # Parse the module trees
+        cls.processor = Processor()
+        cls.simple_tree = cls.processor.parse_fortran_file(cls.simple_module)
+        cls.complex_tree = cls.processor.parse_fortran_file(cls.complex_module)
+
+    @classmethod
+    def tearDownClass(cls):
+        # Remove the temporary directory
+        shutil.rmtree(cls.test_dir)
+
+    def setUp(self):
+        # Create a fresh Extractor instance for each test
+        self.simple_extractor = Extractor(self.test_dir, self.simple_tree)
+        self.complex_extractor = Extractor(self.test_dir, self.complex_tree)
+
+    def test_initialization(self):
+        # Test that initialization sets up all attributes correctly
+        self.assertEqual(self.simple_extractor.module_dir, self.test_dir)
+        self.assertIsInstance(self.simple_extractor.module_tree.children[1], F23.Module)
+        self.assertIsInstance(self.simple_extractor.subroutines, defaultdict)
+        self.assertIsInstance(self.simple_extractor.dummy_arg_list, defaultdict)
+        self.assertEqual(self.simple_extractor.exclude, {'kjpindex', 'nslm', 'nstm', 'nvm', 'nsnow', 'DIM', 'dim', 'MASK', 'next_calc_loop'})
+
+    def test_extract_loop_indices(self):
+        # Test loop index extraction
+        self.simple_extractor.extract_loop_indices()
+        self.assertEqual(len(self.simple_extractor.loop_dict), 1)
+        self.assertIn('SIZE(b)', self.simple_extractor.loop_dict)
+        self.assertEqual(self.simple_extractor.loop_dict['SIZE(b)'], {'i'})
+
+    def test_extract_loop_vect(self):
+        # Test vector loop extraction
+        self.simple_extractor.find_subroutines()
+        sub_key = "test_sub"
+        sub_tree = self.simple_extractor.subroutines[sub_key]
+        
+        # Test with a non-vector loop
+        self.simple_extractor.extract_loop_vect(sub_key, sub_tree)
+        self.assertIsNone(self.simple_extractor.loop_vect[sub_key])
+        
+        # Test with a vector loop (kjpindex)
+        code = """
+        subroutine vect_sub(a)
+        integer, intent(in) :: a
+        real :: b(10)
+        integer :: i
+        do i = 1, kjpindex
+            b(i) = a * 2.0
+        end do
+        end subroutine vect_sub
+        """
+        sub_tree = self.processor.parse_fortran_string(code)
+        self.simple_extractor.extract_loop_vect("vect_sub", sub_tree)
+        self.assertIsNotNone(self.simple_extractor.loop_vect["vect_sub"])
+
+    def test_find_subroutines(self):
+        # Test subroutine finding
+        self.simple_extractor.find_subroutines()
+        self.assertEqual(self.simple_extractor.subroutine_keys_all, {"test_sub"})
+        self.assertEqual(self.simple_extractor.subroutine_keys_ncl, {"test_sub"})
+        
+        # Test with complex module
+        self.complex_extractor.find_subroutines()
+        self.assertEqual(self.complex_extractor.subroutine_keys_all, {"complex_sub", "helper_fn"})
+        self.assertEqual(self.complex_extractor.call_within_sub["complex_sub"], {"test_sub"})
+
+    def test_extract_names(self):
+        # Test name extraction
+        self.simple_extractor.find_subroutines()
+        sub_key = "test_sub"
+        sub_tree = self.simple_extractor.subroutines[sub_key]
+        self.simple_extractor.find_variables(sub_tree, sub_key)
+        
+        # Verify local names are extracted
+        self.simple_extractor.extract_names(sub_key)
+        self.assertEqual(self.simple_extractor.var_local_names[sub_key], {"i"})
+
+    '''def test_extract_intent(self):
+        # Test intent extraction
+        self.complex_extractor.find_subroutines()
+        sub_key = "complex_sub"
+        sub_tree = self.complex_extractor.subroutines[sub_key]
+        
+        # First need to process the called subroutine
+        self.simple_extractor.find_subroutines()
+        called_key = "test_sub"
+        called_tree = self.simple_extractor.subroutines[called_key]
+        self.simple_extractor.find_variables(called_tree, called_key)
+        self.simple_extractor.extract_intent(called_key, called_tree)
+
+        # Verify intents
+        self.assertEqual(self.simple_extractor.general_usage_dict[called_key]["a"], "IN")
+        self.assertEqual(self.simple_extractor.general_usage_dict[called_key]["b"], "INOUT")
+
+        self.complex_extractor.general_usage_dict = self.simple_extractor.general_usage_dict
+        # Now process the calling subroutine
+        self.complex_extractor.find_variables(sub_tree, sub_key)
+        self.complex_extractor.extract_intent(sub_key, sub_tree, {"test_sub"})
+        
+        # Verify intents
+        #self.assertEqual(self.complex_extractor.general_usage_dict[sub_key]["x"], "INOUT")
+        #self.assertEqual(self.complex_extractor.general_usage_dict[sub_key]["y"], "OUT")
+    '''
+    def test_add_intent(self):
+        # Test adding intent to declarations
+        decl = "real :: a(10)"
+        parsed_decl = Processor().parse_fortran_statement(decl)
+        
+        # Add IN intent
+        new_decl = Extractor.add_intent(parsed_decl.children[0], "in")
+        self.assertIn("INTENT(IN)", new_decl.tostr())
+        
+        # Add OUT intent
+        new_decl = Extractor.add_intent(parsed_decl.children[0], "out")
+        self.assertIn("INTENT(OUT)", new_decl.tostr())
+
+    '''def test_clean_subroutine(self):
+        # Test subroutine cleaning (intent correction)
+        self.simple_extractor.find_subroutines()
+        sub_key = "test_sub"
+        sub_tree = self.simple_extractor.subroutines[sub_key]
+        
+        # First extract intent info
+        self.simple_extractor.find_variables(sub_tree, sub_key)
+        self.simple_extractor.extract_intent(sub_key, sub_tree)
+        
+        # Now clean the subroutine
+        self.simple_extractor.clean_subroutine(sub_key, sub_tree)
+        
+        # Verify the declarations were properly cleaned
+        spec_part = walk(sub_tree, F23.Specification_Part)[0]
+        decls = walk(spec_part, F23.Type_Declaration_Stmt)
+        for decl in decls:
+            if "a" in decl.tostr():
+                self.assertIn("INTENT(IN)", decl.tostr())
+            elif "b" in decl.tostr():
+                self.assertIn("INTENT(OUT)", decl.tostr())
+    '''
+    def test_find_variables(self):
+        # Test variable finding and categorization
+        self.simple_extractor.find_subroutines()
+        sub_key = "test_sub"
+        sub_tree = self.simple_extractor.subroutines[sub_key] 
+        self.simple_extractor.find_variables(sub_tree, sub_key)
+        
+        # Verify variable categorization
+
+        self.assertEqual(len(self.simple_extractor.var_dummy[sub_key]), 2)  # a and b
+        self.assertEqual(len(self.simple_extractor.var_local[sub_key]), 1)  # i
+        self.assertEqual(self.simple_extractor.var_modif[sub_key], {"b"})
+
+    def test_find_global_variables(self):
+        # Test global variable finding
+        self.complex_extractor.find_subroutines()
+        sub_key = "complex_sub"
+        sub_tree = self.complex_extractor.subroutines[sub_key]
+        
+        # First find variables to get globals
+        self.complex_extractor.find_variables(sub_tree, sub_key)
+        # Now find globals (test_sub in this case)
+        self.complex_extractor.find_global_variables(
+            self.test_dir, 
+            self.complex_tree, 
+            self.complex_extractor.var_global[sub_key], 
+            sub_key
+        )
+        
+        # Verify global was found
+        self.assertIn("test_sub", self.complex_extractor.dec_global[sub_key])
+
+    def test_extract_array_info(self):
+        # Test array information extraction
+        self.complex_extractor.find_subroutines()
+        sub_key = "complex_sub"
+        sub_tree = self.complex_extractor.subroutines[sub_key]
+        
+        # First find variables and globals
+        self.complex_extractor.find_variables(sub_tree, sub_key)
+        self.complex_extractor.find_global_variables(
+            self.test_dir, 
+            self.complex_tree, 
+            self.complex_extractor.var_global[sub_key], 
+            sub_key
+        )
+        
+        # Now extract array info
+        self.complex_extractor.extract_array_info(
+            self.complex_extractor.dec_global[sub_key],
+            self.complex_extractor.var_dummy[sub_key],
+            sub_key
+        )
+        
+        # Verify array info
+        self.assertIn("x", self.complex_extractor.all_array_info[sub_key])
+        self.assertEqual(len(self.complex_extractor.all_array_info[sub_key]["x"]), 1)
+
+    def test_process_declaration_variables(self):
+        # Test processing of declaration variables
+        self.simple_extractor.find_subroutines()
+        sub_key = "test_sub"
+        sub_tree = self.simple_extractor.subroutines[sub_key]
+        
+        # First find variables
+        self.simple_extractor.find_variables(sub_tree, sub_key)
+        
+        
+        # Process declarations
+        self.simple_extractor.process_declaration_variables(self.simple_extractor.var_dummy[sub_key], sub_key)
+        
+        # Verify scalar and shaped variables
+        self.assertEqual(self.simple_extractor.scalar_variables[sub_key], {"a"})
+        self.assertEqual(self.simple_extractor.shapes_variables[sub_key], {"n"})
+    
+if __name__ == "__main__":
+    unittest.main()
