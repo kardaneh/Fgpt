@@ -8,7 +8,7 @@ from fparser.two.parser import ParserFactory
 from collections import deque
 from line_length import FortLineLength 
 from rich.logging import RichHandler
-
+import textwrap
 class Processor:
     """
     A class for parsing Fortran files, strings, and statements using fparser, 
@@ -21,8 +21,24 @@ class Processor:
         An instance of the Fortran 2008 parser created by fparser.
     """
     def __init__(self):
-        #logging.basicConfig(level=logging.INFO)
-        logging.basicConfig(level="INFO", handlers=[RichHandler(show_time=False, show_level=True, show_path=False, enable_link_path=False, markup=False)])
+        self.logger = logging.getLogger("fortran_processor")
+        self.logger.setLevel(logging.INFO)
+        self.logger.propagate = False
+
+        if self.logger.hasHandlers():
+            self.logger.handlers.clear()
+
+        console_handler = RichHandler(
+            show_time=False,
+            show_level=True,
+            show_path=False,
+            enable_link_path=False,
+            markup=False
+        )
+        console_handler.setLevel(logging.INFO)
+        self.logger.addHandler(console_handler)
+        self.logger.info("Processor initialized.")
+
         self.parser = ParserFactory().create(std="f2008")
         self.line_length = FortLineLength()
         current_dir = os.getcwd()
@@ -58,10 +74,10 @@ class Processor:
         try:
             reader = FortranFileReader(file_path, ignore_comments=False)
             parse_tree = self.parser(reader)
-            logging.info("Successfully parsed file:\n%s", file_path)
+            self.logger.info("Successfully parsed file:\n%s", file_path)
             return parse_tree
         except Exception as e:
-            logging.error("Failed to parse file:\n%s\nError: %s", file_path, e)
+            self.logger.error("Failed to parse file:\n%s\nError: %s", file_path, e)
             raise
 
     def parse_fortran_string(self, string):
@@ -86,10 +102,10 @@ class Processor:
         try:
             reader = FortranStringReader(string, ignore_comments=False)
             parse_tree = self.parser(reader)
-            logging.info(f"Successfully parsed string!")
+            self.logger.info(f"Successfully parsed string!")
             return parse_tree
         except Exception as e:
-            logging.error(f"Failed to parse string, Error: {e}")
+            self.logger.error(f"Failed to parse string, Error: {e}")
             raise
 
     def parse_fortran_statement(self, stmt_str):
@@ -118,23 +134,20 @@ class Processor:
         Exception
             If the statement cannot be parsed.
         """
-        code = f"""
-          program foo
-          {stmt_str}
-          end
-        """
+        cleaned_stmt = textwrap.dedent(stmt_str).strip()
+        code =  f"program foo\n{cleaned_stmt}\nend"
         try:
             reader = FortranStringReader(code, ignore_comments=True)
             parse_tree = self.parser(reader)
             for node in parse_tree.children:
                 for child in node.content:
                     if not isinstance(child, F23.Program_Stmt) and not isinstance(child, F23.End_Program_Stmt):
-                        logging.info("Successfully parsed statement:\n%s", stmt_str)
+                        self.logger.info("Successfully parsed statement:\n%s", child.tostr())
                         return child
-            logging.warning(f"No valid statements found in: {stmt_str}")
+            self.logger.warning(f"No valid statements found in: {stmt_str}")
             return None
         except Exception as e:
-            logging.error("Failed to parse statement:\n%s\nError: %s", stmt_str, e)
+            self.logger.error("Failed to parse statement:\n%s\nError: %s", stmt_str, e)
             raise
 
     def parse_fortran_comment(self, stmt_str):
@@ -163,11 +176,8 @@ class Processor:
         RuntimeError
             If the comment could not be parsed or extracted.
         """
-        code = f"""
-    program foo
-    {stmt_str}
-    end
-    """
+        cleaned_stmt = textwrap.dedent(stmt_str).strip()
+        code = f"program foo\n{cleaned_stmt}\nend"
         try:
             reader = FortranStringReader(code, ignore_comments=False)
             parse_tree = self.parser(reader)
@@ -176,9 +186,12 @@ class Processor:
                     continue
                 for child in node.content:
                     if not isinstance(child, F23.Program_Stmt) and not isinstance(child, F23.End_Program_Stmt):
-                        return child.children[0].children[0]
+                        comment_node = child.children[0].children[0]
+                        self.logger.info("Successfully parsed comment:\n%s", comment_node.tostr())
+                        return comment_node
         except Exception as e:
-            raise RuntimeError(f"An error occurred while parsing Fortran code: {e}")
+            self.logger.error("Failed to parse comment:\n%s\nError: %s", stmt_str, e)
+            raise
 
     def initiate_empty_routine(self, subroutine_name):
         """
@@ -220,7 +233,7 @@ class Processor:
             parse_tree = self.parser(reader)
             return parse_tree.children[0]
         except Exception as e:
-            logging.error(f"Failed to generate Fortran code for routine {subroutine_name}, Error: {e}")
+            self.logger.error(f"Failed to generate Fortran code for routine {subroutine_name}, Error: {e}")
             raise
 
     def separate_entity_declarations(self, declaration_stmt):
@@ -263,8 +276,8 @@ class Processor:
                 new_decl.append(F23.Type_Declaration_Stmt(decl))
             return new_decl
         except Exception as e:
-            print(f"An error occurred during separation of variables: {e}")
-            return None
+            self.logger.error("An error occurred during separation of variables: %s", e)
+            raise
 
     def add_entity_to_declaration(self, declaration_stmt, var_modif):
         """
@@ -310,8 +323,8 @@ class Processor:
             new_decl = F23.Type_Declaration_Stmt(decl)
             return new_decl
         except Exception as e:
-            print(f"An error occurred during adding an entity to a declaration: {e}")
-            return None
+            self.logger.error("An error occurred during adding an entity to a declaration: %s", e)
+            raise
 
     def separate_entity_allocation(self, allocate_stmt):
         """
@@ -362,11 +375,10 @@ class Processor:
 
                 new_allocation.append(F23.Allocate_Stmt(allocation))
 
-            logging.info("Successfully generated allocation statements")
+            self.logger.info("Successfully generated allocation statements")
             return new_allocation
-
         except Exception as e:
-            logging.error(f"Failed to generate allocation statements, Error: {e}")
+            self.logger.error(f"Failed to generate allocation statements, Error: {e}")
             raise
 
     def add_entity_to_allocation(self, allocate_stmt, var_modif, openacc=False):
@@ -414,10 +426,10 @@ class Processor:
                                 allocation = re.sub(rf'\b{allocate_name}\b', allocate_name_add, allocate_stmt.tostr())
                                 code = f"if(.not. allocated({allocate_name_add}))then\n{allocation}\nend if"
                                 new_allocation.append(self.parse_fortran_statement(code))
-            logging.info("Successfully generated allocation statements")
+            self.logger.info("Successfully generated allocation statements")
             return new_allocation
         except Exception as e:
-            logging.error(f"Failed to generate allocation statements, Error: {e}")
+            self.logger.error(f"Failed to generate allocation statements, Error: {e}")
             raise
 
     def map_declaration(self, implicit_dec, explicit_dec=None, dimensions=None):
@@ -473,11 +485,11 @@ class Processor:
             else:
                 new_decl = f"{type_and_attributes}, DIMENSION({dimensions}) :: {array_name}"
             
-            logging.info(f"Mapped declaration: {new_decl}")
+            self.logger.info(f"Mapped declaration: {new_decl}")
             parsed_decl = F23.Type_Declaration_Stmt(new_decl)
             return parsed_decl
         except Exception as e:
-            logging.error(f"Failed to map declaration, Error: {e}")
+            self.logger.error(f"Failed to map declaration, Error: {e}")
             raise
 
     def combine_allocate_declaration(self, variable_declarations):
@@ -529,11 +541,11 @@ class Processor:
                     raise ValueError('Unrecognized statement')
             
             combined_statement = f"{type_and_attributes}, DIMENSION({dimensions}) :: {array_name}"
-            logging.info(f"Combined statement: {combined_statement}")
+            self.logger.info(f"Combined statement: {combined_statement}")
             parsed_decl = F23.Type_Declaration_Stmt(combined_statement)
             return parsed_decl
         except Exception as e:
-            logging.error(f"Failed to combine allocate and declaration, Error: {e}")
+            self.logger.error(f"Failed to combine allocate and declaration, Error: {e}")
             raise
 
     def remove_intent_and_save(self, type_declaration_stmts):
@@ -581,10 +593,10 @@ class Processor:
                 cleaned_stmt_str = f"{left_part_merged} :: {right_part}"
                 cleaned_stmt = F23.Type_Declaration_Stmt(cleaned_stmt_str)
                 cleaned_statements.append(cleaned_stmt)
-            logging.info("Successfully removed INTENT and SAVE attributes from statements")
+            self.logger.info("Successfully removed INTENT and SAVE attributes from statements")
             return cleaned_statements
         except Exception as e:
-            logging.error(f"Failed to remove INTENT and SAVE attributes, Error: {e}")
+            self.logger.error(f"Failed to remove INTENT and SAVE attributes, Error: {e}")
             raise
 
     def out_module_fortran(self, subroutine_name):
@@ -648,10 +660,10 @@ class Processor:
         try:
             reader = FortranStringReader(code, ignore_comments=False)
             parse_tree = self.parser(reader)
-            logging.info("Successfully parsed module code")
+            self.logger.info("Successfully parsed module code")
             return parse_tree
         except Exception as e:
-            logging.error(f"Failed to parse module code, Error: {e}")
+            self.logger.error(f"Failed to parse module code, Error: {e}")
             raise
 
     def check_point(self, var, var_copy, info):
@@ -692,7 +704,6 @@ class Processor:
             GPU/CPU equivalence.
         - Diagnostic printouts help locate mismatch severity and range.
         """
-        code = ""
 
         if 'DIMENSION' in info:
             if 'LOGICAL' not in info:
@@ -784,10 +795,10 @@ class Processor:
         try:
             reader = FortranStringReader(code, ignore_comments=False)
             parse_tree = self.parser(reader)
-            logging.info("Successfully parsed main program code")
+            self.logger.info("Successfully parsed main program code")
             return parse_tree
         except Exception as e:
-            logging.error(f"Failed to parse main program code, Error: {e}")
+            self.logger.error(f"Failed to parse main program code, Error: {e}")
             raise
 
     def write_fortran_code_to_file(self, code, file_path):
@@ -815,9 +826,9 @@ class Processor:
             code = self.line_length.process(code.tostr())
             with open(file_path, 'w') as f:
                 f.write(str(code))
-            logging.info(f"Successfully wrote code to file: {file_path}")
+            self.logger.info(f"Successfully wrote code to file: {file_path}")
         except Exception as e:
-            logging.error(f"Failed to write code to file: {file_path}, Error: {e}")
+            self.logger.error(f"Failed to write code to file: {file_path}, Error: {e}")
             raise
 
     def update_global_module(self, input_dict, file_path, subroutine_name, module_tree):
@@ -907,10 +918,10 @@ class Processor:
                                                 if self.acc_declare_create:
                                                     subsubsubnode.content.insert(ldx + 1, self.acc_update_device_cmd)
                                                     ldx += 1
-            logging.info("Successfully updated the global module")
+            self.logger.info("Successfully updated the global module")
             self.write_fortran_code_to_file(self.out_module, file_path)
         except Exception as e:
-            logging.error(f"Failed to update global module, Error: {e}")
+            self.logger.error(f"Failed to update global module, Error: {e}")
             raise
 
     def update_main_program(
@@ -984,10 +995,9 @@ class Processor:
             self.out_main = self.out_main_fortran()
             custom_module_name = walk(walk(self.out_module,F23.Module_Stmt), F23.Name)[0].string
             custom_subroutines_names = [name.string for name in walk(walk(self.out_module,F23.Subroutine_Stmt),F23.Name)]
-            #specification_part = self.remove_intent_and_save(custom_dec_inout)
             initialization_part = self.initialization_statement(custom_dec_inout)
             if self.dummy_list:
-                print('need to build an initialization for in/inout dummy args: ')
+                self.logger.info("Need to build an initialization for IN/INOUT dummy args.")
                 specification_part_dummy = self.remove_intent_and_save(self.dummy_list)
                 block_tree = self.generate_read_routine(specification_part_dummy, initialization_part, subroutine_name)
 
@@ -1044,7 +1054,6 @@ class Processor:
                                 kdx += 1
                         elif isinstance(subnode, F23.Execution_Part):
                             kdx = len(subnode.content) - 1
-                            #for name in custom_subroutines_names:
                             subroutine_call = "Call declaration_initialization"
                             subnode.content.insert(kdx + 1, F23.Call_Stmt(subroutine_call))
                             kdx += 1
@@ -1133,7 +1142,6 @@ class Processor:
                                 kdx += 1
 
                                 acc_update_self_str = ', '.join([modified_var for modified_var in var_modif])# \
-                                    #if modified_var in self.acc_declare_create])
                                 acc_update_self_cmd = self.parse_fortran_comment(f"!$ACC UPDATE SELF({acc_update_self_str})")
                                 subnode.content.insert(kdx + 1, acc_update_self_cmd)
                                 kdx += 1
@@ -1160,10 +1168,10 @@ class Processor:
                             if childs_subroutine_tree is not None:
                                 for child_subroutine in childs_subroutine_tree:
                                     node.content.insert(idx + 1, child_subroutine)
-            logging.info("Successfully updated the main program")
+            self.logger.info("Successfully updated the main program")
             self.write_fortran_code_to_file(self.out_main, file_path)
         except Exception as e:
-            logging.error(f"Failed to update main program, Error: {e}")
+            self.logger.error(f"Failed to update main program, Error: {e}")
             raise
 
     def create_call_stmt(self, subroutine_tree):
@@ -1199,7 +1207,7 @@ class Processor:
             subroutine_call_obj = F23.Call_Stmt(subroutine_call)
             return subroutine_call_obj
         except Exception as e:
-            print(f"An error occurred in creating a Call_Stmt object: {e}")
+            self.logger.error("An error occurred in creating a Call_Stmt object: %s", e)
             raise
 
     def generate_read_routine(self, specification_part, initialization_part, subroutine_name):
@@ -1263,7 +1271,7 @@ class Processor:
                     idc += 1
                 return block
         except Exception as e:
-            logging.error(f"Failed to generate read routine, Error: {e}")
+            self.logger.error(f"Failed to generate read routine, Error: {e}")
             raise
 
     def initialization_statement(self, items):
@@ -1315,10 +1323,10 @@ class Processor:
                     """
                     read_list.append(self.parse_fortran_statement(code_template))
                     self.write_stmt.append(F23.Write_Stmt(f"write(1363){var_name}").tostr())
-            logging.info(f"processing initialization completed!")
+            self.logger.info(f"processing initialization completed!")
             return read_list
         except Exception as e:
-            logging.error(f"Error processing initialization: {e}")
+            self.logger.error(f"Error processing initialization: {e}")
             raise
 
     def add_declarations(self, input_dict, var_modif, openacc=False):
@@ -1402,9 +1410,9 @@ class Processor:
                 acc_declare_create_str = ', '.join([name for name in self.acc_declare_create])
                 self.acc_declare_create_cmd = self.parse_fortran_comment(f"!$ACC DECLARE CREATE({acc_declare_create_str})")
                 self.acc_update_device_cmd = self.parse_fortran_comment(f"!$ACC UPDATE DEVICE({acc_declare_create_str})")
-            logging.info("Declarations and allocations processed successfully ")
+            self.logger.info("Declarations and allocations processed successfully ")
         except Exception as e:
-            logging.error(f"Failed to process declarations and allocations, Error: {e}")
+            self.logger.error(f"Failed to process declarations and allocations, Error: {e}")
             raise
 
     def process_queue(self, input_list):
@@ -1460,10 +1468,10 @@ class Processor:
                 else:
                     middle_list.append(element)
             combined_list = left_list + middle_list + right_list
-            logging.info(f"Processing complete. PARAMETER elements sent to the left.")
+            self.logger.info(f"Processing complete. PARAMETER elements sent to the left.")
             return list(combined_list)
         except Exception as e:
-            logging.error(f"An error occurred while processing the queue: {e}")
+            self.logger.error(f"An error occurred while processing the queue: {e}")
             raise
 
     def compile_and_run(self, base_dir, modules_dir, mode="CPU"):
@@ -1502,28 +1510,28 @@ class Processor:
         for subdir in os.listdir(target_module_dir_path):
             subdir_path = os.path.join(target_module_dir_path, subdir)
             if os.path.isdir(subdir_path):
-                print('\033[32m' + f"Compiling and running in {subdir_path}..." + '\033[0m')
+                self.logger.info(f"Compiling and running in {subdir_path}...")
                 os.environ["SUBDIR_PATH"] = subdir_path
                 os.environ["MODE"] = mode
                 os.chdir(subdir_path)
                 os.system("make clean -f {}".format(os.path.join(base_dir, "Makefile")))
                 os.system("make -f {}".format(os.path.join(base_dir, "Makefile")))
                 if os.path.exists(subdir):
-                    print('\033[32m' + "Compilation process completed!" + '\033[0m')
+                    self.logger.info("Compilation process completed!")
                     dummy_bin = os.path.join(self.benchmark_dir, subdir, "dummy.bin")
                     global_bin = os.path.join(self.benchmark_dir, subdir, "global.bin")
                     if os.path.exists(dummy_bin) and os.path.exists(global_bin):
-                        print('\033[32m' + "Benchmark files exist. Now running the unit tests ..." + '\033[0m')
+                        self.logger.info("Benchmark files exist. Now running the unit tests ...")
                         os.system("./{}".format(subdir))
-                        print('\033[32m' + f"Execution completed in {subdir_path}" + '\033[0m')
+                        self.logger.info(f"Execution completed in {subdir_path}")
                     else:
                          if not os.path.exists(dummy_bin):
-                             print('\033[31m' + f"Missing file: {dummy_bin}" + '\033[0m')
+                             self.logger.warning(f"Missing file: {dummy_bin}")
                          if not os.path.exists(global_bin):
-                             print('\033[31m' + f"Missing file: {global_bin}" + '\033[0m')
-                         print('\033[31m' + f"Benchmark files do not exist yet. Run the modified main code and then python executive.py " + '\033[0m')
+                             self.logger.warning(f"Missing file: {global_bin}")
+                         self.logger.warning("Benchmark files do not exist yet. Run the modified main code and then python executive.py")
                 else:
-                    print('\033[31m' + "Compilation failed or main_program not generated." + '\033[0m')
+                    self.logger.error("Compilation failed or main_program not generated.")
                     return 1
         os.chdir(base_dir)
         return 0
@@ -1539,6 +1547,7 @@ if __name__ == "__main__":
         def setUpClass(cls):
             cls.test_dir = tempfile.mkdtemp()
             cls.processor = Processor()
+            cls.processor.benchmark_dir =  os.path.join('.', 'examples')
             
             # Create test Fortran files
             cls.simple_fortran = os.path.join(cls.test_dir, "simple.f90")
