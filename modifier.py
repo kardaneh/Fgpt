@@ -863,9 +863,6 @@ class Modifier:
                          if dim.tostr() == ':' and idim == int(reduction_dim):
                             lb = array_info[idim]['dim_str']
                             ub = array_info[idim]['dim_end']
-                            print('lb, ub', ub)
-                            print(self.loop_dict[ub])
-                            print(self.var_declared)
                             index = list(self.loop_dict[ub] & self.var_declared)
                             shape[idim] = index[0]
                          else:
