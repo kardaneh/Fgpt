@@ -12,7 +12,7 @@ class Executive:
     """
     
     @staticmethod
-    def execute(target_module, mode="CPU"):
+    def run(target_module, mode="CPU"):
         """
         Executes the specified Fortran module.
         
@@ -31,5 +31,5 @@ if __name__ == "__main__":
                         help="The compilation mode: 'CPU' or 'GPU' (default: 'CPU').")
     
     args = parser.parse_args()
-    Executive.execute(args.target_module, mode=args.mode)
+    Executive.run(args.target_module, mode=args.mode)
 

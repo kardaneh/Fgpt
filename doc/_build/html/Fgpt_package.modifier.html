@@ -1,0 +1,597 @@
+<!DOCTYPE html>
+
+<html lang="en" data-content_root="./">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+    <title>Fgpt_package.modifier module &#8212; Fgpt_package dev documentation</title>
+    <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=5ecbeea2" />
+    <link rel="stylesheet" type="text/css" href="_static/basic.css?v=686e5160" />
+    <link rel="stylesheet" type="text/css" href="_static/alabaster.css?v=27fed22d" />
+    <script src="_static/documentation_options.js?v=3ce10a4d"></script>
+    <script src="_static/doctools.js?v=9bcbadda"></script>
+    <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
+    <link rel="index" title="Index" href="genindex.html" />
+    <link rel="search" title="Search" href="search.html" />
+   
+  <link rel="stylesheet" href="_static/custom.css" type="text/css" />
+  
+
+  
+  
+
+  </head><body>
+  
+
+    <div class="document">
+      <div class="documentwrapper">
+        <div class="bodywrapper">
+          
+
+          <div class="body" role="main">
+            
+  <section id="module-Fgpt_package.modifier">
+<span id="fgpt-package-modifier-module"></span><h1>Fgpt_package.modifier module<a class="headerlink" href="#module-Fgpt_package.modifier" title="Link to this heading">¶</a></h1>
+<dl class="py class">
+<dt class="sig sig-object py" id="Fgpt_package.modifier.Modifier">
+<em class="property"><span class="pre">class</span><span class="w"> </span></em><span class="sig-prename descclassname"><span class="pre">Fgpt_package.modifier.</span></span><span class="sig-name descname"><span class="pre">Modifier</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">loop_vect_value</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">all_array_info</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">loop_dict</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">var_declared</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">imp_shape</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">io_subroutines</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">var_local</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">within_calls</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">child_error_flag</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="_modules/Fgpt_package/modifier.html#Modifier"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#Fgpt_package.modifier.Modifier" title="Link to this definition">¶</a></dt>
+<dd><p>Bases: <code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></p>
+<p>The Modifier class is responsible for transforming Fortran source code to handle various
+computational and array-related transformations, particularly when porting or optimizing the code for
+modern architectures such as GPUs.</p>
+<dl class="simple">
+<dt>The class includes methods for:</dt><dd><ul class="simple">
+<li><p>Replacing unsupported Fortran GPU features with compatible code.</p></li>
+<li><p>Modifying and optimizing array operations.</p></li>
+<li><p>Handling vectorization and manually adjusting loops for performance improvements.</p></li>
+<li><p>Parsing and modifying <cite>If-Then</cite> and <cite>Else-If</cite> statements in the Fortran code.</p></li>
+<li><p>Creating call statements for subroutines, processing dummy arguments and vector dimensions.</p></li>
+<li><p>Merging and adding vector loops within the Fortran code blocks for better performance.</p></li>
+</ul>
+</dd>
+</dl>
+<dl class="py attribute">
+<dt class="sig sig-object py" id="Fgpt_package.modifier.Modifier.all_array_info">
+<span class="sig-name descname"><span class="pre">all_array_info</span></span><a class="headerlink" href="#Fgpt_package.modifier.Modifier.all_array_info" title="Link to this definition">¶</a></dt>
+<dd><p>Stores information about all arrays found in the code.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>dict</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="Fgpt_package.modifier.Modifier.loop_dict">
+<span class="sig-name descname"><span class="pre">loop_dict</span></span><a class="headerlink" href="#Fgpt_package.modifier.Modifier.loop_dict" title="Link to this definition">¶</a></dt>
+<dd><p>Maps loops and their relevant metadata.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>dict</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="Fgpt_package.modifier.Modifier.var_declared">
+<span class="sig-name descname"><span class="pre">var_declared</span></span><a class="headerlink" href="#Fgpt_package.modifier.Modifier.var_declared" title="Link to this definition">¶</a></dt>
+<dd><p>A set of declared variables in the code.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>set</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="Fgpt_package.modifier.Modifier.imp_shape">
+<span class="sig-name descname"><span class="pre">imp_shape</span></span><a class="headerlink" href="#Fgpt_package.modifier.Modifier.imp_shape" title="Link to this definition">¶</a></dt>
+<dd><p>A list containing the shapes of implicit arrays.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>list</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="Fgpt_package.modifier.Modifier.allowed_external_subroutines">
+<span class="sig-name descname"><span class="pre">allowed_external_subroutines</span></span><a class="headerlink" href="#Fgpt_package.modifier.Modifier.allowed_external_subroutines" title="Link to this definition">¶</a></dt>
+<dd><p>A list of allowed external subroutines.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>list</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="Fgpt_package.modifier.Modifier.var_local">
+<span class="sig-name descname"><span class="pre">var_local</span></span><a class="headerlink" href="#Fgpt_package.modifier.Modifier.var_local" title="Link to this definition">¶</a></dt>
+<dd><p>Stores global variables for the Fortran code being processed.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>dict</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="Fgpt_package.modifier.Modifier.seen">
+<span class="sig-name descname"><span class="pre">seen</span></span><a class="headerlink" href="#Fgpt_package.modifier.Modifier.seen" title="Link to this definition">¶</a></dt>
+<dd><p>A set to track visited nodes during the traversal of expressions.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>set</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="Fgpt_package.modifier.Modifier.arrays_queue">
+<span class="sig-name descname"><span class="pre">arrays_queue</span></span><a class="headerlink" href="#Fgpt_package.modifier.Modifier.arrays_queue" title="Link to this definition">¶</a></dt>
+<dd><p>A queue to store arrays during expression traversal.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>collections.deque</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="Fgpt_package.modifier.Modifier.error_flag">
+<span class="sig-name descname"><span class="pre">error_flag</span></span><a class="headerlink" href="#Fgpt_package.modifier.Modifier.error_flag" title="Link to this definition">¶</a></dt>
+<dd><p>Flags for error handling in child nodes.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>dict</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="Fgpt_package.modifier.Modifier.replace_gpu_unsupported">
+<span class="sig-name descname"><span class="pre">replace_gpu_unsupported</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">parse_tree</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="_modules/Fgpt_package/modifier.html#Modifier.replace_gpu_unsupported"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#Fgpt_package.modifier.Modifier.replace_gpu_unsupported" title="Link to this definition">¶</a></dt>
+<dd><p>Replaces GPU-unsupported features in the Fortran code.</p>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="Fgpt_package.modifier.Modifier.merge_vector_loop">
+<span class="sig-name descname"><span class="pre">merge_vector_loop</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">parse_tree</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="_modules/Fgpt_package/modifier.html#Modifier.merge_vector_loop"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#Fgpt_package.modifier.Modifier.merge_vector_loop" title="Link to this definition">¶</a></dt>
+<dd><p>Merges vector loops to optimize performance.</p>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="Fgpt_package.modifier.Modifier.add_vector_loop">
+<span class="sig-name descname"><span class="pre">add_vector_loop</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">modified_block</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="_modules/Fgpt_package/modifier.html#Modifier.add_vector_loop"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#Fgpt_package.modifier.Modifier.add_vector_loop" title="Link to this definition">¶</a></dt>
+<dd><p>Adds vector loops to the transformed Fortran code.</p>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="Fgpt_package.modifier.Modifier.replace_vec_colon_with_index">
+<span class="sig-name descname"><span class="pre">replace_vec_colon_with_index</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">output_stmt</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="_modules/Fgpt_package/modifier.html#Modifier.replace_vec_colon_with_index"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#Fgpt_package.modifier.Modifier.replace_vec_colon_with_index" title="Link to this definition">¶</a></dt>
+<dd><p>Replaces vectorized colons in array accesses with index-based accesses.</p>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="Fgpt_package.modifier.Modifier.edit_if_else_stmt">
+<span class="sig-name descname"><span class="pre">edit_if_else_stmt</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">stmt</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="_modules/Fgpt_package/modifier.html#Modifier.edit_if_else_stmt"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#Fgpt_package.modifier.Modifier.edit_if_else_stmt" title="Link to this definition">¶</a></dt>
+<dd><p>Edits <cite>If-Then</cite> and <cite>Else-If</cite> statements, processing vector dimensions.</p>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="Fgpt_package.modifier.Modifier.create_act_call_stmt">
+<span class="sig-name descname"><span class="pre">create_act_call_stmt</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">subroutine_stmt</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="_modules/Fgpt_package/modifier.html#Modifier.create_act_call_stmt"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#Fgpt_package.modifier.Modifier.create_act_call_stmt" title="Link to this definition">¶</a></dt>
+<dd><p>Creates and modifies a call statement for a subroutine with dummy arguments and vector dimensions.</p>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="Fgpt_package.modifier.Modifier.add_dos">
+<span class="sig-name descname"><span class="pre">add_dos</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">assignment_stmt</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="_modules/Fgpt_package/modifier.html#Modifier.add_dos"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#Fgpt_package.modifier.Modifier.add_dos" title="Link to this definition">¶</a></dt>
+<dd><p>Add DO statements for array assignments, processing the dimensions and
+generating the corresponding loops.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>assignment_stmt</strong> – The assignment statement to process.</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="id0">
+<span class="sig-name descname"><span class="pre">add_vector_loop</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">block</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="_modules/Fgpt_package/modifier.html#Modifier.add_vector_loop"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#id0" title="Link to this definition">¶</a></dt>
+<dd><p>Adds the vector loop to the block content.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>block</strong> (<em>F23.Block</em>) – The block of code where the vector loop should be added.</p>
+</dd>
+<dt class="field-even">Returns<span class="colon">:</span></dt>
+<dd class="field-even"><p>The modified block of code with the vector loop added.</p>
+</dd>
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>F23.Block</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="Fgpt_package.modifier.Modifier.contains_unsupported_function">
+<span class="sig-name descname"><span class="pre">contains_unsupported_function</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">assignment_stmt</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="_modules/Fgpt_package/modifier.html#Modifier.contains_unsupported_function"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#Fgpt_package.modifier.Modifier.contains_unsupported_function" title="Link to this definition">¶</a></dt>
+<dd><p>Check if an assignment statement contains any unsupported functions.</p>
+<p>Parameters:
+assignment_stmt (F23.Assignment_Stmt): The Fortran assignment statement to check.</p>
+<p>Returns:
+bool: True if the statement contains any unsupported function, False otherwise.</p>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="id1">
+<span class="sig-name descname"><span class="pre">create_act_call_stmt</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">subroutine_stmt</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="_modules/Fgpt_package/modifier.html#Modifier.create_act_call_stmt"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#id1" title="Link to this definition">¶</a></dt>
+<dd><p>Creates a call statement for a subroutine, processing dummy arguments and handling vector dimensions
+where necessary.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>subroutine_stmt</strong> (<em>F23.Subroutine_Stmt</em>) – The subroutine statement node to process.</p>
+</dd>
+<dt class="field-even">Returns<span class="colon">:</span></dt>
+<dd class="field-even"><p>Updates the <cite>subroutine_call_act_vec</cite> attribute with the constructed statement.</p>
+</dd>
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>None</p>
+</dd>
+<dt class="field-even">Raises<span class="colon">:</span></dt>
+<dd class="field-even"><p><strong>Exception</strong> – If any error occurs during processing.</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="id2">
+<span class="sig-name descname"><span class="pre">edit_if_else_stmt</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">stmt</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="_modules/Fgpt_package/modifier.html#Modifier.edit_if_else_stmt"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#id2" title="Link to this definition">¶</a></dt>
+<dd></dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="Fgpt_package.modifier.Modifier.extract_intrinsic_names">
+<span class="sig-name descname"><span class="pre">extract_intrinsic_names</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">stmt</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="_modules/Fgpt_package/modifier.html#Modifier.extract_intrinsic_names"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#Fgpt_package.modifier.Modifier.extract_intrinsic_names" title="Link to this definition">¶</a></dt>
+<dd><p>Extract intrinsic names and their associated details from a statement.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>stmt</strong> – The statement to process for intrinsic names.</p>
+</dd>
+<dt class="field-even">Returns<span class="colon">:</span></dt>
+<dd class="field-even"><p>A dictionary where keys are parent names of intrinsics and values
+are dictionaries with details about the intrinsics.</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="id3">
+<span class="sig-name descname"><span class="pre">merge_vector_loop</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">block</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="_modules/Fgpt_package/modifier.html#Modifier.merge_vector_loop"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#id3" title="Link to this definition">¶</a></dt>
+<dd><p>Merges vector loops by modifying specific children if they match the <cite>vector_loop</cite>.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>block</strong> (<em>F23.Block</em>) – The block of code containing various statements.</p>
+</dd>
+<dt class="field-even">Returns<span class="colon">:</span></dt>
+<dd class="field-even"><p>The modified block of code with merged vector loops.</p>
+</dd>
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>F23.Block</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="Fgpt_package.modifier.Modifier.modify_array_without_notation">
+<span class="sig-name descname"><span class="pre">modify_array_without_notation</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">node</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="_modules/Fgpt_package/modifier.html#Modifier.modify_array_without_notation"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#Fgpt_package.modifier.Modifier.modify_array_without_notation" title="Link to this definition">¶</a></dt>
+<dd><p>Modify an array’s representation without notation based on array information and bounds.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>node</strong> – The node containing the array name.</p>
+</dd>
+<dt class="field-even">Returns<span class="colon">:</span></dt>
+<dd class="field-even"><p>A modified node with the updated dimensions.</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="Fgpt_package.modifier.Modifier.modify_array_without_notation_vec">
+<span class="sig-name descname"><span class="pre">modify_array_without_notation_vec</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">node</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="_modules/Fgpt_package/modifier.html#Modifier.modify_array_without_notation_vec"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#Fgpt_package.modifier.Modifier.modify_array_without_notation_vec" title="Link to this definition">¶</a></dt>
+<dd><p>Modify an array’s representation without notation, handling cases where the upper bound is ‘kjpindex’.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>node</strong> – The node containing the array name.</p>
+</dd>
+<dt class="field-even">Returns<span class="colon">:</span></dt>
+<dd class="field-even"><p>A modified node with the updated dimensions.</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="Fgpt_package.modifier.Modifier.modify_colon_array">
+<span class="sig-name descname"><span class="pre">modify_colon_array</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">node</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">in_intrinsic_parent</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">reduction_dim</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="_modules/Fgpt_package/modifier.html#Modifier.modify_colon_array"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#Fgpt_package.modifier.Modifier.modify_colon_array" title="Link to this definition">¶</a></dt>
+<dd><p>Modify an array’s section subscript list based on given parameters.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>node</strong> – The node containing the section subscript list.</p></li>
+<li><p><strong>in_intrinsic_parent</strong> – Optional parent intrinsic for dimensional changes.</p></li>
+<li><p><strong>reduction_dim</strong> – Dimension to consider for reduction or modification.</p></li>
+</ul>
+</dd>
+<dt class="field-even">Returns<span class="colon">:</span></dt>
+<dd class="field-even"><p>A tuple containing the modified node and optional new argument specification.</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="Fgpt_package.modifier.Modifier.modify_colon_array_vec">
+<span class="sig-name descname"><span class="pre">modify_colon_array_vec</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">node</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">in_intrinsic_parent</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">reduction_dim</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="_modules/Fgpt_package/modifier.html#Modifier.modify_colon_array_vec"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#Fgpt_package.modifier.Modifier.modify_colon_array_vec" title="Link to this definition">¶</a></dt>
+<dd><p>Modify an array’s section subscript list based on given parameters, specifically
+handling cases where upper bounds are ‘kjpindex’.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>node</strong> – The node containing the section subscript list.</p></li>
+<li><p><strong>in_intrinsic_parent</strong> – Optional parent intrinsic for dimensional changes.</p></li>
+<li><p><strong>reduction_dim</strong> – Dimension to consider for reduction or modification.</p></li>
+</ul>
+</dd>
+<dt class="field-even">Returns<span class="colon">:</span></dt>
+<dd class="field-even"><p>A tuple containing the modified node and optional new argument specification.</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="Fgpt_package.modifier.Modifier.modify_specification_part">
+<span class="sig-name descname"><span class="pre">modify_specification_part</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">block</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="_modules/Fgpt_package/modifier.html#Modifier.modify_specification_part"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#Fgpt_package.modifier.Modifier.modify_specification_part" title="Link to this definition">¶</a></dt>
+<dd><p>Modify the specification part of the block by updating entity declarations with assumed shape specifications
+and handling dummy additions.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>block</strong> – The block containing entity declarations to be modified.</p>
+</dd>
+<dt class="field-even">Returns<span class="colon">:</span></dt>
+<dd class="field-even"><p>The modified block.</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="Fgpt_package.modifier.Modifier.modify_statement_where">
+<span class="sig-name descname"><span class="pre">modify_statement_where</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">stmt</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="_modules/Fgpt_package/modifier.html#Modifier.modify_statement_where"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#Fgpt_package.modifier.Modifier.modify_statement_where" title="Link to this definition">¶</a></dt>
+<dd><p>Modify a statement by traversing expressions and updating array notations as needed.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>stmt</strong> – The statement to be modified.</p>
+</dd>
+<dt class="field-even">Returns<span class="colon">:</span></dt>
+<dd class="field-even"><p>A modified version of the input statement.</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="Fgpt_package.modifier.Modifier.process_section_subscript_list">
+<span class="sig-name descname"><span class="pre">process_section_subscript_list</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">node</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">reduction_dim</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="_modules/Fgpt_package/modifier.html#Modifier.process_section_subscript_list"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#Fgpt_package.modifier.Modifier.process_section_subscript_list" title="Link to this definition">¶</a></dt>
+<dd><p>Process a section subscript list to identify the dimension for reduction.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>node</strong> – The node containing the section subscript list.</p></li>
+<li><p><strong>reduction_dim</strong> – The dimension number for reduction.</p></li>
+</ul>
+</dd>
+<dt class="field-even">Returns<span class="colon">:</span></dt>
+<dd class="field-even"><p>The index of the dimension as a string if found, otherwise None.</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="Fgpt_package.modifier.Modifier.remove_vec_for_locals_in_assigns">
+<span class="sig-name descname"><span class="pre">remove_vec_for_locals_in_assigns</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">node</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="_modules/Fgpt_package/modifier.html#Modifier.remove_vec_for_locals_in_assigns"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#Fgpt_package.modifier.Modifier.remove_vec_for_locals_in_assigns" title="Link to this definition">¶</a></dt>
+<dd><p>Removes vector dimension for local arrays in assignments.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>node</strong> (<em>F23.Node</em>) – The node representing an array.</p>
+</dd>
+<dt class="field-even">Returns<span class="colon">:</span></dt>
+<dd class="field-even"><p>A modified node with the appropriate dimensions.</p>
+</dd>
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>F23.Node</p>
+</dd>
+<dt class="field-even">Raises<span class="colon">:</span></dt>
+<dd class="field-even"><p><strong>Exception</strong> – If any error occurs during the process.</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="Fgpt_package.modifier.Modifier.remove_vec_for_locals_in_specification">
+<span class="sig-name descname"><span class="pre">remove_vec_for_locals_in_specification</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">block</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="_modules/Fgpt_package/modifier.html#Modifier.remove_vec_for_locals_in_specification"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#Fgpt_package.modifier.Modifier.remove_vec_for_locals_in_specification" title="Link to this definition">¶</a></dt>
+<dd><p>Processes a block of statements, updating type declaration statements to remove unnecessary vector dimensions
+for local arrays.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>block</strong> (<em>F23.Block</em>) – The block of statements to be processed.</p>
+</dd>
+<dt class="field-even">Returns<span class="colon">:</span></dt>
+<dd class="field-even"><p>The updated block with modified type declaration statements.</p>
+</dd>
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>F23.Block</p>
+</dd>
+<dt class="field-even">Raises<span class="colon">:</span></dt>
+<dd class="field-even"><p><strong>Exception</strong> – If any error occurs during processing.</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="id4">
+<span class="sig-name descname"><span class="pre">replace_gpu_unsupported</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">subroutine_tree</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="_modules/Fgpt_package/modifier.html#Modifier.replace_gpu_unsupported"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#id4" title="Link to this definition">¶</a></dt>
+<dd><p>Replace WRITE statements with error flags in a Fortran subroutine.
+This method walks through the provided subroutine parse tree, identifies WRITE statements,
+and replaces them with error flags. It also handles CALL statements containing ‘ipslerr’..</p>
+<p>Args:
+subroutine_tree (Program): The parse tree of the Fortran subroutine.</p>
+<p>Returns:
+tuple: Updated subroutine_tree and a dictionary containing error flag information.</p>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="Fgpt_package.modifier.Modifier.replace_unsupported_function_with_manual_loop">
+<span class="sig-name descname"><span class="pre">replace_unsupported_function_with_manual_loop</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">assignment_stmt</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="_modules/Fgpt_package/modifier.html#Modifier.replace_unsupported_function_with_manual_loop"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#Fgpt_package.modifier.Modifier.replace_unsupported_function_with_manual_loop" title="Link to this definition">¶</a></dt>
+<dd><p>Replace unsupported GPU functions (e.g., MINLOC, MAXLOC) in a Fortran assignment with a manual loop.</p>
+<p>Parameters:
+assignment_stmt (F23.Assignment_Stmt): The Fortran assignment statement to process.</p>
+<p>Returns:
+str: The modified Fortran code with unsupported functions replaced by a manual loop.</p>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="id5">
+<span class="sig-name descname"><span class="pre">replace_vec_colon_with_index</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">assignment_stmt</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="_modules/Fgpt_package/modifier.html#Modifier.replace_vec_colon_with_index"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#id5" title="Link to this definition">¶</a></dt>
+<dd><p>Replaces colons in array subscripts with appropriate index variables
+in an assignment statement.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>assignment_stmt</strong> (<em>F23.Assignment_Stmt</em>) – The assignment statement that
+contains array subscripts with colons to be replaced.</p>
+</dd>
+<dt class="field-even">Returns<span class="colon">:</span></dt>
+<dd class="field-even"><p><dl class="simple">
+<dt>A new assignment statement with colons replaced by</dt><dd><p>index variables.</p>
+</dd>
+</dl>
+</p>
+</dd>
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>F23.Assignment_Stmt</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="Fgpt_package.modifier.Modifier.replace_where">
+<span class="sig-name descname"><span class="pre">replace_where</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">block</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="_modules/Fgpt_package/modifier.html#Modifier.replace_where"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#Fgpt_package.modifier.Modifier.replace_where" title="Link to this definition">¶</a></dt>
+<dd><p>Replace WHERE constructs in the given block with corresponding IF-ELSEIF-ELSE constructs.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>block</strong> – The block containing WHERE constructs to be replaced.</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="Fgpt_package.modifier.Modifier.traverse_declaration_stmt">
+<span class="sig-name descname"><span class="pre">traverse_declaration_stmt</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">node</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="_modules/Fgpt_package/modifier.html#Modifier.traverse_declaration_stmt"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#Fgpt_package.modifier.Modifier.traverse_declaration_stmt" title="Link to this definition">¶</a></dt>
+<dd><p>Traverses a node to extract and construct a type declaration statement.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>node</strong> (<em>F23.Node</em>) – The node representing a declaration statement.</p>
+</dd>
+<dt class="field-even">Returns<span class="colon">:</span></dt>
+<dd class="field-even"><p>A new type declaration statement constructed from the node.</p>
+</dd>
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>F23.Type_Declaration_Stmt</p>
+</dd>
+<dt class="field-even">Raises<span class="colon">:</span></dt>
+<dd class="field-even"><p><strong>Exception</strong> – If any error occurs during the traversal or construction.</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="Fgpt_package.modifier.Modifier.traverse_expression">
+<span class="sig-name descname"><span class="pre">traverse_expression</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">node</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="_modules/Fgpt_package/modifier.html#Modifier.traverse_expression"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#Fgpt_package.modifier.Modifier.traverse_expression" title="Link to this definition">¶</a></dt>
+<dd><p>Traverse an expression node and process arrays and names within it.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>node</strong> – The node to be traversed, which can be of various types
+including Part_Ref, Name, or a node with children.</p>
+</dd>
+</dl>
+</dd></dl>
+
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="Fgpt_package.modifier.main">
+<span class="sig-prename descclassname"><span class="pre">Fgpt_package.modifier.</span></span><span class="sig-name descname"><span class="pre">main</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="_modules/Fgpt_package/modifier.html#main"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#Fgpt_package.modifier.main" title="Link to this definition">¶</a></dt>
+<dd></dd></dl>
+
+</section>
+
+
+          </div>
+          
+        </div>
+      </div>
+      <div class="sphinxsidebar" role="navigation" aria-label="Main">
+        <div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="index.html">Fgpt_package</a></h1>
+
+
+
+
+
+
+
+
+
+<search id="searchbox" style="display: none" role="search">
+    <div class="searchformwrapper">
+    <form class="search" action="search.html" method="get">
+      <input type="text" name="q" aria-labelledby="searchlabel" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" placeholder="Search"/>
+      <input type="submit" value="Go" />
+    </form>
+    </div>
+</search>
+<script>document.getElementById('searchbox').style.display = "block"</script><h3>Navigation</h3>
+
+<div class="relations">
+<h3>Related Topics</h3>
+<ul>
+  <li><a href="index.html">Documentation overview</a><ul>
+  </ul></li>
+</ul>
+</div>
+
+
+
+
+
+
+
+
+        </div>
+      </div>
+      <div class="clearer"></div>
+    </div>
+    <div class="footer">
+      &#169;2025, Kardaneh.
+      
+      |
+      Powered by <a href="https://www.sphinx-doc.org/">Sphinx 8.1.3</a>
+      &amp; <a href="https://alabaster.readthedocs.io">Alabaster 1.0.0</a>
+      
+      |
+      <a href="_sources/Fgpt_package.modifier.rst.txt"
+          rel="nofollow">Page source</a>
+    </div>
+
+    
+
+    
+  </body>
+</html>

@@ -838,19 +838,19 @@ class Processor:
 
         This method performs the following steps:
         1. Locates the call statement to the specified subroutine within the module tree
-            and replaces it with a code block that opens a binary file, writes data,
-            and then closes the file.
+        and replaces it with a code block that opens a binary file, writes data,
+        and then closes the file.
         2. Inserts collected USE statements and variable declarations into the module's
-            specification part.
+        specification part.
         3. Inserts initialization and allocation statements into the appropriate subroutines
-            (e.g., 'declaration_initialization' and 'initialization') within the module's
-            subprogram part.
+        (e.g., 'declaration_initialization' and 'initialization') within the module's
+        subprogram part.
         4. Handles OpenACC declarations for device data management by adding relevant
-            directives.
+        directives.
         5. Finally, writes the updated Fortran module code to the specified file path.
 
         Args:
-            input_dict (dict): Dictionary of variables or declarations to add (not directly used here but related to overall context).
+            input_dict (dict): Dictionary of variables or declarations to add.
             file_path (str): Path where the updated Fortran module source code will be saved.
             subroutine_name (str): Name of the subroutine whose call site is to be updated.
             module_tree (F23.Tree): Parsed Fortran module tree representing the source code.

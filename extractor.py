@@ -232,8 +232,8 @@ class Extractor:
         - Filters out subroutines whose names match patterns in `self.cases_to_exclude` (e.g., 'init', 'clear', 'read').
         - Saves the full subroutine structure in `self.subroutines`, and tracks the name in `self.subroutine_keys_all`.
         - Detects all internal and external subroutine calls:
-            - Internal calls are stored in `self.call_within_sub[subroutine_key]`.
-            - External calls (e.g., library or unrelated modules) are detected by checking against `self.allowed_external_subroutines`.
+        - Internal calls are stored in `self.call_within_sub[subroutine_key]`.
+        - External calls (e.g., library or unrelated modules) are detected by checking against `self.allowed_external_subroutines`.
         - Records all actual arguments passed during calls in `self.actual_arg_spec_list`.
         - Stores all call statements in `self.call_subroutines`.
         - Tracks subroutines that are considered "having no call" in `self.subroutine_keys_ncl`.
@@ -524,17 +524,18 @@ class Extractor:
         Validates and corrects INTENT specifications for dummy arguments in a given subroutine.
 
         This method traverses all type declaration statements in the subroutine and ensures that:
-            - Each dummy argument (from the subroutine's signature) has an `INTENT` attribute.
-            - The `INTENT` (IN, OUT, or INOUT) matches the intent previously inferred using `extract_intent`.
-            - If multiple variables are declared in one statement, they are separated into individual declarations 
-                for more accurate handling.
-            - If the existing `INTENT` is missing or incorrect, it modifies the statement accordingly.
-            - Warnings are printed for any inconsistencies found (e.g., undeclared usage or missing intents).
+        - Each dummy argument (from the subroutine's signature) has an `INTENT` attribute.
+        - The `INTENT` (IN, OUT, or INOUT) matches the intent previously inferred using `extract_intent`.
+        - If multiple variables are declared in one statement, they are separated into individual declarations 
+        for more accurate handling.
+        - If the existing `INTENT` is missing or incorrect, it modifies the statement accordingly.
+        - Warnings are printed for any inconsistencies found (e.g., undeclared usage or missing intents).
 
         The method modifies the subroutine tree **in-place** by:
-            - Replacing or inserting corrected declaration statements.
-            - Using `self.general_usage_dict[subroutine_key]` to lookup expected intents.
-            - Calling `self.add_intent()` to apply missing intent attributes.
+
+        - Replacing or inserting corrected declaration statements.
+        - Using `self.general_usage_dict[subroutine_key]` to lookup expected intents.
+        - Calling `self.add_intent()` to apply missing intent attributes.
 
         Parameters:
         -----------
@@ -547,14 +548,13 @@ class Extractor:
         Notes:
         ------
         - This method assumes that `extract_intent()` has already been run, and intent info is available in 
-      `     self.general_usage_dict`.
-        - Color-coded terminal warnings (`\033[38;5;214m`) and confirmations (`\033[32m`) are printed for user visibility.
+            self.general_usage_dict`.
         - The processor internally uses `walk()` and `Processor().separate_entity_declarations()` to navigate and 
             restructure declaration blocks where needed.
     
         Returns:
         --------
-        None (modifies subroutine_tree in-place)
+            None (modifies subroutine_tree in-place)
         """
         def traverse_subroutine(block):
             if hasattr(block, "content"):
@@ -825,9 +825,9 @@ class Extractor:
         Outputs
         -------
         - Prints progress messages with color highlighting to indicate the status of each search:
-            - Searching (with spinner)
-            - Found (success)
-            - Attention messages for additional recursive searches.
+        - Searching (with spinner)
+        - Found (success)
+        - Attention messages for additional recursive searches.
 
         Raises
         ------
@@ -879,12 +879,12 @@ class Extractor:
         and stores this information in `self.all_array_info`.
 
         The method processes:
-            - Global variable declarations (from other modules)
-            - Dummy argument declarations (with potential shape info)
-            - Local variable declarations
+            Global variable declarations (from other modules)
+            Dummy argument declarations (with potential shape info)
+            Local variable declarations
         and normalizes array-related declarations to extract shape dimensions such as:
-            - Lower and upper bounds
-            - Dimensionality (rank)
+            Lower and upper bounds
+            Dimensionality (rank)
     
         It also tracks whether a variable has been modified and annotates it with additional 
         properties like `DIMENSION` or type information (e.g., REAL, INTEGER, etc.) 
@@ -906,14 +906,6 @@ class Extractor:
         ---------
         - self.all_array_info[subroutine_key]: dict
             Stores detailed dimension info for each array variable in the subroutine.
-            Example:
-            {
-                'arr': [
-                    {'dim_str': '1', 'dim_end': 'N'},
-                    {'dim_str': '1', 'dim_end': 'M'}
-                ],
-            }
-
         - self.var_modif_info[subroutine_key]: defaultdict
             Annotates modified variables with associated types and whether they're arrays.
 
