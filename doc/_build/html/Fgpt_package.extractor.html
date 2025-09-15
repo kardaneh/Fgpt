@@ -1,0 +1,515 @@
+<!DOCTYPE html>
+
+<html lang="en" data-content_root="./">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+    <title>Fgpt_package.extractor module &#8212; Fgpt_package dev documentation</title>
+    <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=5ecbeea2" />
+    <link rel="stylesheet" type="text/css" href="_static/basic.css?v=686e5160" />
+    <link rel="stylesheet" type="text/css" href="_static/alabaster.css?v=27fed22d" />
+    <script src="_static/documentation_options.js?v=3ce10a4d"></script>
+    <script src="_static/doctools.js?v=9bcbadda"></script>
+    <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
+    <link rel="index" title="Index" href="genindex.html" />
+    <link rel="search" title="Search" href="search.html" />
+   
+  <link rel="stylesheet" href="_static/custom.css" type="text/css" />
+  
+
+  
+  
+
+  </head><body>
+  
+
+    <div class="document">
+      <div class="documentwrapper">
+        <div class="bodywrapper">
+          
+
+          <div class="body" role="main">
+            
+  <section id="module-Fgpt_package.extractor">
+<span id="fgpt-package-extractor-module"></span><h1>Fgpt_package.extractor module<a class="headerlink" href="#module-Fgpt_package.extractor" title="Link to this heading">¶</a></h1>
+<dl class="py class">
+<dt class="sig sig-object py" id="Fgpt_package.extractor.Extractor">
+<em class="property"><span class="pre">class</span><span class="w"> </span></em><span class="sig-prename descclassname"><span class="pre">Fgpt_package.extractor.</span></span><span class="sig-name descname"><span class="pre">Extractor</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">module_dir</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">module_tree</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="_modules/Fgpt_package/extractor.html#Extractor"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#Fgpt_package.extractor.Extractor" title="Link to this definition">¶</a></dt>
+<dd><p>Bases: <code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></p>
+<dl class="py method">
+<dt class="sig sig-object py" id="Fgpt_package.extractor.Extractor.add_intent">
+<em class="property"><span class="pre">static</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">add_intent</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">block</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">intent</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="_modules/Fgpt_package/extractor.html#Extractor.add_intent"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#Fgpt_package.extractor.Extractor.add_intent" title="Link to this definition">¶</a></dt>
+<dd><p>Adds an <cite>INTENT</cite> attribute to a Fortran type declaration block.</p>
+<p>This function inspects a given <cite>F23.Type_Declaration_Stmt</cite> AST node, extracts its type,
+shape, and declared variables, and reconstructs it with the specified <cite>INTENT</cite> attribute
+(e.g., <cite>INTENT(IN)</cite>, <cite>INTENT(OUT)</cite>, or <cite>INTENT(INOUT)</cite>).</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>block</strong> (<em>F23.Type_Declaration_Stmt</em>) – The Fortran type declaration statement node to modify. Must contain
+intrinsic type, shape specification, and entity declarations.</p></li>
+<li><p><strong>intent</strong> (<em>str</em>) – The desired INTENT attribute to inject (e.g., “in”, “out”, “inout”).</p></li>
+</ul>
+</dd>
+<dt class="field-even">Returns<span class="colon">:</span></dt>
+<dd class="field-even"><p>A new type declaration node with the added INTENT attribute.</p>
+</dd>
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>F23.Type_Declaration_Stmt</p>
+</dd>
+<dt class="field-even">Raises<span class="colon">:</span></dt>
+<dd class="field-even"><p><strong>AssertionError</strong> – If <cite>block</cite> is not of type <cite>F23.Type_Declaration_Stmt</cite>.</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="Fgpt_package.extractor.Extractor.clean_subroutine">
+<span class="sig-name descname"><span class="pre">clean_subroutine</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">subroutine_key</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">subroutine_tree</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="_modules/Fgpt_package/extractor.html#Extractor.clean_subroutine"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#Fgpt_package.extractor.Extractor.clean_subroutine" title="Link to this definition">¶</a></dt>
+<dd><p>Validates and corrects INTENT specifications for dummy arguments in a given subroutine.</p>
+<p>This method traverses all type declaration statements in the subroutine and ensures that:
+- Each dummy argument (from the subroutine’s signature) has an <cite>INTENT</cite> attribute.
+- The <cite>INTENT</cite> (IN, OUT, or INOUT) matches the intent previously inferred using <cite>extract_intent</cite>.
+- If multiple variables are declared in one statement, they are separated into individual declarations
+for more accurate handling.
+- If the existing <cite>INTENT</cite> is missing or incorrect, it modifies the statement accordingly.
+- Warnings are printed for any inconsistencies found (e.g., undeclared usage or missing intents).</p>
+<p>The method modifies the subroutine tree <strong>in-place</strong> by:</p>
+<ul class="simple">
+<li><p>Replacing or inserting corrected declaration statements.</p></li>
+<li><p>Using <cite>self.general_usage_dict[subroutine_key]</cite> to lookup expected intents.</p></li>
+<li><p>Calling <cite>self.add_intent()</cite> to apply missing intent attributes.</p></li>
+</ul>
+<section id="parameters">
+<h2>Parameters:<a class="headerlink" href="#parameters" title="Link to this heading">¶</a></h2>
+<dl class="simple">
+<dt>subroutine_key<span class="classifier">str</span></dt><dd><p>The name of the subroutine to clean.</p>
+</dd>
+<dt>subroutine_tree<span class="classifier">Fortran2003.Subroutine_Subprogram</span></dt><dd><p>The parsed tree (AST node) of the subroutine being cleaned.</p>
+</dd>
+</dl>
+</section>
+<section id="notes">
+<h2>Notes:<a class="headerlink" href="#notes" title="Link to this heading">¶</a></h2>
+<ul class="simple">
+<li><dl class="simple">
+<dt>This method assumes that <cite>extract_intent()</cite> has already been run, and intent info is available in</dt><dd><p>self.general_usage_dict`.</p>
+</dd>
+</dl>
+</li>
+<li><dl class="simple">
+<dt>The processor internally uses <cite>walk()</cite> and <cite>Processor().separate_entity_declarations()</cite> to navigate and</dt><dd><p>restructure declaration blocks where needed.</p>
+</dd>
+</dl>
+</li>
+</ul>
+</section>
+<section id="returns">
+<h2>Returns:<a class="headerlink" href="#returns" title="Link to this heading">¶</a></h2>
+<blockquote>
+<div><p>None (modifies subroutine_tree in-place)</p>
+</div></blockquote>
+</section>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="Fgpt_package.extractor.Extractor.extract_array_info">
+<span class="sig-name descname"><span class="pre">extract_array_info</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">dec_global</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">var_dummy_list</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">subroutine_key</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="_modules/Fgpt_package/extractor.html#Extractor.extract_array_info"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#Fgpt_package.extractor.Extractor.extract_array_info" title="Link to this definition">¶</a></dt>
+<dd><p>Extracts detailed dimensional information for arrays used within a given subroutine,
+and stores this information in <cite>self.all_array_info</cite>.</p>
+<dl class="simple">
+<dt>The method processes:</dt><dd><p>Global variable declarations (from other modules)
+Dummy argument declarations (with potential shape info)
+Local variable declarations</p>
+</dd>
+<dt>and normalizes array-related declarations to extract shape dimensions such as:</dt><dd><p>Lower and upper bounds
+Dimensionality (rank)</p>
+</dd>
+</dl>
+<p>It also tracks whether a variable has been modified and annotates it with additional
+properties like <cite>DIMENSION</cite> or type information (e.g., REAL, INTEGER, etc.)
+in <cite>self.var_modif_info</cite>.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>dec_global</strong> (<em>dict</em>) – Dictionary of external/global declarations used in the subroutine, typically obtained
+from imported modules. Keys are module names; values are lists of <cite>Type_Declaration_Stmt</cite>.</p></li>
+<li><p><strong>var_dummy_list</strong> (<em>list</em>) – List of dummy argument declaration statements (<cite>Type_Declaration_Stmt</cite>) for the current subroutine.</p></li>
+<li><p><strong>subroutine_key</strong> (<em>str</em>) – Identifier (name) for the current subroutine being analyzed.</p></li>
+<li><p><strong>Populates</strong></p></li>
+<li><p><strong>---------</strong></p></li>
+<li><p><strong>self.all_array_info</strong><strong>[</strong><strong>subroutine_key</strong><strong>]</strong> (<em>-</em>) – Stores detailed dimension info for each array variable in the subroutine.</p></li>
+<li><p><strong>self.var_modif_info</strong><strong>[</strong><strong>subroutine_key</strong><strong>]</strong> (<em>-</em>) – Annotates modified variables with associated types and whether they’re arrays.</p></li>
+</ul>
+</dd>
+</dl>
+<p class="rubric">Notes</p>
+<ul class="simple">
+<li><p>The method combines <cite>ALLOCATE</cite> statements and declaration statements for <cite>ALLOCATABLE</cite> arrays.</p></li>
+<li><p>It skips scalars and focuses only on variables with <cite>Explicit_Shape_Spec</cite>.</p></li>
+<li><p>Dimensions are normalized into a list of dicts containing start and end bounds.</p></li>
+<li><p>If dimensions are improperly formatted or too many colon-separated parts are found, it raises an error.</p></li>
+</ul>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="Fgpt_package.extractor.Extractor.extract_intent">
+<span class="sig-name descname"><span class="pre">extract_intent</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">subroutine_key</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">subroutine_tree</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">within_calls</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="_modules/Fgpt_package/extractor.html#Extractor.extract_intent"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#Fgpt_package.extractor.Extractor.extract_intent" title="Link to this definition">¶</a></dt>
+<dd><p>Analyze the usage of dummy arguments within a Fortran subroutine and
+infer their INTENT attribute (IN, OUT, or INOUT).</p>
+<p>This function traverses the execution part of the given subroutine and
+tracks how each dummy argument is used:</p>
+<ul class="simple">
+<li><dl class="simple">
+<dt>If a variable is used only on the right-hand side of expressions (e.g., in conditions or RHS of assignments),</dt><dd><p>it is classified as INTENT(IN).</p>
+</dd>
+</dl>
+</li>
+<li><p>If a variable appears on the left-hand side (LHS) of an assignment, it is classified as INTENT(OUT).</p></li>
+<li><dl class="simple">
+<dt>If a variable is both read and written (RHS and LHS), or passed to a child subroutine with a known</dt><dd><p>INTENT(INOUT), it is classified as INTENT(INOUT).</p>
+</dd>
+</dl>
+</li>
+</ul>
+<dl class="simple">
+<dt>The function handles various Fortran constructs:</dt><dd><ul class="simple">
+<li><p>Assignment statements</p></li>
+<li><p>Loop headers (e.g., DO loops)</p></li>
+<li><p>Conditional branches (IF-THEN, ELSEIF)</p></li>
+<li><p>WHERE and ELSEWHERE constructs</p></li>
+<li><p>Nested subroutine calls</p></li>
+</ul>
+</dd>
+</dl>
+<p>In the case of subroutine calls, if a dummy argument is passed to a child subroutine, the method also
+references the intent already extracted for the child (from <cite>self.general_usage_dict</cite>) to propagate
+intent information upward through the call hierarchy.</p>
+<p>The results are stored in <cite>self.general_usage_dict</cite> under the corresponding <cite>subroutine_key</cite>.</p>
+<section id="id1">
+<h2>Parameters:<a class="headerlink" href="#id1" title="Link to this heading">¶</a></h2>
+<dl class="simple">
+<dt>subroutine_key<span class="classifier">str</span></dt><dd><p>The name of the subroutine being analyzed.</p>
+</dd>
+<dt>subroutine_tree<span class="classifier">Fparser node (Subroutine_Subprogram)</span></dt><dd><p>The parsed tree representation of the subroutine.</p>
+</dd>
+<dt>within_calls<span class="classifier">set[str], optional</span></dt><dd><p>Set of subroutine names called within the current subroutine. Used for validating and propagating
+intent information when dummy arguments are passed to internal calls.</p>
+</dd>
+</dl>
+</section>
+<section id="raises">
+<h2>Raises:<a class="headerlink" href="#raises" title="Link to this heading">¶</a></h2>
+<dl class="simple">
+<dt>AssertionError:</dt><dd><p>If expected subroutine calls or argument lists are not found.</p>
+</dd>
+<dt>RuntimeError:</dt><dd><p>If traversal encounters unexpected structures.</p>
+</dd>
+</dl>
+</section>
+<section id="id2">
+<h2>Returns:<a class="headerlink" href="#id2" title="Link to this heading">¶</a></h2>
+<p>None (results stored in self.general_usage_dict)</p>
+</section>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="Fgpt_package.extractor.Extractor.extract_loop_indices">
+<span class="sig-name descname"><span class="pre">extract_loop_indices</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="_modules/Fgpt_package/extractor.html#Extractor.extract_loop_indices"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#Fgpt_package.extractor.Extractor.extract_loop_indices" title="Link to this definition">¶</a></dt>
+<dd><p>Extract loop indices and their associated loop bounds from all non-labeled DO loops in the module.</p>
+<p>This method traverses the parsed Fortran module tree to find all DO loops without labels. For each loop,
+it parses the loop control statement to identify the loop index variable and the loop’s end bound. It skips
+loops that involve complex expressions (such as logical OR operands or part references).</p>
+<p>The extracted loop indices are stored in a dictionary (<cite>self.loop_dict</cite>), where each key is a loop end bound
+and the corresponding value is a set of loop index variables that iterate up to that bound.</p>
+<p>This information is useful for analyzing loop structures, dependencies, and vectorization opportunities
+within the module’s subroutines.</p>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="Fgpt_package.extractor.Extractor.extract_loop_vect">
+<span class="sig-name descname"><span class="pre">extract_loop_vect</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">subroutine_key</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">subroutine_tree</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="_modules/Fgpt_package/extractor.html#Extractor.extract_loop_vect"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#Fgpt_package.extractor.Extractor.extract_loop_vect" title="Link to this definition">¶</a></dt>
+<dd><p>Identifies and extracts the vector loop structure from a given subroutine.</p>
+<p>This method searches for non-labeled <cite>DO</cite> loops in the subroutine body
+that are structured like:
+DO index = start, end, stride
+Specifically, it looks for loops whose end value is <cite>‘kjpindex’</cite>,
+which is used here as an indicator of a vectorized loop.</p>
+<dl class="simple">
+<dt>For each such loop:</dt><dd><ul class="simple">
+<li><p>If <cite>kjpindex</cite> is used as the upper bound, the loop is stored.</p></li>
+<li><dl class="simple">
+<dt>If a vector loop is already stored and a new one is found,</dt><dd><p>the method checks for consistency. If they differ, it raises an error.</p>
+</dd>
+</dl>
+</li>
+</ul>
+</dd>
+</dl>
+<p>Skips any loops that involve logical operations (e.g., <cite>Or_Operand</cite>) or
+part references (e.g., array accesses) in their structure.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>subroutine_key</strong> (<em>str</em>) – Name of the current subroutine.</p></li>
+<li><p><strong>subroutine_tree</strong> (<em>Fparser node</em>) – Parsed tree of the subroutine.</p></li>
+</ul>
+</dd>
+<dt class="field-even">Raises<span class="colon">:</span></dt>
+<dd class="field-even"><ul class="simple">
+<li><p><strong>RuntimeError</strong> – If an error occurs during parsing or inconsistency is detected.</p></li>
+<li><p><strong>ValueError</strong> – If multiple inconsistent vector loops are found in the same subroutine.</p></li>
+</ul>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="Fgpt_package.extractor.Extractor.extract_names">
+<span class="sig-name descname"><span class="pre">extract_names</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">subroutine_key</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="_modules/Fgpt_package/extractor.html#Extractor.extract_names"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#Fgpt_package.extractor.Extractor.extract_names" title="Link to this definition">¶</a></dt>
+<dd><p>Extracts the names of the local variables using the var_local attribute based on the given subroutine key argument.
+The var_local attribute contains a list of Type_Declaration_Stmt from which extraction of the variables names is done.</p>
+<section id="params">
+<h2>params<a class="headerlink" href="#params" title="Link to this heading">¶</a></h2>
+<ul class="simple">
+<li><p>subroutine_key (str):</p></li>
+</ul>
+<dl class="field-list simple">
+<dt class="field-odd">rtype<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p>None</p></li>
+</ul>
+</dd>
+</dl>
+</section>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="Fgpt_package.extractor.Extractor.find_global_variables">
+<span class="sig-name descname"><span class="pre">find_global_variables</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">module_dir</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">module_tree</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">var_global</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">subroutine_key</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="_modules/Fgpt_package/extractor.html#Extractor.find_global_variables"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#Fgpt_package.extractor.Extractor.find_global_variables" title="Link to this definition">¶</a></dt>
+<dd><p>Recursively searches for the declarations of global variables and external procedures
+within the module hierarchy starting from a given module directory and parse tree.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>module_dir</strong> (<em>str</em>) – The directory path of the current module where the search starts.</p></li>
+<li><p><strong>module_tree</strong> (<em>F23.Module</em>) – The parse tree of the current module, typically obtained via a Fortran parser.</p></li>
+<li><p><strong>var_global</strong> (<em>- For each variable/procedure name in</em>) – A collection of variable or procedure names (strings) that are considered global
+and need to be resolved within the module or its children.</p></li>
+<li><p><strong>subroutine_key</strong> (<em>str</em>) – The name of the subroutine whose global variables are being resolved; used as a key
+in <cite>self.dec_global</cite> to store found declarations.</p></li>
+<li><p><strong>Behavior</strong></p></li>
+<li><p><strong>--------</strong></p></li>
+<li><p><strong>var_global</strong> – subroutine or a variable.</p></li>
+<li><p><strong>external</strong> (<em>determines whether it is an</em>) – subroutine or a variable.</p></li>
+<li><p><strong>external</strong><strong>)</strong> (<em>- If it is a variable</em><em> (</em><em>not</em>) – declaration within the given module tree and directory.</p></li>
+<li><p><strong>its</strong> (<em>uses Navigator.variable_finder to search for</em>) – declaration within the given module tree and directory.</p></li>
+<li><p><strong>found</strong> (<em>- If</em>)</p></li>
+<li><p><strong>name.</strong> (<em>stores the declarations in self.dec_global</em><em>[</em><em>subroutine_key</em><em>] </em><em>keyed by the variable</em>)</p></li>
+<li><p><strong>(</strong><strong>var_initial</strong><strong>)</strong> (<em>- If additional unresolved variables are discovered during the search</em>) – recursively searches child modules for these variables.</p></li>
+</ul>
+</dd>
+</dl>
+<p>:param : recursively searches child modules for these variables.
+:param - For external subroutines: procedure declarations and similarly stores them.
+:param uses <cite>Navigator.external_subroutine_finder</cite> to locate the: procedure declarations and similarly stores them.
+:param - Raises an error if a variable or external procedure cannot be found in the accessible modules.:
+:param Outputs:
+:param ——-:
+:param - Prints progress messages with color highlighting to indicate the status of each search:
+:param - Searching (with spinner):
+:param - Found (success):
+:param - Attention messages for additional recursive searches.:</p>
+<dl class="field-list simple">
+<dt class="field-odd">Raises<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>ValueError</strong> – When a global variable or external procedure is not found in the module hierarchy.</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="Fgpt_package.extractor.Extractor.find_subroutines">
+<span class="sig-name descname"><span class="pre">find_subroutines</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="_modules/Fgpt_package/extractor.html#Extractor.find_subroutines"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#Fgpt_package.extractor.Extractor.find_subroutines" title="Link to this definition">¶</a></dt>
+<dd><p>Extracts all subroutines from the parsed Fortran module and gathers metadata for each one.</p>
+<p>This method performs the following:
+- Walks the module tree to identify all <cite>Subroutine_Subprogram</cite> nodes.
+- Extracts the subroutine name (<cite>subroutine_key</cite>) and its dummy argument list.
+- Filters out subroutines whose names match patterns in <cite>self.cases_to_exclude</cite> (e.g., ‘init’, ‘clear’, ‘read’).
+- Saves the full subroutine structure in <cite>self.subroutines</cite>, and tracks the name in <cite>self.subroutine_keys_all</cite>.
+- Detects all internal and external subroutine calls:
+- Internal calls are stored in <cite>self.call_within_sub[subroutine_key]</cite>.
+- External calls (e.g., library or unrelated modules) are detected by checking against <cite>self.allowed_external_subroutines</cite>.
+- Records all actual arguments passed during calls in <cite>self.actual_arg_spec_list</cite>.
+- Stores all call statements in <cite>self.call_subroutines</cite>.
+- Tracks subroutines that are considered “having no call” in <cite>self.subroutine_keys_ncl</cite>.
+- Determines external subroutines as those that are called but not defined within the current module.</p>
+<p>This function is essential for analyzing dependencies between procedures and for enabling subroutine isolation.</p>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="Fgpt_package.extractor.Extractor.find_variables">
+<span class="sig-name descname"><span class="pre">find_variables</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">subroutine_tree</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">subroutine_key</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">parent_subroutine_key</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="_modules/Fgpt_package/extractor.html#Extractor.find_variables"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#Fgpt_package.extractor.Extractor.find_variables" title="Link to this definition">¶</a></dt>
+<dd><p>Analyzes a subroutine or function’s declarations and execution to extract and categorize variables.</p>
+<dl class="simple">
+<dt>This method performs a full scan of a subroutine’s abstract syntax tree to identify:</dt><dd><ul class="simple">
+<li><p><strong>Declared</strong> vs <strong>Used</strong> variables.</p></li>
+<li><p><strong>Dummy arguments</strong> (with or without <cite>INTENT</cite>).</p></li>
+<li><p><strong>Local variables</strong> (non-dummy and declared within the subroutine).</p></li>
+<li><p><strong>Global variables</strong> (used but not declared in the subroutine).</p></li>
+<li><p><strong>Modified variables</strong> (i.e., appearing on the LHS of an assignment).</p></li>
+<li><p><strong>Array shape dependencies</strong> (variables that define array bounds).</p></li>
+<li><p>Handles implicit and intrinsic shape declarations, and replaces them with explicit forms when possible.</p></li>
+</ul>
+</dd>
+<dt>The analysis is stored internally in various class attributes:</dt><dd><ul class="simple">
+<li><p><cite>self.var_dummy[subroutine_key]</cite> — List of dummy arguments.</p></li>
+<li><p><cite>self.var_local[subroutine_key]</cite> — List of local variables.</p></li>
+<li><p><cite>self.var_global[subroutine_key]</cite> — Set of global variables (used but undeclared).</p></li>
+<li><p><cite>self.var_declared[subroutine_key]</cite> — Set of explicitly declared variable names.</p></li>
+<li><p><cite>self.var_modif[subroutine_key]</cite> — Set of modified variable names.</p></li>
+<li><p><cite>self.imp_shape[subroutine_key]</cite> — Dictionary of array variables with implicitly shaped declarations.</p></li>
+</ul>
+</dd>
+</dl>
+<p>If any dummy argument is found without an <cite>INTENT</cite>, an error is raised (for strict isolation handling).</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>subroutine_tree</strong> (<em>Fortran2003.Subroutine_Subprogram</em><em> or </em><em>Function_Subprogram</em>) – Parsed Fortran AST of the subroutine or function to be analyzed.</p></li>
+<li><p><strong>subroutine_key</strong> (<em>str</em>) – Name of the subroutine (or function) being analyzed.</p></li>
+<li><p><strong>parent_subroutine_key</strong> (<em>str</em><em>, </em><em>optional</em>) – Required when analyzing a function, used to retrieve array shape info from its caller.</p></li>
+</ul>
+</dd>
+<dt class="field-even">Raises<span class="colon">:</span></dt>
+<dd class="field-even"><p><strong>ValueError</strong> – If a dummy argument is declared without an <cite>INTENT</cite> or intrinsic shape handling is not implemented
+    for some specific cases.</p>
+</dd>
+</dl>
+<p class="rubric">Notes</p>
+<ul class="simple">
+<li><p>This method relies on <cite>Shaper</cite> to resolve implicit or intrinsic shapes into explicit ones.</p></li>
+<li><p>Multiple variable declarations in one line are separated for clarity and safety.</p></li>
+<li><p>Warnings are printed for intrinsic names or implicit shapes found during traversal.</p></li>
+<li><p><cite>self.exclude</cite> is used to filter out known indices or ignored variables from global list.</p></li>
+</ul>
+<dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>None (modifies internal state of the Extractor instance)</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="Fgpt_package.extractor.Extractor.process_declaration_variables">
+<span class="sig-name descname"><span class="pre">process_declaration_variables</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">items</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">subroutine_key</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="_modules/Fgpt_package/extractor.html#Extractor.process_declaration_variables"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#Fgpt_package.extractor.Extractor.process_declaration_variables" title="Link to this definition">¶</a></dt>
+<dd><p>Analyze a list of declaration-related statements within a subroutine and
+categorize variables as either scalar or array (with explicit shape).</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>items</strong> (<em>list</em>) – A list of parsed Fortran statements (typically from the Specification_Part)
+to analyze. These may include type declarations and allocation statements.</p></li>
+<li><p><strong>subroutine_key</strong> (<em>str</em>) – The name of the subroutine being processed, used as a key to store
+results in class-level dictionaries.</p></li>
+<li><p><strong>Behavior</strong></p></li>
+<li><p><strong>--------</strong></p></li>
+<li><p><strong>(</strong><strong>e.g.</strong> (<em>- Skips irrelevant statements</em>)</p></li>
+<li><p><strong>statements</strong><strong>)</strong><strong>.</strong> (<em>USE</em>)</p></li>
+<li><p><strong>info</strong> (<em>- For Allocate_Stmt</em><em> or </em><em>Type_Declaration_Stmt with explicit shape</em>) – it extracts the array shape variables and stores them in <cite>shapes_variables[subroutine_key]</cite>.</p></li>
+</ul>
+</dd>
+</dl>
+<p>:param : it extracts the array shape variables and stores them in <cite>shapes_variables[subroutine_key]</cite>.
+:param - For scalar variable declarations (i.e.: it identifies and stores them in <cite>scalar_variables[subroutine_key]</cite>.
+:param without DIMENSION attributes): it identifies and stores them in <cite>scalar_variables[subroutine_key]</cite>.
+:param : it identifies and stores them in <cite>scalar_variables[subroutine_key]</cite>.
+:param - Excludes specific names defined in <cite>self.exclude</cite> from both scalar and shape tracking.:</p>
+<p class="rubric">Notes</p>
+<ul class="simple">
+<li><dl class="simple">
+<dt>This method helps differentiate between scalar and shaped variables in</dt><dd><p>preparation for isolation, dependency resolution, and rewriting.</p>
+</dd>
+</dl>
+</li>
+<li><p>If a declaration is neither a type declaration nor an allocation, it’s ignored.</p></li>
+<li><dl class="simple">
+<dt>Dimension attributes (e.g., <cite>DIMENSION(:,:)</cite>) are used to distinguish arrays</dt><dd><p>when shape specs are not explicitly present.</p>
+</dd>
+</dl>
+</li>
+</ul>
+<dl class="field-list simple">
+<dt class="field-odd">Raises<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>AssertionError</strong> – If an unshaped variable is not declared with a <cite>Type_Declaration_Stmt</cite>.</p>
+</dd>
+</dl>
+</dd></dl>
+
+</dd></dl>
+
+</section>
+
+
+          </div>
+          
+        </div>
+      </div>
+      <div class="sphinxsidebar" role="navigation" aria-label="Main">
+        <div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="index.html">Fgpt_package</a></h1>
+
+
+
+
+
+
+
+
+
+<search id="searchbox" style="display: none" role="search">
+    <div class="searchformwrapper">
+    <form class="search" action="search.html" method="get">
+      <input type="text" name="q" aria-labelledby="searchlabel" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" placeholder="Search"/>
+      <input type="submit" value="Go" />
+    </form>
+    </div>
+</search>
+<script>document.getElementById('searchbox').style.display = "block"</script><h3>Navigation</h3>
+
+<div class="relations">
+<h3>Related Topics</h3>
+<ul>
+  <li><a href="index.html">Documentation overview</a><ul>
+  </ul></li>
+</ul>
+</div>
+
+
+
+
+
+
+
+
+        </div>
+      </div>
+      <div class="clearer"></div>
+    </div>
+    <div class="footer">
+      &#169;2025, Kardaneh.
+      
+      |
+      Powered by <a href="https://www.sphinx-doc.org/">Sphinx 8.1.3</a>
+      &amp; <a href="https://alabaster.readthedocs.io">Alabaster 1.0.0</a>
+      
+      |
+      <a href="_sources/Fgpt_package.extractor.rst.txt"
+          rel="nofollow">Page source</a>
+    </div>
+
+    
+
+    
+  </body>
+</html>

@@ -1,0 +1,993 @@
+<!DOCTYPE html>
+
+<html lang="en" data-content_root="./">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+    <title>Fgpt_package.processor module &#8212; Fgpt_package dev documentation</title>
+    <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=5ecbeea2" />
+    <link rel="stylesheet" type="text/css" href="_static/basic.css?v=686e5160" />
+    <link rel="stylesheet" type="text/css" href="_static/alabaster.css?v=27fed22d" />
+    <script src="_static/documentation_options.js?v=3ce10a4d"></script>
+    <script src="_static/doctools.js?v=9bcbadda"></script>
+    <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
+    <link rel="index" title="Index" href="genindex.html" />
+    <link rel="search" title="Search" href="search.html" />
+   
+  <link rel="stylesheet" href="_static/custom.css" type="text/css" />
+  
+
+  
+  
+
+  </head><body>
+  
+
+    <div class="document">
+      <div class="documentwrapper">
+        <div class="bodywrapper">
+          
+
+          <div class="body" role="main">
+            
+  <section id="module-Fgpt_package.processor">
+<span id="fgpt-package-processor-module"></span><h1>Fgpt_package.processor module<a class="headerlink" href="#module-Fgpt_package.processor" title="Link to this heading">¶</a></h1>
+<dl class="py class">
+<dt class="sig sig-object py" id="Fgpt_package.processor.Processor">
+<em class="property"><span class="pre">class</span><span class="w"> </span></em><span class="sig-prename descclassname"><span class="pre">Fgpt_package.processor.</span></span><span class="sig-name descname"><span class="pre">Processor</span></span><a class="reference internal" href="_modules/Fgpt_package/processor.html#Processor"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#Fgpt_package.processor.Processor" title="Link to this definition">¶</a></dt>
+<dd><p>Bases: <code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></p>
+<p>A class for parsing Fortran files, strings, and statements using fparser,
+creating Abstract Syntax Trees (ASTs), generating Fortran code, and performing
+various mappings.</p>
+<section id="attributes">
+<h2>Attributes:<a class="headerlink" href="#attributes" title="Link to this heading">¶</a></h2>
+<dl class="simple">
+<dt>parser<span class="classifier">object</span></dt><dd><p>An instance of the Fortran 2008 parser created by fparser.</p>
+</dd>
+</dl>
+<dl class="py method">
+<dt class="sig sig-object py" id="Fgpt_package.processor.Processor.add_declarations">
+<span class="sig-name descname"><span class="pre">add_declarations</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">input_dict</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">var_modif</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">openacc</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="_modules/Fgpt_package/processor.html#Processor.add_declarations"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#Fgpt_package.processor.Processor.add_declarations" title="Link to this definition">¶</a></dt>
+<dd><p>Processes and categorizes Fortran variable declarations and allocations
+into separate groups for further use, such as:</p>
+<ul class="simple">
+<li><p>Adding to the module or routine headers.</p></li>
+<li><p>Preparing OpenACC directives (e.g., <cite>!$ACC DECLARE CREATE(…)</cite>).</p></li>
+<li><p>Tracking variables that need to be initialized via read statements.</p></li>
+</ul>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>input_dict</strong> (<em>dict</em>) – Dictionary of declarations (var name → [declaration nodes]).</p></li>
+<li><p><strong>var_modif</strong> (<em>set</em>) – Set of variable names that are modified inside the subroutine.</p></li>
+</ul>
+</dd>
+</dl>
+<dl class="simple">
+<dt>Populates:</dt><dd><ul class="simple">
+<li><p>self.add_to_module → declarations to be added to module.</p></li>
+<li><p>self.add_to_routin → allocation statements to be added in routine body.</p></li>
+<li><p>self.add_to_usestm → collected USE statements.</p></li>
+<li><p>self.acc_declare_create / copyin → for OpenACC memory management.</p></li>
+<li><p>self.reads_in_decleration_routine / reads_in_read_routine → categorized init methods.</p></li>
+<li><p>self.write_stmt → write statements to be emitted to file.</p></li>
+<li><p>self.acc_declare_create_cmd / copyin_cmd → formatted OpenACC directives.</p></li>
+</ul>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="Fgpt_package.processor.Processor.add_entity_to_allocation">
+<span class="sig-name descname"><span class="pre">add_entity_to_allocation</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">allocate_stmt</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">var_modif</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">openacc</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="_modules/Fgpt_package/processor.html#Processor.add_entity_to_allocation"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#Fgpt_package.processor.Processor.add_entity_to_allocation" title="Link to this definition">¶</a></dt>
+<dd><p>Wraps allocation statements with <cite>.not. allocated(…)</cite> condition and adds
+suffixed allocations (e.g., <cite>_copy</cite>) for variables in var_modif.</p>
+<section id="parameters">
+<h3>Parameters:<a class="headerlink" href="#parameters" title="Link to this heading">¶</a></h3>
+<dl class="simple">
+<dt>allocate_stmt<span class="classifier">fparser.two.Fortran2003.Allocate_Stmt</span></dt><dd><p>A parsed allocate statement, potentially allocating multiple variables.</p>
+</dd>
+<dt>var_modif<span class="classifier">list of str</span></dt><dd><p>A list of variable names that require shadow allocation (e.g., with ‘_copy’ suffix).</p>
+</dd>
+</dl>
+</section>
+<section id="returns">
+<h3>Returns:<a class="headerlink" href="#returns" title="Link to this heading">¶</a></h3>
+<dl class="simple">
+<dt>new_allocation<span class="classifier">list of fparser.two.statements.If_Construct</span></dt><dd><p>A list of AST nodes, each wrapping allocation in a conditional check.</p>
+</dd>
+</dl>
+</section>
+<section id="notes">
+<h3>Notes:<a class="headerlink" href="#notes" title="Link to this heading">¶</a></h3>
+<ul class="simple">
+<li><p>Wraps each allocation inside an <cite>if (.not. allocated(…)) then</cite> block.</p></li>
+<li><p>If variable is in var_modif, creates a duplicate allocation for <cite>&lt;var&gt;_copy</cite>.</p></li>
+<li><p>Prevents redundant allocations at runtime and supports CPU/GPU memory handling.</p></li>
+</ul>
+</section>
+<section id="raises">
+<h3>Raises:<a class="headerlink" href="#raises" title="Link to this heading">¶</a></h3>
+<dl class="simple">
+<dt>Exception</dt><dd><p>If generation or parsing of statements fails.</p>
+</dd>
+</dl>
+</section>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="Fgpt_package.processor.Processor.add_entity_to_declaration">
+<span class="sig-name descname"><span class="pre">add_entity_to_declaration</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">declaration_stmt</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">var_modif</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="_modules/Fgpt_package/processor.html#Processor.add_entity_to_declaration"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#Fgpt_package.processor.Processor.add_entity_to_declaration" title="Link to this definition">¶</a></dt>
+<dd><p>Modifies a Fortran declaration by appending new variables (with _copy suffix)
+for those listed in var_modif.</p>
+<section id="id1">
+<h3>Parameters:<a class="headerlink" href="#id1" title="Link to this heading">¶</a></h3>
+<dl class="simple">
+<dt>declaration_stmt<span class="classifier">fparser.two.Fortran2003.Type_Declaration_Stmt</span></dt><dd><p>The original Fortran declaration statement.</p>
+</dd>
+<dt>var_modif<span class="classifier">list of str</span></dt><dd><p>A list of variable names for which new suffixed variables should be added.</p>
+</dd>
+</dl>
+</section>
+<section id="id2">
+<h3>Returns:<a class="headerlink" href="#id2" title="Link to this heading">¶</a></h3>
+<dl class="simple">
+<dt>new_decl<span class="classifier">fparser.two.Fortran2003.Type_Declaration_Stmt</span></dt><dd><p>A new declaration statement including the original and modified variables.</p>
+</dd>
+</dl>
+</section>
+<section id="id3">
+<h3>Notes:<a class="headerlink" href="#id3" title="Link to this heading">¶</a></h3>
+<ul class="simple">
+<li><p>Preserves the left-hand part (e.g., REAL(KIND=f64), INTENT(OUT)).</p></li>
+<li><p>Duplicates any variable found in var_modif, adding a _copy version.</p></li>
+<li><p>Useful for creating CPU/GPU variants of variables in transformed code.</p></li>
+</ul>
+</section>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="Fgpt_package.processor.Processor.check_point">
+<span class="sig-name descname"><span class="pre">check_point</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">var</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">var_copy</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">info</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="_modules/Fgpt_package/processor.html#Processor.check_point"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#Fgpt_package.processor.Processor.check_point" title="Link to this definition">¶</a></dt>
+<dd><p>Generates and parses a Fortran <cite>IF</cite> block that performs a runtime check
+to compare two variables: typically a GPU version and a CPU reference.</p>
+<p>The generated code compares either scalar or array variables using <cite>.EQ.</cite>
+or <cite>.EQV.</cite> (for logical types), and provides diagnostic output if the
+check fails — including max errors or mismatched values.</p>
+<section id="id4">
+<h3>Parameters:<a class="headerlink" href="#id4" title="Link to this heading">¶</a></h3>
+<dl class="simple">
+<dt>var<span class="classifier">str</span></dt><dd><p>The name of the GPU or test version of the variable (e.g., ‘a’).</p>
+</dd>
+<dt>var_copy<span class="classifier">str</span></dt><dd><p>The name of the CPU or reference version of the variable (e.g., ‘a_copy’).</p>
+</dd>
+<dt>info<span class="classifier">list of str</span></dt><dd><p>A list of type/property descriptors, such as [‘REAL’, ‘DIMENSION’]
+or [‘LOGICAL’], which guides the comparison logic:</p>
+<ul class="simple">
+<li><p>If ‘DIMENSION’ is present, array comparison is used (with <cite>ALL(…)</cite>)</p></li>
+<li><p>If ‘LOGICAL’ is present, <cite>.EQV.</cite> is used instead of <cite>.EQ.</cite></p></li>
+<li><p>Otherwise, scalar <cite>.EQ.</cite> comparison is performed</p></li>
+</ul>
+</dd>
+</dl>
+</section>
+<section id="id5">
+<h3>Returns:<a class="headerlink" href="#id5" title="Link to this heading">¶</a></h3>
+<dl class="simple">
+<dt>code<span class="classifier">fparser.two.Fortran2003.If_Construct</span></dt><dd><p>The parsed AST of the generated Fortran comparison block.</p>
+</dd>
+</dl>
+</section>
+<section id="id6">
+<h3>Notes:<a class="headerlink" href="#id6" title="Link to this heading">¶</a></h3>
+<ul class="simple">
+<li><p>Supports scalar and array types.</p></li>
+<li><p>Supports LOGICAL and numeric comparisons.</p></li>
+<li><dl class="simple">
+<dt>Designed for automated testing or benchmarking frameworks to validate</dt><dd><p>GPU/CPU equivalence.</p>
+</dd>
+</dl>
+</li>
+<li><p>Diagnostic printouts help locate mismatch severity and range.</p></li>
+</ul>
+</section>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="Fgpt_package.processor.Processor.combine_allocate_declaration">
+<span class="sig-name descname"><span class="pre">combine_allocate_declaration</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">variable_declarations</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="_modules/Fgpt_package/processor.html#Processor.combine_allocate_declaration"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#Fgpt_package.processor.Processor.combine_allocate_declaration" title="Link to this definition">¶</a></dt>
+<dd><p>Combines a type declaration and an ALLOCATE statement into a single, explicit
+Fortran declaration with fixed dimensions.</p>
+<section id="id7">
+<h3>Parameters:<a class="headerlink" href="#id7" title="Link to this heading">¶</a></h3>
+<dl class="simple">
+<dt>variable_declarations<span class="classifier">list</span></dt><dd><p>A list of two AST nodes: one must be a Type_Declaration_Stmt,
+the other an Allocate_Stmt.</p>
+</dd>
+</dl>
+</section>
+<section id="id8">
+<h3>Returns:<a class="headerlink" href="#id8" title="Link to this heading">¶</a></h3>
+<dl class="simple">
+<dt>parsed_decl<span class="classifier">fparser.two.Fortran2003.Type_Declaration_Stmt</span></dt><dd><p>A combined type declaration statement with explicit shape.</p>
+</dd>
+</dl>
+</section>
+<section id="id9">
+<h3>Raises:<a class="headerlink" href="#id9" title="Link to this heading">¶</a></h3>
+<dl class="simple">
+<dt>ValueError</dt><dd><p>If shape or type/name information cannot be extracted.</p>
+</dd>
+</dl>
+</section>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="Fgpt_package.processor.Processor.compile_and_run">
+<span class="sig-name descname"><span class="pre">compile_and_run</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">base_dir</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">modules_dir</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">mode</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">'CPU'</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="_modules/Fgpt_package/processor.html#Processor.compile_and_run"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#Fgpt_package.processor.Processor.compile_and_run" title="Link to this definition">¶</a></dt>
+<dd><p>Compiles and runs all generated subroutines in their respective directories.</p>
+<p>This method searches through subdirectories inside the given <cite>modules_dir</cite> path,
+sets up the environment variables needed for compilation, and invokes <cite>make</cite>
+using the provided Makefile. If the required binary input files (<cite>dummy.bin</cite>
+and <cite>global.bin</cite>) exist in the benchmark directory, it proceeds to execute
+the compiled subroutine binary.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>base_dir</strong> (<em>str</em>) – The root directory containing the Makefile and benchmark structure.</p></li>
+<li><p><strong>modules_dir</strong> (<em>str</em>) – The directory (relative to <cite>base_dir</cite>) where each subroutine’s
+compiled files and sources reside.</p></li>
+<li><p><strong>mode</strong> (<em>str</em><em>, </em><em>optional</em>) – Compilation mode, typically “CPU” or “GPU”. Defaults to “CPU”.</p></li>
+</ul>
+</dd>
+<dt class="field-even">Returns<span class="colon">:</span></dt>
+<dd class="field-even"><p><ul class="simple">
+<li><p>Returns 0 if all subroutines were successfully compiled and executed.</p></li>
+<li><p>Returns 1 if any compilation or execution step failed.</p></li>
+</ul>
+</p>
+</dd>
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>int</p>
+</dd>
+</dl>
+<dl class="simple">
+<dt>Side Effects:</dt><dd><ul class="simple">
+<li><p>Changes the current working directory (<cite>os.chdir</cite>).</p></li>
+<li><p>Sets environment variables <cite>SUBDIR_PATH</cite> and <cite>MODE</cite>.</p></li>
+<li><p>Executes shell commands via <cite>os.system</cite>.</p></li>
+<li><p>Prints colored status messages to the terminal.</p></li>
+</ul>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="Fgpt_package.processor.Processor.create_call_stmt">
+<span class="sig-name descname"><span class="pre">create_call_stmt</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">subroutine_tree</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="_modules/Fgpt_package/processor.html#Processor.create_call_stmt"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#Fgpt_package.processor.Processor.create_call_stmt" title="Link to this definition">¶</a></dt>
+<dd><p>Constructs a Fortran CALL statement from the AST of a parsed subroutine.</p>
+<p>This method extracts the subroutine name from a provided <cite>Subroutine_Stmt</cite>
+node within the subroutine’s AST and returns a corresponding
+<cite>Call_Stmt</cite> object (parsed using fparser).</p>
+<section id="id10">
+<h3>Parameters:<a class="headerlink" href="#id10" title="Link to this heading">¶</a></h3>
+<dl class="simple">
+<dt>subroutine_tree<span class="classifier">fparser.two.Fortran2003.Block</span></dt><dd><p>The AST node representing the full subroutine block (e.g., returned from <cite>parse_fortran_string</cite> or similar).</p>
+</dd>
+</dl>
+</section>
+<section id="id11">
+<h3>Returns:<a class="headerlink" href="#id11" title="Link to this heading">¶</a></h3>
+<dl class="simple">
+<dt>subroutine_call_obj<span class="classifier">fparser.two.Fortran2003.Call_Stmt</span></dt><dd><p>A parsed <cite>CALL</cite> statement targeting the subroutine, which can be inserted
+into other Fortran program structures.</p>
+</dd>
+</dl>
+</section>
+<section id="id12">
+<h3>Raises:<a class="headerlink" href="#id12" title="Link to this heading">¶</a></h3>
+<dl class="simple">
+<dt>Exception</dt><dd><p>If the subroutine name cannot be extracted or the CALL statement cannot be constructed.</p>
+</dd>
+</dl>
+</section>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="Fgpt_package.processor.Processor.generate_read_routine">
+<span class="sig-name descname"><span class="pre">generate_read_routine</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">specification_part</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">initialization_part</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">subroutine_name</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="_modules/Fgpt_package/processor.html#Processor.generate_read_routine"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#Fgpt_package.processor.Processor.generate_read_routine" title="Link to this definition">¶</a></dt>
+<dd><p>Generates a complete Fortran subroutine that reads input data from file
+and initializes dummy variables.</p>
+<p>This method creates a new subroutine based on a template, inserts dummy
+argument declarations and initialization <cite>READ</cite> statements, and finalizes
+the subroutine with a <cite>CLOSE</cite> statement for the file unit.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>specification_part</strong> (<em>list</em>) – A list of <cite>F23.Type_Declaration_Stmt</cite> nodes that declare dummy variables
+and their types, shapes, etc.</p></li>
+<li><p><strong>initialization_part</strong> (<em>list</em>) – A list of <cite>F23.Read_Stmt</cite> nodes used to read input values from a binary file
+into the declared dummy arguments.</p></li>
+<li><p><strong>subroutine_name</strong> (<em>str</em>) – Name of the generated subroutine, used to customize the header.</p></li>
+</ul>
+</dd>
+<dt class="field-even">Returns<span class="colon">:</span></dt>
+<dd class="field-even"><p>An updated Fortran subroutine block (<cite>Fparser2Node</cite>) with appropriate declarations,
+dummy argument interface, and input reading logic inserted.</p>
+</dd>
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>Fparser2Node</p>
+</dd>
+<dt class="field-even">Raises<span class="colon">:</span></dt>
+<dd class="field-even"><p><strong>Exception</strong> – If any error occurs during construction of the subroutine block, it is logged and raised.</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="Fgpt_package.processor.Processor.initialization_statement">
+<span class="sig-name descname"><span class="pre">initialization_statement</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">items</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="_modules/Fgpt_package/processor.html#Processor.initialization_statement"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#Fgpt_package.processor.Processor.initialization_statement" title="Link to this definition">¶</a></dt>
+<dd><p>Separates Fortran declarations and generates appropriate initialization
+<cite>read(…)</cite> or <cite>write(…)</cite> statements for variables.</p>
+<p>Used when variables are declared without initialization or
+when <cite>ALLOCATABLE</cite> is not present.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>items</strong> (<em>list</em>) – List of declaration nodes (F23.Type_Declaration_Stmt).</p>
+</dd>
+<dt class="field-even">Returns<span class="colon">:</span></dt>
+<dd class="field-even"><p>List of Fortran read statements for each variable.</p>
+</dd>
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>read_list (list)</p>
+</dd>
+</dl>
+<dl class="simple">
+<dt>Populates:</dt><dd><ul class="simple">
+<li><p>self.write_stmt → Stores <cite>write(…)</cite> strings.</p></li>
+<li><p>self.dummy_list → Stores modified declaration statements.</p></li>
+</ul>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="Fgpt_package.processor.Processor.initiate_empty_routine">
+<span class="sig-name descname"><span class="pre">initiate_empty_routine</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">subroutine_name</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="_modules/Fgpt_package/processor.html#Processor.initiate_empty_routine"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#Fgpt_package.processor.Processor.initiate_empty_routine" title="Link to this definition">¶</a></dt>
+<dd><p>Generates a dummy Fortran subroutine with an open statement and a print,
+then parses and returns its AST node.</p>
+<section id="id13">
+<h3>Parameters:<a class="headerlink" href="#id13" title="Link to this heading">¶</a></h3>
+<dl class="simple">
+<dt>subroutine_name<span class="classifier">str</span></dt><dd><p>The name to be used in the dummy subroutine’s printed message and file path.</p>
+</dd>
+</dl>
+</section>
+<section id="id14">
+<h3>Returns:<a class="headerlink" href="#id14" title="Link to this heading">¶</a></h3>
+<dl class="simple">
+<dt>subroutine_node<span class="classifier">fparser.two.Fortran2003.Subroutine_Subprogram</span></dt><dd><p>The root AST node representing the generated subroutine.</p>
+</dd>
+</dl>
+</section>
+<section id="id15">
+<h3>Notes:<a class="headerlink" href="#id15" title="Link to this heading">¶</a></h3>
+<ul class="simple">
+<li><dl class="simple">
+<dt>The dummy subroutine includes:</dt><dd><ul>
+<li><p>An <cite>open</cite> statement opening a binary file.</p></li>
+<li><p>A write (print) statement to indicate execution.</p></li>
+</ul>
+</dd>
+</dl>
+</li>
+<li><p>The file path is constructed using <cite>self.benchmark_dir</cite> and the subroutine name.</p></li>
+<li><p>Useful as a placeholder routine during transformation or benchmarking.</p></li>
+<li><p>Parses the generated code using <cite>FortranStringReader</cite> and returns the subroutine AST node.</p></li>
+</ul>
+</section>
+<section id="id16">
+<h3>Raises:<a class="headerlink" href="#id16" title="Link to this heading">¶</a></h3>
+<dl class="simple">
+<dt>Exception</dt><dd><p>If the subroutine code cannot be parsed.</p>
+</dd>
+</dl>
+</section>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="Fgpt_package.processor.Processor.map_declaration">
+<span class="sig-name descname"><span class="pre">map_declaration</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">implicit_dec</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">explicit_dec</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">dimensions</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="_modules/Fgpt_package/processor.html#Processor.map_declaration"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#Fgpt_package.processor.Processor.map_declaration" title="Link to this definition">¶</a></dt>
+<dd><p>Maps an assumed-shape or partially defined Fortran declaration (e.g. DIMENSION(:))
+to a fully explicit declaration (e.g. DIMENSION(kjpindex)).</p>
+<section id="id17">
+<h3>Parameters:<a class="headerlink" href="#id17" title="Link to this heading">¶</a></h3>
+<dl class="simple">
+<dt>implicit_dec<span class="classifier">fparser.two.Fortran2003.Type_Declaration_Stmt</span></dt><dd><p>The original implicit declaration, typically with DIMENSION(:) or missing shape info.</p>
+</dd>
+<dt>explicit_dec<span class="classifier">fparser.two.Fortran2003.Type_Declaration_Stmt, optional</span></dt><dd><p>A full declaration used to infer shape (when <cite>dimensions</cite> is not explicitly given).</p>
+</dd>
+<dt>dimensions<span class="classifier">str, optional</span></dt><dd><p>A comma-separated string of dimensions (e.g. “kjpindex, nlev”) to override shape detection.</p>
+</dd>
+</dl>
+</section>
+<section id="id18">
+<h3>Returns:<a class="headerlink" href="#id18" title="Link to this heading">¶</a></h3>
+<dl class="simple">
+<dt>parsed_decl<span class="classifier">fparser.two.Fortran2003.Type_Declaration_Stmt</span></dt><dd><p>A new, fully formed declaration statement with mapped shape.</p>
+</dd>
+</dl>
+</section>
+<section id="id19">
+<h3>Raises:<a class="headerlink" href="#id19" title="Link to this heading">¶</a></h3>
+<p>ValueError if the variable type, name, or shape are missing or cannot be inferred.
+Exception if parsing the constructed declaration fails.</p>
+</section>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="Fgpt_package.processor.Processor.out_main_fortran">
+<span class="sig-name descname"><span class="pre">out_main_fortran</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="_modules/Fgpt_package/processor.html#Processor.out_main_fortran"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#Fgpt_package.processor.Processor.out_main_fortran" title="Link to this definition">¶</a></dt>
+<dd><p>Generates and parses a minimal Fortran <cite>main</cite> program.</p>
+<p>This method creates a simple Fortran program named <cite>main</cite> with:</p>
+<ul class="simple">
+<li><p>An <cite>implicit none</cite> declaration to enforce explicit typing.</p></li>
+<li><p>A basic print statement to indicate entry into the main program.</p></li>
+<li><dl class="simple">
+<dt>A <cite>contains</cite> section included to support the addition of internal</dt><dd><p>subroutines if needed in future code generation.</p>
+</dd>
+</dl>
+</li>
+</ul>
+<p>This stub is useful as a starting point for wrapping generated modules,
+calling subroutines, or building up a driver program structure for testing
+or benchmarking.</p>
+<section id="id20">
+<h3>Returns:<a class="headerlink" href="#id20" title="Link to this heading">¶</a></h3>
+<dl class="simple">
+<dt>parse_tree<span class="classifier">fparser.two.Fortran2003.Program</span></dt><dd><p>The parsed Abstract Syntax Tree (AST) of the generated main program.</p>
+</dd>
+</dl>
+</section>
+<section id="id21">
+<h3>Raises:<a class="headerlink" href="#id21" title="Link to this heading">¶</a></h3>
+<dl class="simple">
+<dt>Exception</dt><dd><p>If the Fortran source fails to parse.</p>
+</dd>
+</dl>
+</section>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="Fgpt_package.processor.Processor.out_module_fortran">
+<span class="sig-name descname"><span class="pre">out_module_fortran</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">subroutine_name</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="_modules/Fgpt_package/processor.html#Processor.out_module_fortran"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#Fgpt_package.processor.Processor.out_module_fortran" title="Link to this definition">¶</a></dt>
+<dd><p>Generates and parses a Fortran <cite>module</cite> containing globally defined
+constants, variables, and a utility subroutine for initialization.</p>
+<p>This method programmatically creates a Fortran source code string that
+defines:</p>
+<ul class="simple">
+<li><p>A module named <cite>module_global</cite></p></li>
+<li><p>Parameter constants (e.g., <cite>i_std</cite>, <cite>r_std</cite>, array sizes)</p></li>
+<li><p>Globally scoped scalar variables</p></li>
+<li><dl class="simple">
+<dt>A <cite>declaration_initialization</cite> subroutine that opens a binary file</dt><dd><p>associated with the given <cite>subroutine_name</cite></p>
+</dd>
+</dl>
+</li>
+</ul>
+<section id="id22">
+<h3>Parameters:<a class="headerlink" href="#id22" title="Link to this heading">¶</a></h3>
+<dl class="simple">
+<dt>subroutine_name<span class="classifier">str</span></dt><dd><p>Name of the subroutine for which the global binary file path
+is constructed. This name is inserted into the <cite>OPEN</cite> statement
+to load <cite>global.bin</cite>.</p>
+</dd>
+</dl>
+</section>
+<section id="id23">
+<h3>Returns:<a class="headerlink" href="#id23" title="Link to this heading">¶</a></h3>
+<dl class="simple">
+<dt>parse_tree<span class="classifier">fparser.two.Fortran2003.Program</span></dt><dd><p>The parsed AST representation of the module and its contents.</p>
+</dd>
+</dl>
+</section>
+<section id="id24">
+<h3>Raises:<a class="headerlink" href="#id24" title="Link to this heading">¶</a></h3>
+<dl class="simple">
+<dt>Exception</dt><dd><p>If the Fortran string fails to parse.</p>
+</dd>
+</dl>
+</section>
+<section id="id25">
+<h3>Notes:<a class="headerlink" href="#id25" title="Link to this heading">¶</a></h3>
+<p>This method is useful for generating boilerplate global Fortran modules
+used in benchmarking, testing, or modular code generation. It ensures
+consistency in parameters and supports I/O operations embedded within
+global modules.</p>
+</section>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="Fgpt_package.processor.Processor.parse_fortran_comment">
+<span class="sig-name descname"><span class="pre">parse_fortran_comment</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">stmt_str</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="_modules/Fgpt_package/processor.html#Processor.parse_fortran_comment"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#Fgpt_package.processor.Processor.parse_fortran_comment" title="Link to this definition">¶</a></dt>
+<dd><p>Parses a Fortran comment and returns the corresponding fparser comment node.</p>
+<section id="id26">
+<h3>Parameters:<a class="headerlink" href="#id26" title="Link to this heading">¶</a></h3>
+<dl class="simple">
+<dt>stmt_str<span class="classifier">str</span></dt><dd><p>A single line Fortran comment (e.g., ‘! this is a comment’).</p>
+</dd>
+</dl>
+</section>
+<section id="id27">
+<h3>Returns:<a class="headerlink" href="#id27" title="Link to this heading">¶</a></h3>
+<dl class="simple">
+<dt>node<span class="classifier">fparser.two.utils.Comment</span></dt><dd><p>The fparser AST node representing the comment.</p>
+</dd>
+</dl>
+</section>
+<section id="id28">
+<h3>Notes:<a class="headerlink" href="#id28" title="Link to this heading">¶</a></h3>
+<ul class="simple">
+<li><p>The comment is wrapped in a dummy program block for parsing context.</p></li>
+<li><p><cite>ignore_comments=False</cite> is required to ensure comments are preserved.</p></li>
+<li><p>Walks the parsed tree to extract the comment node.</p></li>
+<li><p>If no valid comment node is found, it raises a runtime error.</p></li>
+</ul>
+</section>
+<section id="id29">
+<h3>Raises:<a class="headerlink" href="#id29" title="Link to this heading">¶</a></h3>
+<dl class="simple">
+<dt>RuntimeError</dt><dd><p>If the comment could not be parsed or extracted.</p>
+</dd>
+</dl>
+</section>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="Fgpt_package.processor.Processor.parse_fortran_file">
+<span class="sig-name descname"><span class="pre">parse_fortran_file</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">file_path</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="_modules/Fgpt_package/processor.html#Processor.parse_fortran_file"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#Fgpt_package.processor.Processor.parse_fortran_file" title="Link to this definition">¶</a></dt>
+<dd><p>Parses a Fortran source file and returns its Abstract Syntax Tree (AST).</p>
+<section id="id30">
+<h3>Parameters:<a class="headerlink" href="#id30" title="Link to this heading">¶</a></h3>
+<dl class="simple">
+<dt>file_path<span class="classifier">str</span></dt><dd><p>Path to the Fortran source file to be parsed.</p>
+</dd>
+</dl>
+</section>
+<section id="id31">
+<h3>Returns:<a class="headerlink" href="#id31" title="Link to this heading">¶</a></h3>
+<dl class="simple">
+<dt>parse_tree<span class="classifier">fparser.two.Fortran2008.Program</span></dt><dd><p>The root of the abstract syntax tree (AST) generated by fparser.</p>
+</dd>
+</dl>
+</section>
+<section id="id32">
+<h3>Raises:<a class="headerlink" href="#id32" title="Link to this heading">¶</a></h3>
+<dl class="simple">
+<dt>Exception</dt><dd><p>If parsing fails due to invalid syntax or I/O issues.</p>
+</dd>
+</dl>
+</section>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="Fgpt_package.processor.Processor.parse_fortran_statement">
+<span class="sig-name descname"><span class="pre">parse_fortran_statement</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">stmt_str</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="_modules/Fgpt_package/processor.html#Processor.parse_fortran_statement"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#Fgpt_package.processor.Processor.parse_fortran_statement" title="Link to this definition">¶</a></dt>
+<dd><p>Parses a single Fortran statement and returns its corresponding fparser AST node.</p>
+<section id="id33">
+<h3>Parameters:<a class="headerlink" href="#id33" title="Link to this heading">¶</a></h3>
+<dl class="simple">
+<dt>stmt_str<span class="classifier">str</span></dt><dd><p>A single line or statement of Fortran code (e.g., an assignment, loop, etc.).</p>
+</dd>
+</dl>
+</section>
+<section id="id34">
+<h3>Returns:<a class="headerlink" href="#id34" title="Link to this heading">¶</a></h3>
+<dl class="simple">
+<dt>node<span class="classifier">fparser.two.base.Base</span></dt><dd><p>The fparser AST node representing the parsed statement.</p>
+</dd>
+</dl>
+</section>
+<section id="id35">
+<h3>Notes:<a class="headerlink" href="#id35" title="Link to this heading">¶</a></h3>
+<ul class="simple">
+<li><p>Wraps the statement inside a dummy program (with <cite>program foo … end</cite>) to ensure it’s valid Fortran.</p></li>
+<li><p>This approach allows fparser to treat the input as a complete unit for parsing.</p></li>
+<li><p>Filters out the program start and end lines to return only the actual statement node.</p></li>
+<li><p>Useful for identifying what kind of AST node a statement maps to in <cite>fparser.two.Fortran2003</cite>.</p></li>
+</ul>
+</section>
+<section id="id36">
+<h3>Raises:<a class="headerlink" href="#id36" title="Link to this heading">¶</a></h3>
+<dl class="simple">
+<dt>Exception</dt><dd><p>If the statement cannot be parsed.</p>
+</dd>
+</dl>
+</section>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="Fgpt_package.processor.Processor.parse_fortran_string">
+<span class="sig-name descname"><span class="pre">parse_fortran_string</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">string</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="_modules/Fgpt_package/processor.html#Processor.parse_fortran_string"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#Fgpt_package.processor.Processor.parse_fortran_string" title="Link to this definition">¶</a></dt>
+<dd><p>Parses a Fortran code snippet provided as a string and returns its AST.</p>
+<section id="id37">
+<h3>Parameters:<a class="headerlink" href="#id37" title="Link to this heading">¶</a></h3>
+<dl class="simple">
+<dt>string<span class="classifier">str</span></dt><dd><p>A string containing valid Fortran source code.</p>
+</dd>
+</dl>
+</section>
+<section id="id38">
+<h3>Returns:<a class="headerlink" href="#id38" title="Link to this heading">¶</a></h3>
+<dl class="simple">
+<dt>parse_tree<span class="classifier">fparser.two.Fortran2008.Program</span></dt><dd><p>The root of the AST representing the parsed code.</p>
+</dd>
+</dl>
+</section>
+<section id="id39">
+<h3>Raises:<a class="headerlink" href="#id39" title="Link to this heading">¶</a></h3>
+<dl class="simple">
+<dt>Exception</dt><dd><p>If the parsing fails due to invalid syntax or other errors.</p>
+</dd>
+</dl>
+</section>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="Fgpt_package.processor.Processor.process_queue">
+<span class="sig-name descname"><span class="pre">process_queue</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">input_list</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="_modules/Fgpt_package/processor.html#Processor.process_queue"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#Fgpt_package.processor.Processor.process_queue" title="Link to this definition">¶</a></dt>
+<dd><p>Organizes a list of Fortran declaration statements into a logical and structured order.</p>
+<p>This method is designed to sort variable declarations based on their characteristics,
+which is particularly important for ensuring correct code generation and proper
+compilation behavior in Fortran.</p>
+<dl class="simple">
+<dt>The reordering follows these rules:</dt><dd><ul class="simple">
+<li><p>PARAMETER constants (non-arrays) come first.</p></li>
+<li><p>Regular scalar variables follow.</p></li>
+<li><p>Arrays and ALLOCATABLE declarations are placed at the end.</p></li>
+</ul>
+</dd>
+<dt>Specifically:</dt><dd><ul class="simple">
+<li><dl class="simple">
+<dt>If a declaration includes the PARAMETER attribute and is not an array:</dt><dd><ul>
+<li><p>If it has initialization, it’s added to the end of the PARAMETER section.</p></li>
+<li><p>If it lacks initialization, it’s inserted at the very beginning.</p></li>
+</ul>
+</dd>
+</dl>
+</li>
+<li><p>ALLOCATABLE declarations and variables with explicit shape (arrays) go last.</p></li>
+<li><p>All others (typically scalar declarations) are kept in the middle.</p></li>
+</ul>
+</dd>
+</dl>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>input_list</strong> (<em>list</em>) – A list of F23.Type_Declaration_Stmt nodes representing
+variable declarations to be sorted.</p>
+</dd>
+<dt class="field-even">Returns<span class="colon">:</span></dt>
+<dd class="field-even"><p>A reordered list of declaration statements following the above rules.</p>
+</dd>
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>list</p>
+</dd>
+<dt class="field-even">Raises<span class="colon">:</span></dt>
+<dd class="field-even"><p><strong>Exception</strong> – If any error occurs during processing.</p>
+</dd>
+</dl>
+<dl class="simple">
+<dt>Logging:</dt><dd><p>Logs information about the sorting process and any errors encountered.</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="Fgpt_package.processor.Processor.remove_intent_and_save">
+<span class="sig-name descname"><span class="pre">remove_intent_and_save</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">type_declaration_stmts</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="_modules/Fgpt_package/processor.html#Processor.remove_intent_and_save"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#Fgpt_package.processor.Processor.remove_intent_and_save" title="Link to this definition">¶</a></dt>
+<dd><p>Removes specific Fortran attributes such as INTENT, SAVE, and PUBLIC
+from a list of type declaration statements.</p>
+<section id="id40">
+<h3>Parameters:<a class="headerlink" href="#id40" title="Link to this heading">¶</a></h3>
+<dl class="simple">
+<dt>type_declaration_stmts<span class="classifier">list of Fortran2003.Type_Declaration_Stmt</span></dt><dd><p>A list of Fortran type declaration AST nodes to clean.</p>
+</dd>
+</dl>
+</section>
+<section id="id41">
+<h3>Returns:<a class="headerlink" href="#id41" title="Link to this heading">¶</a></h3>
+<dl class="simple">
+<dt>cleaned_statements<span class="classifier">list of Fortran2003.Type_Declaration_Stmt</span></dt><dd><p>Modified declarations without INTENT, SAVE, or PUBLIC attributes.</p>
+</dd>
+</dl>
+</section>
+<section id="id42">
+<h3>Notes:<a class="headerlink" href="#id42" title="Link to this heading">¶</a></h3>
+<ul class="simple">
+<li><p>Useful for extracting variable declarations from subroutines and</p></li>
+</ul>
+<p>reusing them in contexts where INTENT or SAVE is not allowed.
+- Maintains DIMENSION, POINTER, ALLOCATABLE, and other attributes.
+- Skips any node that is not a Type_Declaration_Stmt.</p>
+</section>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="Fgpt_package.processor.Processor.separate_entity_allocation">
+<span class="sig-name descname"><span class="pre">separate_entity_allocation</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">allocate_stmt</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="_modules/Fgpt_package/processor.html#Processor.separate_entity_allocation"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#Fgpt_package.processor.Processor.separate_entity_allocation" title="Link to this definition">¶</a></dt>
+<dd><p>Separates a compound Fortran ALLOCATE statement into multiple individual allocate statements,
+one for each variable.</p>
+<section id="id43">
+<h3>Parameters:<a class="headerlink" href="#id43" title="Link to this heading">¶</a></h3>
+<dl class="simple">
+<dt>allocate_stmt<span class="classifier">fparser.two.Fortran2003.Allocate_Stmt</span></dt><dd><p>A parsed allocate statement, potentially allocating multiple variables.</p>
+</dd>
+</dl>
+</section>
+<section id="id44">
+<h3>Returns:<a class="headerlink" href="#id44" title="Link to this heading">¶</a></h3>
+<dl class="simple">
+<dt>new_allocation<span class="classifier">list of fparser.two.Fortran2003.Allocate_Stmt</span></dt><dd><p>A list of new allocate statements, each allocating a single variable.</p>
+</dd>
+</dl>
+</section>
+<section id="id45">
+<h3>Notes:<a class="headerlink" href="#id45" title="Link to this heading">¶</a></h3>
+<ul class="simple">
+<li><p>Also preserves optional allocation options (e.g., <cite>stat=istat</cite>).</p></li>
+<li><p>Supports both Fortran 2003 and Fortran 2008 AST types.</p></li>
+<li><p>Useful when tools need one allocation per line for readability or instrumentation.</p></li>
+</ul>
+</section>
+<section id="id46">
+<h3>Raises:<a class="headerlink" href="#id46" title="Link to this heading">¶</a></h3>
+<dl class="simple">
+<dt>Exception</dt><dd><p>If parsing or transformation fails.</p>
+</dd>
+</dl>
+</section>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="Fgpt_package.processor.Processor.separate_entity_declarations">
+<span class="sig-name descname"><span class="pre">separate_entity_declarations</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">declaration_stmt</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="_modules/Fgpt_package/processor.html#Processor.separate_entity_declarations"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#Fgpt_package.processor.Processor.separate_entity_declarations" title="Link to this definition">¶</a></dt>
+<dd><p>Splits a combined Fortran type declaration statement into separate declarations,
+one for each variable.</p>
+<section id="id47">
+<h3>Parameters:<a class="headerlink" href="#id47" title="Link to this heading">¶</a></h3>
+<dl class="simple">
+<dt>declaration_stmt<span class="classifier">fparser.two.Fortran2003.Type_Declaration_Stmt</span></dt><dd><p>A parsed Fortran declaration statement, possibly declaring multiple variables.</p>
+</dd>
+</dl>
+</section>
+<section id="id48">
+<h3>Returns:<a class="headerlink" href="#id48" title="Link to this heading">¶</a></h3>
+<dl class="simple">
+<dt>new_decl<span class="classifier">list of fparser.two.Fortran2003.Type_Declaration_Stmt</span></dt><dd><p>A list of declaration statements, each declaring exactly one variable.</p>
+</dd>
+</dl>
+</section>
+<section id="id49">
+<h3>Notes:<a class="headerlink" href="#id49" title="Link to this heading">¶</a></h3>
+<ul class="simple">
+<li><p>Preserves the left part (type, kind, dimension, intent, etc.).</p></li>
+<li><p>Separates the variable names to create one declaration per variable.</p></li>
+<li><p>Useful in code transformations that require granular control of declarations.</p></li>
+</ul>
+</section>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="Fgpt_package.processor.Processor.update_global_module">
+<span class="sig-name descname"><span class="pre">update_global_module</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">input_dict</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">file_path</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">subroutine_name</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">module_tree</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="_modules/Fgpt_package/processor.html#Processor.update_global_module"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#Fgpt_package.processor.Processor.update_global_module" title="Link to this definition">¶</a></dt>
+<dd><p>Update the global Fortran module by injecting declarations, use statements,
+and I/O operations related to global variables and routines.</p>
+<p>This method performs the following steps:
+1. Locates the call statement to the specified subroutine within the module tree
+and replaces it with a code block that opens a binary file, writes data,
+and then closes the file.
+2. Inserts collected USE statements and variable declarations into the module’s
+specification part.
+3. Inserts initialization and allocation statements into the appropriate subroutines
+(e.g., ‘declaration_initialization’ and ‘initialization’) within the module’s
+subprogram part.
+4. Handles OpenACC declarations for device data management by adding relevant
+directives.
+5. Finally, writes the updated Fortran module code to the specified file path.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>input_dict</strong> (<em>dict</em>) – Dictionary of variables or declarations to add.</p></li>
+<li><p><strong>file_path</strong> (<em>str</em>) – Path where the updated Fortran module source code will be saved.</p></li>
+<li><p><strong>subroutine_name</strong> (<em>str</em>) – Name of the subroutine whose call site is to be updated.</p></li>
+<li><p><strong>module_tree</strong> (<em>F23.Tree</em>) – Parsed Fortran module tree representing the source code.</p></li>
+</ul>
+</dd>
+<dt class="field-even">Raises<span class="colon">:</span></dt>
+<dd class="field-even"><ul class="simple">
+<li><p><strong>AssertionError</strong> – If unexpected node types are encountered during tree traversal.</p></li>
+<li><p><strong>Exception</strong> – Logs and re-raises any exceptions that occur during processing.</p></li>
+</ul>
+</dd>
+</dl>
+<dl class="simple">
+<dt>Logging:</dt><dd><p>Logs success or failure of the module update process.</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="Fgpt_package.processor.Processor.update_main_program">
+<span class="sig-name descname"><span class="pre">update_main_program</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">custom_dec_inout</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">custom_subroutine_trees</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">call_stmts</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">var_modif</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">file_path</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">subroutine_name</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">dummy_args</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">module_tree</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">childs_subroutine_tree</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">openacc</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">dummy_add_decl</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">error_flag</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">acc_data_copyin</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="_modules/Fgpt_package/processor.html#Processor.update_main_program"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#Fgpt_package.processor.Processor.update_main_program" title="Link to this definition">¶</a></dt>
+<dd><p>Updates the Fortran main program by modifying its structure, adding subroutine calls,
+variable declarations, initialization routines, error handling, and OpenACC directives
+for parallelism. The method processes the given subroutine information and writes the
+modified program to the specified file path.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>custom_dec_inout</strong> (<em>list</em>) – A list of custom variable declarations and input/output
+specifications to be inserted into the Fortran program’s
+specification part.</p></li>
+<li><p><strong>custom_subroutine_trees</strong> (<em>list</em>) – A list of subroutine trees to be inserted into the
+main program.</p></li>
+<li><p><strong>call_stmts</strong> (<em>list</em>) – A list of Fortran <cite>Call_Stmt</cite> objects representing subroutine
+calls to be inserted into the program.</p></li>
+<li><p><strong>var_modif</strong> (<em>set</em>) – A set of variable names that have been modified within the
+subroutine. Used for tracking variable changes.</p></li>
+<li><p><strong>file_path</strong> (<em>str</em>) – The file path where the modified Fortran code will be written to.</p></li>
+<li><p><strong>subroutine_name</strong> (<em>str</em>) – The name of the subroutine to be modified in the main program.</p></li>
+<li><p><strong>dummy_args</strong> (<em>list</em>) – A list of dummy argument names that are passed to subroutines.</p></li>
+<li><p><strong>module_tree</strong> (<em>F23.Module_Stmt</em>) – The module tree of the program, which includes
+declarations and subroutines that need to be modified.</p></li>
+<li><p><strong>childs_subroutine_tree</strong> (<em>optional</em><em>, </em><em>list</em>) – A list of child subroutine trees to be
+inserted into the program. Default is <cite>None</cite>.</p></li>
+<li><p><strong>openacc</strong> (<em>bool</em><em>, </em><em>optional</em>) – If <cite>True</cite>, OpenACC directives for parallelism and data
+management are inserted into the program. Default is <cite>False</cite>.</p></li>
+<li><p><strong>dummy_add_decl</strong> (<em>F23.Declaration_Stmt</em><em>, </em><em>optional</em>) – A Fortran declaration statement
+for dummy arguments to be added.
+Default is <cite>None</cite>.</p></li>
+<li><p><strong>error_flag</strong> (<em>dict</em><em>, </em><em>optional</em>) – A dictionary containing error flags for variables.
+Used to insert error-handling code. Default is <cite>None</cite>.</p></li>
+</ul>
+</dd>
+</dl>
+<dl class="simple">
+<dt>Operation:</dt><dd><ul class="simple">
+<li><p>Initializes and parses the main program and module information.</p></li>
+<li><p>Handles dummy arguments and builds initialization routines for them.</p></li>
+<li><p>Updates variable declarations and adds error-handling code based on the <cite>error_flag</cite>.</p></li>
+<li><p>Inserts initialization code, such as <cite>read</cite> routines, for dummy arguments.</p></li>
+<li><dl class="simple">
+<dt>Modifies the <cite>Specification_Part</cite> of the program by inserting new variable</dt><dd><p>declarations and subroutine calls.</p>
+</dd>
+</dl>
+</li>
+<li><dl class="simple">
+<dt>Adds performance benchmarking code using <cite>SYSTEM_CLOCK</cite> and writes the result</dt><dd><p>to an output file.</p>
+</dd>
+</dl>
+</li>
+<li><dl class="simple">
+<dt>If <cite>openacc</cite> is enabled, inserts OpenACC directives for parallel loops and data</dt><dd><p>management, such as <cite>COPYIN</cite>, <cite>UPDATE SELF</cite>, and <cite>PARALLEL LOOP</cite>.</p>
+</dd>
+</dl>
+</li>
+<li><dl class="simple">
+<dt>Includes subroutine calls for initialization, execution time measurements, and</dt><dd><p>variable modifications.</p>
+</dd>
+</dl>
+</li>
+<li><p>Handles child subroutine trees and inserts them at the appropriate locations.</p></li>
+<li><p>Writes the modified Fortran code to the specified file path.</p></li>
+</ul>
+</dd>
+</dl>
+<dl class="field-list simple">
+<dt class="field-odd">Returns<span class="colon">:</span></dt>
+<dd class="field-odd"><p><dl class="simple">
+<dt>The method does not return a value, but modifies the Fortran program in place</dt><dd><p>and writes it to the provided file path.</p>
+</dd>
+</dl>
+</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p>None</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="Fgpt_package.processor.Processor.write_fortran_code_to_file">
+<span class="sig-name descname"><span class="pre">write_fortran_code_to_file</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">code</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">file_path</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="_modules/Fgpt_package/processor.html#Processor.write_fortran_code_to_file"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#Fgpt_package.processor.Processor.write_fortran_code_to_file" title="Link to this definition">¶</a></dt>
+<dd><p>Writes formatted Fortran code to a specified file.</p>
+<p>This method takes a parsed Fortran code object, processes it to
+ensure line length compliance or formatting via a line length processor,
+then writes the resulting string to the given file path.</p>
+<section id="id50">
+<h3>Parameters:<a class="headerlink" href="#id50" title="Link to this heading">¶</a></h3>
+<dl class="simple">
+<dt>code<span class="classifier">fparser.two.Fortran2003.Base</span></dt><dd><p>The parsed Fortran code object to be converted and written.</p>
+</dd>
+<dt>file_path<span class="classifier">str</span></dt><dd><p>The path of the file where the Fortran code will be saved.</p>
+</dd>
+</dl>
+</section>
+<section id="id51">
+<h3>Raises:<a class="headerlink" href="#id51" title="Link to this heading">¶</a></h3>
+<dl class="simple">
+<dt>Exception</dt><dd><p>If writing to the file or processing the code fails.</p>
+</dd>
+</dl>
+</section>
+</dd></dl>
+
+</section>
+</dd></dl>
+
+</section>
+
+
+          </div>
+          
+        </div>
+      </div>
+      <div class="sphinxsidebar" role="navigation" aria-label="Main">
+        <div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="index.html">Fgpt_package</a></h1>
+
+
+
+
+
+
+
+
+
+<search id="searchbox" style="display: none" role="search">
+    <div class="searchformwrapper">
+    <form class="search" action="search.html" method="get">
+      <input type="text" name="q" aria-labelledby="searchlabel" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" placeholder="Search"/>
+      <input type="submit" value="Go" />
+    </form>
+    </div>
+</search>
+<script>document.getElementById('searchbox').style.display = "block"</script><h3>Navigation</h3>
+
+<div class="relations">
+<h3>Related Topics</h3>
+<ul>
+  <li><a href="index.html">Documentation overview</a><ul>
+  </ul></li>
+</ul>
+</div>
+
+
+
+
+
+
+
+
+        </div>
+      </div>
+      <div class="clearer"></div>
+    </div>
+    <div class="footer">
+      &#169;2025, Kardaneh.
+      
+      |
+      Powered by <a href="https://www.sphinx-doc.org/">Sphinx 8.1.3</a>
+      &amp; <a href="https://alabaster.readthedocs.io">Alabaster 1.0.0</a>
+      
+      |
+      <a href="_sources/Fgpt_package.processor.rst.txt"
+          rel="nofollow">Page source</a>
+    </div>
+
+    
+
+    
+  </body>
+</html>
