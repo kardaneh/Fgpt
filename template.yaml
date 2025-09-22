@@ -6,21 +6,18 @@ Python_templates:
             from scipy.io import FortranFile
             import os
             
-            i_std = np.int32   
-            r_std = np.float64
+            nsnow = np.int32(3)
+            nslm = np.int32(11)
+            nvm = np.int32(15)
+            nstm = np.int32(3)
+            kjpindex = np.int32(4717)
             
-            nsnow = i_std(3)
-            nslm = i_std(11)
-            nvm = i_std(15)
-            nstm = i_std(3)
-            kjpindex = i_std(4717)
-            
-            ier = i_std(0)
-            ic0 = i_std(0)
-            ic = i_std(0)
-            icr = r_std(0.0)
-            start_time = r_std(0.0)
-            stop_time = r_std(0.0)
+            ier = np.int32(0)
+            ic0 = np.int32(0)
+            ic = np.int32(0)
+            icr = np.float64(0.0)
+            start_time = np.float64(0.0)
+            stop_time = np.float64(0.0)
             
             def declaration_initialization():
                 print("--- add the declaration and initialization in module global ---")
@@ -34,21 +31,19 @@ Python_templates:
             
             class Global_module:
                 def __init__(self):
-                    i_std = np.int32   
-                    r_std = np.float64
                     
-                    self.nsnow = i_std(3)
-                    self.nslm = i_std(11)
-                    self.nvm = i_std(15)
-                    self.nstm = i_std(3)
-                    self.kjpindex = i_std(4717)
+                    self.nsnow = np.int32(3)
+                    self.nslm = np.int32(11)
+                    self.nvm = np.int32(15)
+                    self.nstm = np.int32(3)
+                    self.kjpindex = np.int32(4717)
                     
-                    self.ier = i_std(0)
-                    self.ic0 = i_std(0)
-                    self.ic = i_std(0)
-                    self.icr = r_std(0.0)
-                    self.start_time = r_std(0.0)
-                    self.stop_time = r_std(0.0)
+                    self.ier = np.int32(0)
+                    self.ic0 = np.int32(0)
+                    self.ic = np.int32(0)
+                    self.icr = np.float64(0.0)
+                    self.start_time = np.float64(0.0)
+                    self.stop_time = np.float64(0.0)
             
                 def declaration_initialization(self):
                     pass
@@ -58,18 +53,19 @@ Python_templates:
         template: |
             import os
             import time
+            import functools
             import numpy as np
+            import logging
             from scipy.io import FortranFile
             
             def main():
                 print('--- inside the main program ---')
 
-
             if __name__ == "__main__":
                 main()
 
-    Python_read_template:
-        name: "Python_read_template"
+    Python_read_global_template:
+        name: "Python_read_global_template"
         template: |
             path = f'{benchmark_dir}/{subroutine_name}/global.bin'
             ffile = FortranFile(path, 'r')
@@ -95,6 +91,7 @@ Python_templates:
     Python_read_for_loop_class_template:
         name: "Python_read_for_loop_class_template"
         template: |
+            print(f'--- add the declaration and initialization in module global ---')
             path = f'{benchmark_dir}/{subroutine_name}/global.bin'
             ffile = FortranFile(path, 'r')
             for attr_name in []:
@@ -110,6 +107,7 @@ Python_templates:
         name: "Python_read_dummy_template"
         template: |
             def read_dummy():
+                print(f'--- inside the read dummy routine for {subroutine_name} ---')
                 path = f'{benchmark_dir}/{subroutine_name}/dummy.bin'
                 ffile = FortranFile(path, 'r')
                 for var in []:
@@ -119,14 +117,53 @@ Python_templates:
                             var[:] = ffile.read_reals(np.float64).reshape(arr_shape, order='F')
                         elif var.dtype == np.int32:
                             var[:] = ffile.read_ints(np.int32).reshape(arr_shape, order='F')
+
+    Python_timer_template:
+        name: "Python_timer_template"
+        template: |
+            def timer(func):
+                @functools.wraps(func)
+                def wrapper(*args, **kwargs):
+                    start_time = time.perf_counter() 
+                    result = func(*args, **kwargs)
+                    end_time = time.perf_counter()
+                    duration = end_time - start_time
+                    print(f"[TIMER] '{func.__name__}' executed in {duration:.6f} seconds")
+                    path = $path
+                    with open(path,"a") as f:
+                        f.write(f"[TIMER] Python: '{func.__name__}' executed in {duration:.6f} seconds \n")
+                    return result
+                return wrapper
+
+    Python_test_output_template:
+        name: "Python_test_output_template"
+        template: |
+            fortran_value = None 
+            if isinstance(value,np.ndarray): 
+                arr_shape = value.shape
+                if value.dtype == np.float64:
+                    fortran_value = ffile.read_reals(np.float64).reshape(arr_shape, order='F')
+                elif value.dtype == np.int32:
+                    fortran_value = ffile.read_ints(np.int32).reshape(arr_shape, order='F')
                 
+                if np.allclose(value,fortran_value):
+                    print(f'Test passed: Variable:{variable} is equal to FORTRAN variable: {variable}')
+                else:
+                    print(f'Test failed: All elements in {variable} do not match to FORTRAN variable: {variable}')
+                    print(f' Maximum absolute error: {np.max(abs(value - fortran_value))}')
+                    print(f' Min and max of python value: {value.min()}, {value.max()}')
+                    print(f' Min and max of FORTRAN value: {fortran_value.min()}, {fortran_value.max()}')
                     
+            elif not isinstance(value, np.ndarray):
+                if value.dtype == np.bool or value.dtype == np.int32:
+                    fortran_value = ffile.read_ints(np.int32)[0]
+                elif value.dtype == np.float64:
+                    fortran_value = ffile.read_reals(np.float64)[0]
                     
-                    
-
-
-
-
+                if np.isclose(value,fortran_value):
+                    print(f' Test passed: Variable:{variable} is equal to FORTRAN variable: {variable}')
+                else:
+                    print(f'Test failed: Python variable:{variable} do not match to FORTRAN variable: {variable}')
 
 
 
