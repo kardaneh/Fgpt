@@ -146,17 +146,17 @@ class Isolator:
         os.makedirs(sub_dir, exist_ok=True)
         logging.info(f"{subroutine_key} directory created inside benchmark: {sub_dir}")
         '''
-        dummy_as_local = set() 
-        if local_var_parent is not None:
-            for actual_arg_list in cls.actual_arg_spec_list[subroutine_key]:
-                for iarg, arg in enumerate(actual_arg_list):
-                    if arg in local_var_parent:
-                        dummy_arg = cls.dummy_arg_list[subroutine_key][iarg]
-                        dummy_as_local.add(dummy_arg)
-                        self.processor.logger.warning(
+        dummy_as_local = set()
+        if self.openacc:
+            if local_var_parent is not None:
+                for actual_arg_list in cls.actual_arg_spec_list[subroutine_key]:
+                    for iarg, arg in enumerate(actual_arg_list):
+                        if arg in local_var_parent:
+                            dummy_arg = cls.dummy_arg_list[subroutine_key][iarg]
+                            dummy_as_local.add(dummy_arg)
+                            self.processor.logger.warning(
                                 f"passing local variable '{arg}' as argument '{dummy_arg}' into procedure '{subroutine_key}'!"
-                                )
-
+                            )
 
         self.processor.logger.info(f"Trying to isolate a child subroutine .... {subroutine_key}")
 
@@ -424,7 +424,7 @@ class Isolator:
         cls.extract_loop_indices()
         
         
-        for subroutine in ['hydrol_soil']:#cls.subroutine_keys_ncl:
+        for subroutine in ["hydrol_vegupd"]:#cls.subroutine_keys_ncl:
             self.parent_subroutine_call = set()
             self.isolate_parent_subroutine(cls, subroutine)
         
@@ -456,7 +456,7 @@ if __name__ == "__main__":
     rest_of_path = "modipsl_truck_opt/modeles/ORCHIDEE/src_sechiba/"
     target_module = "hydrol" #"explicitsnow"
     work = os.getenv("works")
-    openacc = True
+    openacc = False
     isolator = Isolator(rest_of_path, target_module, work, openacc)
     isolator.run()
 

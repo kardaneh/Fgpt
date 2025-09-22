@@ -3,6 +3,9 @@ from collections import deque
 from processor import Processor
 from fparser.two.utils import walk
 from fparser.two import Fortran2003 as F23
+import unittest
+import tempfile
+import shutil
 
 class Navigator:
     """
@@ -53,8 +56,12 @@ class Navigator:
                 for child in names:
                     if child.string == self.variable_name_sc:
                         stmts = child.parent.parent.parent
-                        name = stmts.parent.parent
-                        morr = walk(name, F23.Name)[0].string
+                        #name = stmts.parent.parent
+                        #morr = walk(name, F23.Name)[0].string
+                        current = stmts
+                        while current is not None and not isinstance(current, (F23.Subroutine_Subprogram, F23.Function_Subprogram, F23.Module)):
+                            current = getattr(current, "parent", None)
+                        morr = walk(current, F23.Name)[0].string
                         any_allocate = walk(self.var_declaration, F23.Allocate_Stmt)
                         any_declarat = walk(self.var_declaration, F23.Type_Declaration_Stmt)
                         if (isinstance(stmts, F23.Type_Declaration_Stmt) and not any_declarat) or \
@@ -286,3 +293,185 @@ class Navigator:
         except Exception as e:
             self.processor.logger.error(f"Error in 'find_var_in_child_modules': {str(e)}")
             raise
+
+class TestNavigator(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        # Create a temporary directory
+        cls.test_dir = tempfile.mkdtemp()
+
+        # Create test Fortran files
+        cls.simple_module = os.path.join(cls.test_dir, "simple_mod.f90")
+        with open(cls.simple_module, "w") as f:
+            f.write("""
+            module simple_mod
+            implicit none
+            integer, parameter :: global_param = 42
+            real, dimension(:), allocatable :: global_array
+            contains
+
+            subroutine test_sub(a, b, n)
+                integer, intent(in) :: a
+                integer, intent(in) :: n
+                real, dimension(n), intent(out) :: b
+                integer :: i
+                real :: local_scalar
+
+                local_scalar = real(a) * 2.0
+
+                if (.not. allocated(global_array)) then
+                    allocate(global_array(5))
+                    global_array = [1.0, 2.0, 3.0, 4.0, 5.0]
+                end if
+
+                do i = 1, n
+                    b(i) = local_scalar + real(i) + global_param + global_array(mod(i-1, 5) + 1)
+                end do
+
+            end subroutine test_sub
+            end module simple_mod
+            """)
+
+        cls.dependent_module = os.path.join(cls.test_dir, "dependent_mod.f90")
+        with open(cls.dependent_module, "w") as f:
+            f.write("""
+            module dependent_mod
+            use simple_mod
+            implicit none
+            integer :: dependent_var
+
+            contains
+
+            subroutine dependent_sub(x, m)
+            integer, intent(in) :: m
+            real, dimension(m),intent(inout) :: x
+            dependent_var = 5
+            call test_sub(dependent_var, x, m)
+            global_array =  [10.0, 20.0, 30.0, 40.0, 50.0]
+            end subroutine dependent_sub
+            end module dependent_mod
+            """)
+
+        # Parse the module trees
+        processor = Processor()
+        cls.simple_tree = processor.parse_fortran_file(cls.simple_module)
+        cls.dependent_tree = processor.parse_fortran_file(cls.dependent_module)
+
+        # Create a parsed_modules dictionary
+        cls.parsed_modules = {
+            "simple_mod": cls.simple_tree,
+            "dependent_mod": cls.dependent_tree
+        }
+
+    @classmethod
+    def tearDownClass(cls):
+        # Remove the temporary directory
+        shutil.rmtree(cls.test_dir)
+
+    def setUp(self):
+        # Create fresh Navigator instances for each test
+        self.simple_navigator = Navigator(self.test_dir, self.simple_tree, self.parsed_modules)
+        self.dependent_navigator = Navigator(self.test_dir, self.dependent_tree, self.parsed_modules)
+
+    def test_initialization(self):
+        # Test that initialization sets up all attributes correctly
+        self.assertEqual(self.simple_navigator.module_dir_sc, self.test_dir)
+        self.assertIsInstance(self.simple_navigator.module_tree_sc.children[1], F23.Module)
+        self.assertEqual(self.simple_navigator.var_declaration, [])
+        self.assertEqual(self.simple_navigator.var_initial, [])
+        self.assertFalse(self.simple_navigator.return_key_sc)
+        self.assertEqual(self.simple_navigator.visited_modules_sc, set())
+        self.assertEqual(self.simple_navigator.child_modules_sc, set())
+        self.assertEqual(self.simple_navigator.module_set_sc, set())
+        self.assertEqual(len(self.simple_navigator.queue_sc), 0)
+        self.assertFalse(self.simple_navigator.full_scout)
+
+    def test_find_variable_in_module(self):
+        # Test finding a variable in the current module
+        self.simple_navigator.variable_name_sc = "global_param"
+        self.simple_navigator.find_variable_in_module()
+        self.assertTrue(self.simple_navigator.return_key_sc)
+        self.assertEqual(len(self.simple_navigator.var_declaration), 1)
+        self.assertIsInstance(self.simple_navigator.var_declaration[0], F23.Type_Declaration_Stmt)
+
+        # Test finding an array
+        self.simple_navigator.variable_name_sc = "global_array"
+        self.simple_navigator.var_declaration = []
+        self.simple_navigator.return_key_sc = False
+        self.simple_navigator.find_variable_in_module()
+        self.assertTrue(self.simple_navigator.return_key_sc)
+        self.assertEqual(len(self.simple_navigator.var_declaration), 2)
+        type_decl_found = any(isinstance(stmt, F23.Type_Declaration_Stmt) for stmt in self.simple_navigator.var_declaration)
+        allocate_found = any(isinstance(stmt, F23.Allocate_Stmt) for stmt in self.simple_navigator.var_declaration)
+        self.assertTrue(allocate_found, "Allocate_Stmt not found in the parse tree")
+        self.assertTrue(type_decl_found, "Type_Declaration_Stmt not found in the parse tree")
+        
+    
+    def test_find_external_subroutine_in_module(self):
+        # Test finding a subroutine in the current module
+        self.simple_navigator.variable_name_sc = "test_sub"
+        self.simple_navigator.find_external_subroutine_in_module()
+        self.assertTrue(self.simple_navigator.return_key_sc)
+        self.assertEqual(len(self.simple_navigator.var_declaration), 1)
+        self.assertIsInstance(self.simple_navigator.var_declaration[0], F23.Use_Stmt)
+    
+    
+    def test_add_modules_to_queue(self):
+        # Test adding modules to the queue from USE statements
+        self.dependent_navigator.add_modules_to_queue()
+
+        # Verify the queue was populated correctly
+        self.assertEqual(len(self.dependent_navigator.queue_sc), 1)
+        self.assertEqual(len(self.dependent_navigator.module_set_sc), 1)
+        self.assertIn("simple_mod", self.dependent_navigator.module_set_sc)
+    
+    def test_variable_finder(self):
+        # Test finding a variable that requires module traversal
+        self.dependent_navigator.variable_finder("global_param")
+
+        # Verify the variable was found through module dependencies
+        self.assertTrue(self.dependent_navigator.return_key_sc)
+        self.assertEqual(len(self.dependent_navigator.var_declaration), 1)
+        self.assertEqual(len(self.dependent_navigator.visited_modules_sc), 2)  # dependent_mod and simple_mod
+
+        # Test finding an array
+        self.dependent_navigator.var_declaration = []
+        self.dependent_navigator.return_key_sc = False
+        self.dependent_navigator.variable_finder("global_array")
+        self.assertTrue(self.dependent_navigator.return_key_sc)
+        self.assertEqual(len(self.dependent_navigator.var_declaration), 2)
+        type_decl_found = any(isinstance(stmt, F23.Type_Declaration_Stmt) for stmt in self.dependent_navigator.var_declaration)
+        allocate_found = any(isinstance(stmt, F23.Allocate_Stmt) for stmt in self.dependent_navigator.var_declaration)
+        self.assertTrue(allocate_found, "Allocate_Stmt not found in the parse tree")
+        self.assertTrue(type_decl_found, "Type_Declaration_Stmt not found in the parse tree")
+
+    def test_external_subroutine_finder(self):
+        # Test finding an external subroutine that requires module traversal
+        self.dependent_navigator.external_subroutine_finder("test_sub")
+
+        # Verify the subroutine was found through module dependencies
+        self.assertTrue(self.dependent_navigator.return_key_sc)
+        self.assertEqual(len(self.dependent_navigator.var_declaration), 1)
+        self.assertEqual(len(self.dependent_navigator.visited_modules_sc), 2)  # dependent_mod and simple_mod
+
+    def test_find_var_in_child_modules(self):
+        # Test the module traversal logic for variables
+        self.dependent_navigator.variable_name_sc = "global_param"
+        self.dependent_navigator.module_set_sc.add("dependent_mod")
+        self.dependent_navigator.child_modules_sc.add("dependent_mod")
+        self.dependent_navigator.visited_modules_sc.add("dependent_mod")
+        self.dependent_navigator.add_modules_to_queue()
+
+        # Verify the variable is found in child modules
+        self.dependent_navigator.find_var_in_child_modules(key='variable')
+        self.assertTrue(self.dependent_navigator.return_key_sc)
+        self.assertEqual(len(self.dependent_navigator.var_declaration), 1)
+
+    def test_error_handling(self):
+        self.simple_navigator.variable_finder("nonexistent_var")
+        self.assertFalse(self.simple_navigator.return_key_sc)
+        self.simple_navigator.external_subroutine_finder("nonexistent_sub")
+        self.assertFalse(self.simple_navigator.return_key_sc)
+
+if __name__ == "__main__":
+    unittest.main()
