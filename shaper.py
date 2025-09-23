@@ -4,6 +4,10 @@ from fparser.two import Fortran2003 as F23
 from collections import deque
 from processor import Processor
 from navigator import Navigator
+import unittest
+import tempfile
+import shutil
+from collections import defaultdict
 
 class Shaper:
     """
@@ -20,6 +24,7 @@ class Shaper:
         self.module_tree_imp = None
         self.parsed_modules = parsed_modules
         self.processor = Processor()
+        self.cases_to_exclude = ['clear', 'finalize', 'init', 'initialize', 'read']
 
     def find_fortran_files_subroutine(self, subroutine_key):
         """
@@ -44,6 +49,29 @@ class Shaper:
                     self.parsed_modules[module_name] = self.module_tree_imp
                 
                 for sub in walk(self.module_tree_imp, F23.Subroutine_Subprogram):
+                    subroutine_name, arg_list = None, None
+                    subroutine_stmt = walk(sub, F23.Subroutine_Stmt)[0]
+                    call_stmt = walk(sub, F23.Call_Stmt)
+                    for child in subroutine_stmt.children:
+                        if child is None:
+                            continue
+                        if isinstance(child, F23.Name):
+                            subroutine_name = child.tostr()
+                        elif isinstance(child, F23.Dummy_Arg_List):
+                            arg_list = child
+                        else:
+                            raise ValueError(f"Unexpected type '{type(child)}' encountered in children.")
+                    assert subroutine_name is not None, f"Unexpected type {subroutine_name} encountered in children."
+                    check = all(case not in subroutine_name for case in self.cases_to_exclude)
+                    if not check:
+                        continue
+                    #self.subroutine_names_all.add(subroutine_name)
+                    #self.subroutines[subroutine_name] = sub
+                    if arg_list is not None :
+                        if subroutine_name not in self.dummy_arg_list:
+                            for child in arg_list.children:
+                                self.dummy_arg_list[subroutine_name].append(child.tostr())
+
                     call_stmt = walk(sub, F23.Call_Stmt)
                     if call_stmt:
                         for item in call_stmt:
@@ -86,6 +114,7 @@ class Shaper:
             for arg, call in zip(self.actual_arg_spec_list[subroutine_key], self.call_subroutines[subroutine_key]):
                 act_arg = arg[self.dummy_arg_list[subroutine_key].index(name)]
                 enclosing_subroutine = self.find_enclosing_subroutine(call)
+
                 subroutine_key = walk(walk(enclosing_subroutine, F23.Subroutine_Stmt), F23.Name)[0].string
                 declaration_part = walk(enclosing_subroutine, F23.Specification_Part)
                 
@@ -93,10 +122,9 @@ class Shaper:
                     'Corresponding element of "%s" is "%s" in call statement in subroutine "%s"!',
                     name, act_arg, subroutine_key)
 
-                
                 if declaration_part:
                     for decl in walk(declaration_part, F23.Type_Declaration_Stmt):
-                        declarations = [name.string for name in walk(decl, F23.Entity_Decl)]
+                        declarations = [name.children[0].string for name in walk(decl, F23.Entity_Decl)]
                         if act_arg in declarations:
                             explicit_shape = walk(decl, F23.Explicit_Shape_Spec)
                             if explicit_shape:
@@ -315,3 +343,219 @@ class Shaper:
         except Exception as e:
             self.processor.logger.error(f"An error occurred in method 'find_enclosing_subroutine': {e}")
             raise
+
+class TestShaper(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        # Create a temporary directory
+        cls.test_dir = tempfile.mkdtemp()
+
+        # Create test Fortran files with 3-level deep module hierarchy
+        cls.level3_module = os.path.join(cls.test_dir, "level3_mod.f90")
+        with open(cls.level3_module, "w") as f:
+            f.write("""
+            module level3_mod
+            use level2_mod
+            implicit none
+
+            contains
+
+            subroutine level3_sub(arr)
+            real, dimension(40,30), intent(inout) :: arr
+            call level2_sub(arr)
+            end subroutine level3_sub
+
+            end module level3_mod
+            """)
+
+        cls.level2_module = os.path.join(cls.test_dir, "level2_mod.f90")
+        with open(cls.level2_module, "w") as f:
+            f.write("""
+            module level2_mod
+            use level1_mod
+            implicit none
+            real, dimension(30, 40) :: explicit_array_2d
+
+            contains
+
+            subroutine level2_sub(data_in)
+            real, intent(inout) :: data_in(:,:)
+            call level1_sub(data_in)
+            end subroutine level2_sub
+
+            end module level2_mod
+            """)
+
+        cls.level1_module = os.path.join(cls.test_dir, "level1_mod.f90")
+        with open(cls.level1_module, "w") as f:
+            f.write("""
+            module level1_mod
+            implicit none
+            real, dimension(10, 20) :: explicit_array_1d
+
+            contains
+
+            subroutine level1_sub(input_array)
+            real, intent(inout) :: input_array(:,:)
+            call main_caller(input_array)
+            end subroutine level1_sub
+
+            subroutine main_caller(inout_array)
+            real, intent(inout) :: inout_array(:,:)
+            inout_array = inout_array + 2. 
+            end subroutine main_caller
+
+            end module level1_mod
+            """)
+
+        # Parse the module trees
+        processor = Processor()
+        cls.level1_tree = processor.parse_fortran_file(cls.level1_module)
+
+        # Create a parsed_modules dictionary
+        cls.parsed_modules = {
+            "level1_mod": cls.level1_tree
+        }
+
+    @classmethod
+    def tearDownClass(cls):
+        # Remove the temporary directory
+        shutil.rmtree(cls.test_dir)
+
+    def setUp(self):
+        # Create dummy_arg_list, actual_arg_spec_list, and call_subroutines
+        self.dummy_arg_list = defaultdict(list)
+        self.actual_arg_spec_list = defaultdict(list)
+        self.call_subroutines = defaultdict(list)
+
+        # Parse call statements to populate the data structures
+        processor = Processor()
+
+        # Level 1 calls
+        call_stmt = walk(self.level1_tree, F23.Call_Stmt)[0]
+        self.call_subroutines["main_caller"].append(call_stmt)
+        self.actual_arg_spec_list["main_caller"].append(["input_array"])
+        self.dummy_arg_list["main_caller"] = ["inout_array"]
+        self.dummy_arg_list["level1_sub"] = ["input_array"]
+
+        # Create Shaper instances for each level
+        self.shaper_level1 = Shaper(
+            self.test_dir,
+            self.parsed_modules,
+            self.dummy_arg_list,
+            self.actual_arg_spec_list,
+            self.call_subroutines
+        )
+
+    def test_3_level_deep_shape_resolution(self):
+
+        # Level 3: Start with implicit array in level3_sub
+        implicit_decl_level3 = "real, intent(inout) :: inout_array(:,:)"
+        parsed_implicit_level3 = F23.Type_Declaration_Stmt(implicit_decl_level3)
+
+        # Shape resolution should go through the call chain:
+        shaped_level3 = self.shaper_level1.shaper_subroutine(parsed_implicit_level3, "main_caller")
+        self.assertIsNotNone(shaped_level3)
+        self.assertIsInstance(shaped_level3, F23.Type_Declaration_Stmt)
+        shaped_str = walk(shaped_level3, F23.Explicit_Shape_Spec_List)[0].tostr()
+        self.assertIn('40, 30', shaped_str)
+    
+    def test_find_fortran_files_subroutine(self):
+
+        # Test finding level3_sub from level2_mod perspective
+        self.shaper_level1.current_module_imp = "level1_mod"
+        self.shaper_level1.find_fortran_files_subroutine("level1_sub")
+
+        # Verify the subroutine was found and call info was populated
+        self.assertIn("level1_sub", self.shaper_level1.actual_arg_spec_list)
+        self.assertIn("level1_sub", self.shaper_level1.call_subroutines)
+        #self.assertEqual(len(self.shaper_level2.call_subroutines["level3_sub"]), 1)
+
+    
+    def test_find_enclosing_subroutine(self):
+
+        # Parse a subroutine with a call statement
+        sub_code = """
+        subroutine test_enclosing()
+        integer :: x
+        call some_sub(x)
+        end subroutine test_enclosing
+        """
+        sub_tree = Processor().parse_fortran_string(sub_code)
+
+        # Get the call statement node
+        call_node = walk(sub_tree, F23.Call_Stmt)[0]
+
+        # Find the enclosing subroutine
+        enclosing = self.shaper_level1.find_enclosing_subroutine(call_node)
+
+        self.assertIsNotNone(enclosing)
+        self.assertIsInstance(enclosing, F23.Subroutine_Subprogram)
+        self.assertEqual(walk(enclosing, F23.Name)[0].string, "test_enclosing")
+    
+    def test_complex_shape_scenarios(self):
+        """Test more complex shape resolution scenarios"""
+
+        # Create a module with mixed explicit and implicit shapes
+        mixed_module = os.path.join(self.test_dir, "mixed_mod.f90")
+        with open(mixed_module, "w") as f:
+            f.write("""
+            module mixed_mod
+            implicit none
+            real, dimension(15, 25, 35) :: multi_dim_array
+
+            contains
+
+            subroutine complex_sub(data)
+            real, intent(inout) :: data(:,:,:)  ! 3D implicit shape
+            data = data * 2.0
+            end subroutine complex_sub
+
+            subroutine intermediate_sub(arr)
+            real, intent(inout) :: arr(:,:,:)   ! Also implicit
+            call complex_sub(arr)
+            end subroutine intermediate_sub
+
+            subroutine starter()
+            real :: my_array(15, 25, 35)
+            call intermediate_sub(my_array)
+            end subroutine starter
+
+            end module mixed_mod
+            """)
+
+        # Parse and test
+        processor = Processor()
+        mixed_tree = processor.parse_fortran_file(mixed_module)
+        self.parsed_modules["mixed_mod"] = mixed_tree
+
+        # Update call information
+        call_stmt = walk(mixed_tree, F23.Call_Stmt)[1]
+        self.call_subroutines["intermediate_sub"].append(call_stmt)
+        self.actual_arg_spec_list["intermediate_sub"].append(["my_array"])
+        self.dummy_arg_list["intermediate_sub"] = ["arr"]
+
+        call_stmt2 =  walk(mixed_tree, F23.Call_Stmt)[0]
+        self.call_subroutines["complex_sub"].append(call_stmt2)
+        self.actual_arg_spec_list["complex_sub"].append(["arr"])
+        self.dummy_arg_list["complex_sub"] = ["data"]
+
+        # Test 3D shape resolution
+        implicit_decl_3d = "real, intent(inout) :: data(:,:,:)"
+        parsed_implicit_3d =  F23.Type_Declaration_Stmt(implicit_decl_3d)
+
+        mixed_shaper = Shaper(
+            self.test_dir,
+            self.parsed_modules,
+            self.dummy_arg_list,
+            self.actual_arg_spec_list,
+            self.call_subroutines
+        )
+
+        shaped_3d = mixed_shaper.shaper_subroutine(parsed_implicit_3d, "complex_sub")
+        self.assertIsNotNone(shaped_3d)
+        shaped_str_3d = walk(shaped_3d, F23.Explicit_Shape_Spec_List)[0].tostr()
+        self.assertIn('15, 25, 35', shaped_str_3d)
+    
+if __name__ == "__main__":
+    unittest.main()

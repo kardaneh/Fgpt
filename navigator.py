@@ -9,25 +9,100 @@ import shutil
 
 class Navigator:
     """
-    Navigator class used to analyze Fortran code to find specific variables or subroutines within modules.
-    It performs a breadth-first search to traverse module dependencies and checks for variable or subroutine declarations.
-
-    Attributes:
-        module_dir_sc (str): Directory containing the Fortran subroutine files.
-        module_tree_sc (F23 object): Parsed Fortran module tree.
-        variable_name_sc (str): Name of the variable or subroutine to find.
-        var_declaration (list): List of variable declaration statements found.
-        var_initial (list): List of variable initialization names found.
-        return_key_sc (bool): Flag to indicate if the target was found.
-        visited_modules_sc (set): Set of visited modules to avoid redundant checks.
-        child_modules_sc (set): Set of child modules encountered during the search.
-        module_set_sc (set): Set of all encountered modules.
-        queue_sc (deque): Queue to manage module traversal.
-        main_fortran_file (str): The main Fortran driver file name.
-        main_dir (str): Directory of the main Fortran driver file.
-        full_scout (bool): Flag indicating if the search has been extended to the main program.
+    A navigator for analyzing Fortran code to locate variables and subroutines within modules.
+    
+    This class performs a breadth-first search to traverse module dependencies and
+    checks for variable declarations or subroutine definitions. It can handle complex
+    module hierarchies and external subroutine interfaces.
+    
+    Parameters
+    ----------
+    subroutine_dir : str
+        Directory containing the Fortran subroutine files
+    module_tree : fparser.two.Fortran2003.Module
+        Parsed Fortran module tree from fparser
+    parsed_modules : dict
+        Dictionary of pre-parsed modules for efficient lookup
+    
+    Attributes
+    ----------
+    module_dir_sc : str
+        Directory containing the Fortran subroutine files
+    module_tree_sc : fparser.two.Fortran2003.Module
+        Parsed Fortran module tree
+    variable_name_sc : str
+        Name of the variable or subroutine to find
+    var_declaration : list
+        List of variable declaration statements found
+    var_initial : list
+        List of variable initialization names found
+    return_key_sc : bool
+        Flag indicating if the target was found
+    visited_modules_sc : set
+        Set of visited modules to avoid redundant checks
+    child_modules_sc : set
+        Set of child modules encountered during search
+    module_set_sc : set
+        Set of all encountered modules
+    queue_sc : deque
+        Queue to manage module traversal
+    main_fortran_file : str
+        The main Fortran driver file name (default: "orchideedriver.f90")
+    main_dir : str
+        Directory of the main Fortran driver file (default: 'src_driver')
+    full_scout : bool
+        Flag indicating if search has been extended to main program
+    parsed_modules : dict
+        Dictionary of pre-parsed modules
+    processor : Processor
+        Processor instance for parsing and utility functions
+    
+    Methods
+    -------
+    find_variable_in_module()
+        Search for variable in current module and update attributes.
+    find_external_subroutine_in_module()
+        Search for external subroutine in current module.
+    external_subroutine_finder(variable_name)
+        Initialize search for external subroutine.
+    variable_finder(variable_name)
+        Initialize search for variable.
+    add_modules_to_queue()
+        Add modules from USE statements to traversal queue.
+    find_var_in_child_modules(key='variable')
+        Traverse child modules to find variable or subroutine.
+    
+    Notes
+    -----
+    The class uses breadth-first search to ensure the shortest path to the target
+    is found first. It handles both variable declarations and subroutine definitions,
+    including those in interface blocks.
+    
+    Raises
+    ------
+    RuntimeError
+        If errors occur during module parsing or traversal
+    AssertionError
+        If entity declaration separation fails validation
+    
+    See Also
+    --------
+    Processor : Supporting class for Fortran parsing utilities
     """
+
     def __init__(self, subroutine_dir, module_tree, parsed_modules):
+        """
+        Initialize the Navigator with directory, module tree, and parsed modules.
+        
+        Parameters
+        ----------
+        subroutine_dir : str
+            Directory containing Fortran subroutine files
+        module_tree : fparser.two.Fortran2003.Module
+            Parsed Fortran module tree
+        parsed_modules : dict
+            Dictionary of pre-parsed modules for efficient lookup
+        """
         self.module_dir_sc = subroutine_dir
         self.module_tree_sc = module_tree
         self.variable_name_sc = ''
@@ -43,10 +118,30 @@ class Navigator:
         self.full_scout = False
         self.parsed_modules = parsed_modules
         self.processor = Processor()
+
     def find_variable_in_module(self):
         """
-        Search for the variable in the current module and update the relevant attributes.
-        If the variable is found, it checks the type and allocates status, then stores the information.
+        Search for the variable in the current module and update attributes.
+        
+        This method searches for the target variable in the current module tree.
+        If found, it extracts declaration information and checks allocation status.
+        The method handles both simple declarations and multi-variable declarations.
+        
+        Returns
+        -------
+        None
+        
+        Raises
+        ------
+        RuntimeError
+            If errors occur during the search process
+        
+        Notes
+        -----
+        - For multi-variable declarations, the method separates individual entities
+        - Checks for allocatable attributes and allocation statements
+        - Logs findings using the processor's logger
+        - Updates return_key_sc to True if variable is found with valid allocation
         """
         try:
             module_name = walk(self.module_tree_sc, F23.Name)[0].string
@@ -113,7 +208,25 @@ class Navigator:
     def find_external_subroutine_in_module(self):
         """
         Search for an external subroutine within the current module.
-        If the subroutine is found, it adds a use statement to the variable declarations.
+        
+        Searches for subroutine definitions in both interface blocks and
+        regular subroutine subprograms. If found, creates a USE statement
+        for the subroutine.
+        
+        Returns
+        -------
+        None
+        
+        Raises
+        ------
+        Exception
+            If errors occur during interface or subroutine parsing
+        
+        Notes
+        -----
+        - Searches both interface blocks and subroutine subprograms
+        - Creates a USE statement for found subroutines
+        - Sets return_key_sc to True if subroutine is found
         """
         try:
             interfaces = walk(self.module_tree_sc, F23.Interface_Block)
@@ -144,11 +257,27 @@ class Navigator:
 
     def external_subroutine_finder(self, variable_name):
         """
-        Initialize the search for an external subroutine by setting the target variable name,
-        adding the module to the visited set, and starting the search process.
-
-        Args:
-            variable_name (str): The name of the external subroutine to search for.
+        Initialize the search for an external subroutine.
+        
+        Parameters
+        ----------
+        variable_name : str
+            The name of the external subroutine to search for
+        
+        Returns
+        -------
+        None
+        
+        Raises
+        ------
+        Exception
+            If errors occur during the search initialization
+        
+        Notes
+        -----
+        - Sets up initial module tracking and queue
+        - Initiates module traversal with subroutine key
+        - Logs the containing directory upon completion
         """
         try:
             self.variable_name_sc = variable_name
@@ -165,10 +294,28 @@ class Navigator:
 
     def variable_finder(self, variable_name):
         """
-        Initialize the search for a variable by setting the target variable name and starting the search process.
-
-        Args:
-            variable_name (str): The name of the variable to search for.
+        Initialize the search for a variable.
+        
+        Parameters
+        ----------
+        variable_name : str
+            The name of the variable to search for
+        
+        Returns
+        -------
+        None
+        
+        Raises
+        ------
+        Exception
+            If errors occur during the search initialization
+        
+        Notes
+        -----
+        - First searches current module, then traverses dependencies
+        - Uses breadth-first search for module dependencies
+        - Extends search to main program if needed
+        - Logs the containing directory upon completion
         """
         try:
             self.variable_name_sc = variable_name
@@ -189,7 +336,26 @@ class Navigator:
 
     def add_modules_to_queue(self):
         """
-        Add the modules referenced by USE statements in the current module to the queue for further analysis.
+        Add modules referenced by USE statements to the traversal queue.
+        
+        Extracts module names from USE statements in the current module
+        and adds them to the queue for further analysis if they haven't
+        been processed yet.
+        
+        Returns
+        -------
+        None
+        
+        Raises
+        ------
+        Exception
+            If module name extraction fails or other errors occur
+        
+        Notes
+        -----
+        - Only adds modules not already in module_set_sc
+        - Logs each module added to the queue
+        - Skips modules that cannot be parsed or found
         """
         try:
             for module in walk(self.module_tree_sc, F23.Use_Stmt):
@@ -211,10 +377,28 @@ class Navigator:
     
     def find_var_in_child_modules(self, key='variable'):
         """
-        Traverse child modules in the queue to find a variable or subroutine. Updates the module directory and tree as needed.
+        Traverse child modules in the queue to find a variable or subroutine.
         
-        Args:
-            key (str): Specifies whether to search for a 'variable' or 'subroutine'.
+        Parameters
+        ----------
+        key : str, optional
+            Specifies search type: 'variable' or 'subroutine' (default: 'variable')
+        
+        Returns
+        -------
+        None
+        
+        Raises
+        ------
+        Exception
+            If module traversal or parsing fails
+        
+        Notes
+        -----
+        - Processes modules in FIFO order (breadth-first)
+        - Handles module file discovery in multiple directories
+        - Extends search to main program if queue is exhausted
+        - Updates module directory and tree during traversal
         """
         try:
             while self.queue_sc:

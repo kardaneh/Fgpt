@@ -424,7 +424,7 @@ class Isolator:
         cls.extract_loop_indices()
         
         
-        for subroutine in ["hydrol_vegupd"]:#cls.subroutine_keys_ncl:
+        for subroutine in ["hydrol_vegupd", "hydrol_soil"]:#cls.subroutine_keys_ncl:
             self.parent_subroutine_call = set()
             self.isolate_parent_subroutine(cls, subroutine)
         
@@ -456,7 +456,7 @@ if __name__ == "__main__":
     rest_of_path = "modipsl_truck_opt/modeles/ORCHIDEE/src_sechiba/"
     target_module = "hydrol" #"explicitsnow"
     work = os.getenv("works")
-    openacc = False
+    openacc = True
     isolator = Isolator(rest_of_path, target_module, work, openacc)
     isolator.run()
 
