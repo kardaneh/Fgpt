@@ -87,36 +87,40 @@ class Isolator:
             shutil.rmtree(self.target_module_dir)
         os.makedirs(self.target_module_dir)
 
-    def isolate_child_function(self, cls, function_values, parent_subroutine_key):
+    def isolate_child_function(self, cls, function_tree, function_key, parent_subroutine_key):
         """
-        """
-        assert isinstance(function_values[0], F23.Function_Subprogram), \
-                f"Expected type 'F23.Function_Subprogram', but got '{type(function_values[0]).__name__}' instead."
-        assert isinstance(function_values[1], F23.Program), \
-                f"Expected type 'F23.Program', but got '{type(function_values[1]).__name__}' instead."
-        assert isinstance(function_values[2], str), \
-                f"Expected type 'str', but got '{type(function_values[2]).__name__}' instead."
+        Isolate and process a child function found within a parent subroutine.
+        
+        This method extracts a function from within a subroutine, processes its declarations,
+        variables, and dependencies, then generates standalone code for the function that
+        can be compiled and executed independently for testing or benchmarking purposes.
+        
+        Parameters
+        ----------
+        cls : object
+            Class instance containing function metadata and processing methods
+        function_values : tuple
+            Tuple containing (function_name, function_subprogram)
+        parent_subroutine_key : str
+            Name of the parent subroutine containing this function
+            
+        Raises
+        ------
+        AssertionError
+            If function_values does not contain expected types or compilation fails
+        NotImplementedError
+            If nested functions are found (not supported)
+        """ 
 
-        function_tree = function_values[0]
-        module_tree = function_values[1]
-        module_dir = function_values[2]
-        function_stmt = walk(function_tree, F23.Function_Stmt)[0]
-        for child in function_stmt.children:
-            if child is None:
-                continue
-            if isinstance(child, F23.Name):
-                function_key = child.tostr()
-                cls.subroutines[function_key] = function_tree
-            elif isinstance(child, F23.Dummy_Arg_List):
-                arg_list = child
-            elif isinstance(child, F23.Suffix):
-                cls.func_result[function_key] = child.children[0].tostr()
-        assert function_key is not None, f"Unexpected type {function_key} encountered in children."
-        if arg_list is not None:
-            for child in arg_list.children:
-                cls.dummy_arg_list[function_key].append(child.tostr())
+        cls.extract_function_dummy_args(function_tree)
+        cls.extract_intent(function_key, function_tree)
+        cls.clean_subroutine(function_key, function_tree)
+        cls.find_function_actual_args(function_key)
+        cls.call_within_sub[parent_subroutine_key].add(function_key)
+
         cls.find_variables(function_tree, function_key, parent_subroutine_key)
         cls.extract_names(function_key)
+
         if cls.var_global[function_key]:
             cls.find_global_variables(self.module_dir_sp, self.module_tree_sp, cls.var_global[function_key], function_key)
         if cls.var_dummy[function_key]:
@@ -124,6 +128,7 @@ class Isolator:
         if cls.dec_global[function_key]:
             for key in cls.dec_global[function_key].keys():
                 cls.process_declaration_variables(cls.dec_global[function_key][key], function_key)
+        
         shape_to_search = cls.shapes_variables[function_key] - cls.scalar_variables[function_key] - cls.var_global[function_key]
         if shape_to_search:
             cls.find_global_variables(self.module_dir_sp, self.module_tree_sp, shape_to_search, function_key)
@@ -134,11 +139,56 @@ class Isolator:
         for key, values in cls.dec_global[function_key].items():
             if walk(values, F23.Function_Subprogram):
                 self.processor.logger.error(f"Calling Function_Subprogram {key} in Function_Subprogram {function_key}. Not yet implemented")
-                raise 
+                raise NotImplementedError("Nested functions are not supported")
 
+        cls.extract_loop_vect(function_key, function_tree)
 
+        assert os.path.exists(self.processor.benchmark_dir), "benchmark directory does not exist!"
+        sub_dir = os.path.join(self.processor.benchmark_dir, function_key)
+        os.makedirs(sub_dir, exist_ok=True)
 
-        raise ValueError(f"Variable {function_key}")
+        function_dir = os.path.join(self.target_module_dir, function_key)
+        os.makedirs(function_dir)
+        self.processor.logger.info(f"Created function directory: {function_dir}")
+        
+        self.processor.add_declarations(
+                cls.dec_global[function_key], 
+                cls.var_modif_info[function_key],
+                openacc=self.openacc
+                )
+
+        global_file_path = os.path.join(function_dir, self.module_global_file)
+        self.processor.update_global_module(
+                    cls.dec_global[function_key], 
+                    global_file_path, function_key, 
+                    self.module_tree_cp
+                    )
+
+        main_file_path = os.path.join(function_dir, self.main_program_file)
+        arg_list = ', '.join([name for name in cls.dummy_arg_list[function_key]])
+        call_stmt_org =  F23.Assignment_Stmt(f"{cls.func_result[function_key]} = {function_key}({arg_list})")
+
+        self.processor.update_main_program(
+                custom_dec_inout=cls.var_dummy[function_key],
+                custom_subroutine_trees=[function_tree],
+                call_stmts=[call_stmt_org],
+                var_modif=cls.var_modif_info[function_key],
+                file_path=main_file_path,
+                subroutine_name=function_key,
+                dummy_args=cls.dummy_arg_list[function_key],
+                module_tree=self.module_tree_cp,
+                childs_subroutine_tree=None,
+                openacc=self.openacc,
+                dummy_add_decl=None,
+                error_flag=None,
+                acc_data_copyin=None
+                )
+
+        error_status = self.processor.compile_and_run(os.getcwd(), self.target_module_dir)
+        assert error_status == 0, "Error: Compilation failed or main_program not generated."
+        self.processor.logger.info(f"Successfully isolated and compiled function '{function_key}'")
+        self.processor.write_fortran_code_to_file(self.module_tree_cp, self.path_to_target)
+        return function_tree
 
     def isolate_child_subroutine(self, cls, subroutine_key, local_var_parent=None):
         '''assert os.path.exists(self.processor.benchmark_dir), "benchmark directory does not exist!"
@@ -147,6 +197,7 @@ class Isolator:
         logging.info(f"{subroutine_key} directory created inside benchmark: {sub_dir}")
         '''
         dummy_as_local = set()
+        function_tree = None
         if self.openacc:
             if local_var_parent is not None:
                 for actual_arg_list in cls.actual_arg_spec_list[subroutine_key]:
@@ -186,8 +237,22 @@ class Isolator:
              if walk(values, F23.Function_Subprogram):
                  self.processor.logger.info(f"Calling Function_Subprogram {key} in Subroutine_Subprogram {subroutine_key}.")
                  self.processor.logger.info(f"Trying to isolate a child function .... {key}")
-
-                 self.isolate_child_function(cls, values, subroutine_key)
+                 assert isinstance(values[1], F23.Function_Subprogram), f"Expected type 'F23.Function_Subprogram', but got '{type(values[0]).__name__}' instead."
+                 assert isinstance(values[0], F23.Name), f"Expected type 'F23.Name', but got '{type(values[0]).__name__}' instead."
+                 function_tree_org = values[1]
+                 function_key = values[0].tostr()
+                 if function_key in cls.subroutines:
+                     self.processor.logger.info(f"Function '{function_key}' already successfully isolated, skipping...")
+                     function_tree = cls.subroutines[function_key]
+                     cls.call_within_sub[subroutine_key].add(function_key)
+                 else:
+                     function_tree = self.isolate_child_function(cls, function_tree_org, function_key, subroutine_key)
+        
+        function_keys = cls.call_within_sub[subroutine_key]
+        if function_keys:
+            self.processor.logger.info(f"Processing {len(function_keys)} function calls within subroutine {subroutine_key}")
+            for function_key in cls.call_within_sub[subroutine_key]:
+                self.collect_global_vars_decl(cls.dec_global[function_key], cls.dec_global[subroutine_key])
 
 
         if dummy_as_local:
@@ -247,12 +312,16 @@ class Isolator:
             file_path = os.path.join(subroutine_dir, self.module_global_file)
             self.processor.update_global_module(
                     cls.dec_global[subroutine_key], 
-                    file_path, subroutine_key, 
+                    file_path,
+                    subroutine_key,
                     self.module_tree_cp
                     )
             file_path = os.path.join(subroutine_dir, self.main_program_file)
 
             sub_trees = [subroutine_tree]
+            if function_tree is not None:
+                sub_trees.append(function_tree)
+
             arg_list = ', '.join([name for name in cls.dummy_arg_list[subroutine_key]])
             call_stmt_org =  F23.Call_Stmt(f"CALL {subroutine_key}({arg_list})")
             call_stmts = [call_stmt_org]
@@ -292,26 +361,31 @@ class Isolator:
         subroutine_tree = cls.subroutines[subroutine_key]
         cls.find_variables(subroutine_tree, subroutine_key)
         cls.extract_names(subroutine_key)
-
         queue = deque(cls.call_within_sub[subroutine_key])
 
         while queue:
+
             child_subroutine_key = queue.popleft()
             child_subroutine_tree = cls.subroutines[child_subroutine_key]
             self.child_subroutine_call[subroutine_key].append(child_subroutine_tree)
-            #if subroutines_parent is not None:
-            #    for subroutine_key_parent in subroutines_parent:
-            #        self.child_subroutine_call[subroutine_key_parent].append(subroutine_tree)
+
+            if subroutines_parent is not None:
+                for subroutine_key_parent in subroutines_parent:
+                    self.child_subroutine_call[subroutine_key_parent].append(child_subroutine_tree)
+
             if child_subroutine_key not in cls.call_within_sub:
                 mod_child_subroutine_tree, error_flag = self.isolate_child_subroutine(cls, child_subroutine_key, cls.var_local_names[subroutine_key])
+                
                 if mod_child_subroutine_tree is not None:
                     self.child_subroutine_call[subroutine_key].append(mod_child_subroutine_tree)
+                
                 if error_flag is not None:
                     self.child_error_flag[subroutine_key][child_subroutine_key] = error_flag
+                
                 self.collect_global_vars_decl(cls.dec_global[child_subroutine_key], cls.dec_global[subroutine_key])
-            #else:
-            #    self.parent_subroutine_call.add(subroutine_key)
-            #    self.isolate_parent_subroutine(cls, child_subroutine_key, self.parent_subroutine_call)
+            else:
+                self.parent_subroutine_call.add(subroutine_key)
+                self.isolate_parent_subroutine(cls, child_subroutine_key, self.parent_subroutine_call)
 
 
         self.processor.logger.info(f"Now, trying to isolate a parent subroutine .... {subroutine_key}")
@@ -325,6 +399,7 @@ class Isolator:
         #assert working_tree == subroutine_tree, 'Error: Parsed code differs from original subroutine tree.'
         cls.find_variables(subroutine_tree, subroutine_key)
         cls.extract_names(subroutine_key)
+
         cls.var_global[subroutine_key] = cls.var_global[subroutine_key] - cls.call_within_sub[subroutine_key] - set(cls.dec_global[subroutine_key].keys())
         cls.find_global_variables(self.module_dir_sp, self.module_tree_sp, cls.var_global[subroutine_key], subroutine_key)
 
@@ -337,6 +412,10 @@ class Isolator:
         if shape_to_search:
             cls.find_global_variables(self.module_dir_sp, self.module_tree_sp, shape_to_search, subroutine_key)
             cls.var_global[subroutine_key].update(shape_to_search)
+
+        if subroutines_parent is not None:
+            for subroutine_key_parent in subroutines_parent:
+                self.collect_global_vars_decl(cls.dec_global[subroutine_key], cls.dec_global[subroutine_key_parent])
 
         cls.extract_array_info(cls.dec_global[subroutine_key], cls.var_dummy[subroutine_key], subroutine_key)
         cls.extract_loop_vect(subroutine_key, subroutine_tree)
@@ -380,7 +459,12 @@ class Isolator:
                 )
         
         file_path = os.path.join(subroutine_dir, self.module_global_file)
-        self.processor.update_global_module(cls.dec_global[subroutine_key], file_path, subroutine_key, self.module_tree_cp)
+        self.processor.update_global_module(
+                cls.dec_global[subroutine_key], 
+                file_path, 
+                subroutine_key, 
+                self.module_tree_cp
+                )
         file_path = os.path.join(subroutine_dir, self.main_program_file)
 
         sub_trees = [subroutine_tree]
@@ -412,7 +496,7 @@ class Isolator:
         error_status = self.processor.compile_and_run(os.getcwd(), self.target_module_dir)
         assert error_status == 0, "Error: Compilation failed or main_program not generated."
         self.processor.write_fortran_code_to_file(self.module_tree_cp, self.path_to_target) 
-
+        
     def collect_global_vars_decl(self, in_dict, out_dict):
         for child_key, child_value in in_dict.items():
                 if child_key not in out_dict:
@@ -422,41 +506,40 @@ class Isolator:
         cls = Extractor(self.module_dir_sp, self.module_tree_sp)
         cls.find_subroutines()
         cls.extract_loop_indices()
-        
-        
-        for subroutine in ["hydrol_vegupd", "hydrol_soil"]:#cls.subroutine_keys_ncl:
-            self.parent_subroutine_call = set()
-            self.isolate_parent_subroutine(cls, subroutine)
+
+        #for subroutine in ['hydrol_hydraulic_arch_tuzet_calc',"hydrol_vegupd", 'hydrol_soil']:#cls.subroutine_keys_ncl:
+        #    self.parent_subroutine_call = set()
+        #    self.isolate_parent_subroutine(cls, subroutine)
         
 
-        '''
-        subs = {'explicitsnow_age','explicitsnow_compactn','explicitsnow_compactn_up', 'explicitsnow_drift',
-                'explicitsnow_fall','explicitsnow_gone','explicitsnow_icelevels','explicitsnow_icemelt','explicitsnow_iceprofile',
-                'explicitsnow_levels','explicitsnow_maxmass','explicitsnow_melt_refrz','explicitsnow_profile','explicitsnow_subli',
-                'explicitsnow_transf'}
-        '''
+        
+        #subs = {'explicitsnow_age','explicitsnow_compactn','explicitsnow_compactn_up', 'explicitsnow_drift',
+        #        'explicitsnow_fall','explicitsnow_gone','explicitsnow_icelevels','explicitsnow_icemelt','explicitsnow_iceprofile',
+        #        'explicitsnow_levels','explicitsnow_maxmass','explicitsnow_melt_refrz','explicitsnow_profile','explicitsnow_subli',
+        #        'explicitsnow_transf'}
+        
+        #
+        #subs = ['explicitsnow_transf','explicitsnow_subli','explicitsnow_profile','explicitsnow_maxmass','explicitsnow_levels',
+        #        'explicitsnow_iceprofile', 'explicitsnow_icemelt','explicitsnow_icelevels','explicitsnow_age', 'explicitsnow_compactn',
+        #        'explicitsnow_drift', 'explicitsnow_gone']
 
-        '''
-        subs = ['explicitsnow_transf','explicitsnow_subli','explicitsnow_profile','explicitsnow_maxmass','explicitsnow_levels',
-                'explicitsnow_iceprofile', 'explicitsnow_icemelt','explicitsnow_icelevels','explicitsnow_age', 'explicitsnow_compactn',
-                'explicitsnow_drift', 'explicitsnow_gone']
-        subs = ['explicitsnow_grain']
-        '''
-
-        subs = ['hydrol_diag_soil','hydrol_diag_soil_flux','hydrol_nudge_mc','hydrol_root_profile','hydrol_soil_coef','hydrol_soil_froz',
-                'hydrol_soil_infilt','hydrol_soil_setup','hydrol_soil_smooth_over_mcs2','hydrol_soil_smooth_under_mcr','hydrol_soil_tridiag','hydrol_split_soil']
-        '''for subroutine in subs:
+        subs = cls.call_within_sub["explicitsnow_main"]
+        
+        #subs = ['hydrol_diag_soil','hydrol_diag_soil_flux','hydrol_nudge_mc','hydrol_root_profile','hydrol_soil_coef','hydrol_soil_froz',
+        #        'hydrol_soil_infilt','hydrol_soil_setup','hydrol_soil_smooth_over_mcs2','hydrol_soil_smooth_under_mcr','hydrol_soil_tridiag','hydrol_split_soil']
+        for subroutine in subs:
             self.isolate_child_subroutine(cls, subroutine)
-        '''
+        
     def run(self):
         self.create_target_directory()
         self.process_subroutines()
 
 if __name__ == "__main__":
     rest_of_path = "modipsl_truck_opt/modeles/ORCHIDEE/src_sechiba/"
-    target_module = "hydrol" #"explicitsnow"
+    target_modules = ["hydrol", "explicitsnow"]
+    target_module =  target_modules[1]
     work = os.getenv("works")
-    openacc = True
+    openacc = False
     isolator = Isolator(rest_of_path, target_module, work, openacc)
     isolator.run()
 

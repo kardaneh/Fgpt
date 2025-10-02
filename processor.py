@@ -465,7 +465,9 @@ class Processor:
                 raise ValueError("variable type is not present!")
             
             if walk(implicit_dec, F23.Entity_Decl):
+                #array_names = [child.children[0].tostr() for child in walk(implicit_dec, F23.Entity_Decl)]
                 array_name = walk(implicit_dec, F23.Entity_Decl)[0].children[0].tostr()
+                #array_name = ', '.join([name for name in  array_names])
             else:
                 raise ValueError("variable name is not present!")
             
@@ -863,6 +865,7 @@ class Processor:
             Logs success or failure of the module update process.
         """
         try:
+            subroutine_found = False
             self.out_module = self.out_module_fortran(subroutine_name)
             write_stmt_code = "\n".join(self.write_stmt)
             for call in walk(module_tree, F23.Call_Stmt):
@@ -877,7 +880,21 @@ class Processor:
                             "close(1363)"
                             )
                     call.parent.children[call.parent.children.index(call)] = self.parse_fortran_statement(code_template)
+                    subroutine_found = True
                     break
+            if not subroutine_found:
+                for assignment_stmt in walk(module_tree, F23.Assignment_Stmt):
+                    for part_ref in walk(assignment_stmt, F23.Part_Ref):
+                        if isinstance(part_ref.children[0], F23.Name) and part_ref.children[0].tostr() == subroutine_name:
+                            code_template = (
+                                    f"{assignment_stmt.tostr()}\n"
+                                    f"open(unit=1363, file='{self.benchmark_dir}/{subroutine_name}/global.bin', form='unformatted', status='replace')\n"
+                                    f"{write_stmt_code}\n"
+                                    "close(1363)"
+                                    )
+                            assignment_stmt.parent.children[assignment_stmt.parent.children.index(assignment_stmt)] = self.parse_fortran_statement(code_template)
+                            subroutine_found = True
+                            break
 
             for node in self.out_module.content:
                 if isinstance(node, F23.Module):
@@ -1008,7 +1025,11 @@ class Processor:
                     for key in error_flag.keys():
                         custom_dec_inout.append(error_flag[key]['error_flag_decl'])
             specification_part = self.remove_intent_and_save(custom_dec_inout)
+            print("specification_part")
+            for rstmt in initialization_part:
+                print(rstmt)
 
+            subroutine_found = False
             if initialization_part:
                 self.write_stmt = []
                 for call in walk(module_tree, F23.Call_Stmt):
@@ -1016,7 +1037,7 @@ class Processor:
                     assert isinstance(call.children[1], F23.Actual_Arg_Spec_List), \
                             f"Expected F23.Actual_Arg_Spec_List, but got {type(call.children[1])}"
                     if call.children[0].tostr() == subroutine_name:
-                        arg_string = [string.strip() for string in call.children[1].tostr().split(',')]
+                        arg_string = [string.strip() for string in call.children[1].tostr().split(',')] ## bug to fix for passying slices
                         for rstmt in initialization_part:
                             assert isinstance(rstmt.children[0].children[2], F23.Input_Item_List)
                             assert len(rstmt.children[0].children[2].children) == 1
@@ -1031,7 +1052,31 @@ class Processor:
                                 "close(1363)"
                                 )
                         call.parent.children[call.parent.children.index(call)] = self.parse_fortran_statement(code_template)
+                        subroutine_found = True
                         break
+                if not subroutine_found:
+                    for assignment_stmt in walk(module_tree, F23.Assignment_Stmt):
+                        for part_ref in walk(assignment_stmt, F23.Part_Ref):
+                            if isinstance(part_ref.children[0], F23.Name) and part_ref.children[0].tostr() == subroutine_name:
+                                assert isinstance(part_ref.children[1], F23.Section_Subscript_List), f"Expected Section_Subscript_List as second child, got {type(part_ref.children[1])}"
+                                arg_string = [arg.tostr().strip() for arg in part_ref.children[1].children]
+                                for rstmt in initialization_part:
+                                    assert isinstance(rstmt.children[0].children[2], F23.Input_Item_List)
+                                    assert len(rstmt.children[0].children[2].children) == 1
+                                    arg = rstmt.children[0].children[2].tostr()
+                                    corresponding_element = arg_string[dummy_args.index(arg)]
+                                    self.write_stmt.append(F23.Write_Stmt(f"write(1363){corresponding_element}").tostr())
+
+                                write_dummy_code = "\n".join(self.write_stmt)
+                                code_template = (
+                                        f"{assignment_stmt.tostr()}\n"
+                                        f"open(unit=1363, file='{self.benchmark_dir}/{subroutine_name}/dummy.bin', form='unformatted', status='replace')\n"
+                                        f"{write_dummy_code}\n"
+                                        "close(1363)"
+                                        )
+                                assignment_stmt.parent.children[assignment_stmt.parent.children.index(assignment_stmt)] = self.parse_fortran_statement(code_template)
+                                subroutine_found = True
+                                break
 
             for node in self.out_main.content:
                 if isinstance(node, F23.Main_Program):
@@ -1415,63 +1460,144 @@ class Processor:
             self.logger.error(f"Failed to process declarations and allocations, Error: {e}")
             raise
 
+    def is_constant_initialization(self, init_node):
+        """
+        Check whether the initialization is done using only literal constants.
+
+        Parameters
+        ----------
+        init_node : fparser.two.Fortran2003.Initialization
+            The Initialization node extracted from a Type_Declaration_Stmt.
+
+        Returns
+        -------
+        bool
+            True if the RHS of the initialization is a constant (literal value
+            or array of literals). False if it involves variable references or is absent.
+        """
+
+        LITERAL_TYPES = (
+                F23.Int_Literal_Constant,
+                F23.Real_Literal_Constant,
+                F23.Logical_Literal_Constant,
+                F23.Char_Literal_Constant
+                )
+
+        if not init_node:
+            return False
+
+        rhs = init_node.children[1]
+
+        if isinstance(rhs, LITERAL_TYPES):
+            return True
+
+        if isinstance(rhs, F23.Array_Constructor):
+            values = walk(rhs, F23.Ac_Value)
+            return all(isinstance(v, LITERAL_TYPES) for v in values)
+
+        if walk(rhs, F23.Name):
+            return False
+
+        return False
+
     def process_queue(self, input_list):
         """
-        Organizes a list of Fortran declaration statements into a logical and structured order.
+        Sort Fortran declaration statements based on initialization type and structure.
 
-        This method is designed to sort variable declarations based on their characteristics,
-        which is particularly important for ensuring correct code generation and proper
-        compilation behavior in Fortran.
+        The declarations are organized into the following order:
 
-        The reordering follows these rules:
-            - PARAMETER constants (non-arrays) come first.
-            - Regular scalar variables follow.
-            - Arrays and ALLOCATABLE declarations are placed at the end.
+            1. Variables initialized with constant literals (e.g., numeric, logical, character).
+            2. Variables initialized using other variables (i.e., expressions that reference names).
+            3. Variables with no initialization.
+            4. Arrays and ALLOCATABLE variables (always placed at the end).
 
-        Specifically:
-            - If a declaration includes the PARAMETER attribute and is not an array:
-                - If it has initialization, it's added to the end of the PARAMETER section.
-                - If it lacks initialization, it's inserted at the very beginning.
-            - ALLOCATABLE declarations and variables with explicit shape (arrays) go last.
-            - All others (typically scalar declarations) are kept in the middle.
+        This ordering ensures that variables initialized with fixed constants appear first
+        in the declaration block, which can help improve readability and maintain consistent
+        ordering for code generation or transformation tasks.
 
-        Parameters:
-            input_list (list): A list of F23.Type_Declaration_Stmt nodes representing 
-                           variable declarations to be sorted.
+        Parameters
+        ----------
+        input_list : list of fparser.two.Fortran2003.Type_Declaration_Stmt
+            A list of parsed Fortran declaration statements to sort.
 
-        Returns:
-            list: A reordered list of declaration statements following the above rules.
+        Returns
+        -------
+        list of fparser.two.Fortran2003.Type_Declaration_Stmt
+            The reordered list of declaration statements.
 
-        Raises:
-            Exception: If any error occurs during processing.
-    
-        Logging:
-            Logs information about the sorting process and any errors encountered.
+        Raises
+        ------
+        Exception
+            If an error occurs during processing.
+
+        Notes
+        -----
+        This method assumes that `self.is_constant_initialization(init_node)` is available
+        in the containing class to check whether a variable is initialized with a literal value.
         """
+        #try:
+        #    queue = deque(input_list)
+        #    left_list = []
+        #    middle_list = []
+        #    right_list = []
+        #    while queue:
+        #        element = queue.popleft()
+        #        attr_spec = [case.string for case in walk(element, F23.Attr_Spec)]
+        #        array = walk(element, F23.Explicit_Shape_Spec)
+        #        if 'PARAMETER' in attr_spec and not array:
+        #            initialization = walk(walk(element, F23.Initialization), F23.Name)
+        #            if initialization:
+        #                left_list.append(element)    ###insert(0, element)
+        #            else:
+        #                left_list.insert(0, element) ###append(element)
+        #        elif 'ALLOCATABLE' in attr_spec or array:
+        #            right_list.append(element)
+        #        else:
+        #            middle_list.append(element)
+        #    combined_list = left_list + middle_list + right_list
+        #    self.logger.info(f"Processing complete. PARAMETER elements sent to the left.")
+        #    return list(combined_list)
+        #except Exception as e:
+        #    self.logger.error(f"An error occurred while processing the queue: {e}")
+        #    raise
+
         try:
             queue = deque(input_list)
-            left_list = []
-            middle_list = []
-            right_list = []
+
+            const_inits = []   # constant-initialized variables (first)
+            var_inits = []     # variable-based initialized variables
+            uninit = []        # no initialization
+            arrays_alloc = []  # arrays or allocatable
+
             while queue:
                 element = queue.popleft()
                 attr_spec = [case.string for case in walk(element, F23.Attr_Spec)]
-                array = walk(element, F23.Explicit_Shape_Spec)
-                if 'PARAMETER' in attr_spec and not array:
-                    initialization = walk(walk(element, F23.Initialization), F23.Name)
-                    if initialization:
-                        left_list.insert(0, element)
+                is_allocatable = "ALLOCATABLE" in attr_spec
+                is_array = bool(walk(element, F23.Explicit_Shape_Spec))
+
+                init_nodes = walk(element, F23.Initialization)
+                init_node = init_nodes[0] if init_nodes else None
+
+                if is_allocatable or is_array:
+                    arrays_alloc.append(element)
+                elif init_node:
+                    if self.is_constant_initialization(init_node):
+                        const_inits.append(element)
                     else:
-                        left_list.append(element)
-                elif 'ALLOCATABLE' in attr_spec or array:
-                    right_list.append(element)
+                        var_inits.append(element)
                 else:
-                    middle_list.append(element)
-            combined_list = left_list + middle_list + right_list
-            self.logger.info(f"Processing complete. PARAMETER elements sent to the left.")
-            return list(combined_list)
+                    uninit.append(element)
+
+            combined_list = (
+                    const_inits +
+                    var_inits +
+                    uninit +
+                    arrays_alloc
+                    )
+            return combined_list
+
         except Exception as e:
-            self.logger.error(f"An error occurred while processing the queue: {e}")
+            self.logger.error(f"Error in process_queue: {e}")
             raise
 
     def compile_and_run(self, base_dir, modules_dir, mode="CPU"):
