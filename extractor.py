@@ -6,104 +6,13 @@ from navigator import Navigator
 from shaper import Shaper
 import re
 from fparser.common.readfortran import FortranStringReader
-from collections import defaultdict
+from collections import defaultdict, deque
 
 class Extractor:
     """
     """
-
     def __init__(self, module_dir, module_tree):
         """
-        The Extractor class is responsible for analyzing a parsed Fortran module and extracting
-        all relevant structural and dependency information needed to isolate subroutines or functions.
-
-        It builds an internal representation of:
-            - Subroutines and their relationships (calls, dependencies, dummy args)
-            - Variables (local, global, dummy, modified)
-            - Loops and vectorization patterns
-            - Shape and type declarations
-            - Cross-module dependencies
-
-        This information is critical for use in:
-            - Fortran subroutine isolation (used by the `Isolator` class)
-            - Source-to-source transformation (e.g., Fortran to Python)
-            - Refactoring or static analysis
-
-        Parameters
-        ----------
-        module_dir : str
-            Path to the directory containing the target module source.
-        module_tree : fparser.two.Fortran2008.Program
-            The parsed AST of the target Fortran module.
-
-        Attributes
-        ----------
-        subroutine_keys_all : set
-            All subroutine/function names found in the module.
-        subroutine_keys_ncl : set
-            Subroutines without any `CALL` statements inside.
-        subroutines : defaultdict
-            Mapping from subroutine names to their AST node representations.
-        func_result : defaultdict
-            Return variable names of functions (if applicable).
-        dummy_arg_list : defaultdict[list]
-            List of dummy arguments for each subroutine.
-        actual_arg_spec_list : defaultdict[list]
-            Actual arguments used in calls within each subroutine.
-        external_subroutines : set
-            Subroutines that are declared external (outside the current module).
-        call_subroutines : defaultdict[list]
-            All `CALL` statements found within each subroutine.
-        call_within_sub : defaultdict[set]
-            Subroutines invoked from within each subroutine.
-        loop_dict : defaultdict[set]
-            Loops associated with each subroutine (parsed structurally).
-        loop_vect : defaultdict
-            Optional vectorization-related loops (used in optimizations).
-        exclude : set
-            Reserved variable names that are ignored during extraction.
-        cases_to_exclude : list
-            Naming patterns used to skip uninteresting subroutines.
-        allowed_external_subroutines : set
-            External calls allowed during isolation or transformation.
-        dec_global : defaultdict[dict[list]]
-            Global declarations (e.g., types, dimensions) extracted from modules.
-        all_array_info : defaultdict[dict[list]]
-            Metadata about arrays (e.g., shape, intent).
-        imp_shape : defaultdict[dict]
-            Mapping of implicitly shaped variables and their dimensions.
-        scalar_variables : defaultdict[set]
-            Set of scalar variables for each subroutine.
-        shapes_variables : defaultdict[set]
-            Set of shaped (array) variables per subroutine.
-        var_modif_info : defaultdict[dict[list]]
-            Variables modified within each subroutine and how.
-        general_usage_dict : defaultdict
-            Generalized usage metadata (e.g., access patterns).
-        parsed_modules : defaultdict
-            Cache of other parsed modules for dependency resolution.
-        var_global : defaultdict[set]
-            Global variables accessed within each subroutine.
-        var_dummy : defaultdict[list]
-            Dummy arguments declared for each subroutine.
-        var_local : defaultdict[list]
-            Locally declared variables in each subroutine.
-        var_modif : defaultdict[set]
-            Variables modified (assigned) in each subroutine.
-        var_local_names : defaultdict[set]
-            Set of all local variable names in each subroutine.
-        var_declared : defaultdict[set]
-            All explicitly declared variables per subroutine.
-
-        Notes
-        -----
-        The Extractor class serves as the central analysis engine for understanding the full
-        semantic structure of a Fortran module. It supports and powers transformations such as:
-        - Isolating subroutines
-        - Rewriting declarations
-        - Tracing variable usage and modifications
-        - Validating or rewriting loop patterns
-        This makes it ideal for high-level program understanding, static analysis, or test-case generation.
         """
         try:
             self.module_dir = module_dir
@@ -120,8 +29,8 @@ class Extractor:
             self.loop_dict = defaultdict(set)
             self.loop_vect = defaultdict(lambda: None)
             self.exclude = {'kjpindex', 'nslm', 'nstm', 'nvm', 'nsnow', 'DIM', 'dim', 'MASK', 'next_calc_loop'}
-            self.cases_to_exclude = ['clear', 'finalize', 'init', 'initialize', 'read']
-            self.allowed_external_subroutines = {'ipslerr_p', 'xios_orchidee_send_field'}
+            self.cases_to_exclude = ['clear', 'finalize', 'init', 'initialize', 'read', 'write']
+            self.allowed_external_subroutines = {'ipslerr_p', 'xios_orchidee_send_field', 'xios_orchidee_recv_field', 'flinget', 'flininfo', 'scatter'}
             self.dec_global = defaultdict(lambda: defaultdict(list))
             self.all_array_info = defaultdict(lambda: defaultdict(list))
             self.imp_shape = defaultdict(dict)
@@ -137,6 +46,7 @@ class Extractor:
             self.var_local_names = defaultdict(set)
             self.var_declared = defaultdict(set)
             self.module_global_stock = {}
+            self.module_path = {}
             self.processor = Processor() 
         except Exception as e:
             self.processor.logger.error("Error in __init__: %s", str(e))
@@ -222,70 +132,266 @@ class Extractor:
             self.processor.logger.error(f"Error in extract_loop_indices: {str(e)}")
             raise
 
+    def search_subroutine_in_directory(self, subroutine_name,  current_module_name, current_dir):
+        """
+        """
+        try:
+            # Start search in current directory
+            self.module_path[current_module_name] = os.path.join(current_dir, current_module_name)
+            search_dir = os.path.normpath(current_dir)
+            searched_dirs = set()
+
+            while True:
+                if search_dir in searched_dirs:
+                    break
+                searched_dirs.add(search_dir)
+
+                # Create queue for Fortran files in current directory
+                fortran_file_queue = deque()
+                for file in os.listdir(search_dir):
+                    if file.endswith(('.f90', '.F90')):
+                        file_base, _ = os.path.splitext(file)
+                        if file_base != current_module_name:
+                            module_file_path = os.path.join(search_dir, file)
+                            self.module_path[file_base] = module_file_path
+                            fortran_file_queue.append(module_file_path)
+
+                # Search through all Fortran files in current directory
+                while fortran_file_queue:
+                    module_file_path = fortran_file_queue.popleft()
+                    module_file_name = os.path.basename(module_file_path)
+                    module_name, _ = os.path.splitext(module_file_name)
+
+                    # Get or parse the module tree
+                    if module_name in self.parsed_modules:
+                        module_tree = self.parsed_modules[module_name]
+                    else:
+                        module_tree = self.processor.parse_fortran_file(module_file_path)
+                        self.parsed_modules[module_name] = module_tree
+
+                    # Search for the subroutine in this module
+                    for sub in walk(module_tree, F23.Subroutine_Subprogram):
+                        subroutine_stmt = walk(sub, F23.Subroutine_Stmt)[0]
+
+                        # Extract subroutine name from statement
+                        for child in subroutine_stmt.children:
+                            if isinstance(child, F23.Name):
+                                current_sub_name = child.tostr()
+                                if current_sub_name == subroutine_name:
+                                    self.processor.logger.info(
+                                        "Found subroutine '%s' in file: %s",
+                                        subroutine_name,
+                                        module_file_path
+                                    )
+                                    return True, module_file_path, module_tree
+
+                # If not found in current directory, move up one level
+                parent_dir = os.path.dirname(search_dir)
+                if parent_dir == search_dir:  # Reached root directory
+                    break
+                search_dir = parent_dir
+
+            self.processor.logger.warning(
+                "Subroutine '%s' not found in directory hierarchy starting from: %s",
+                subroutine_name,
+                current_dir
+            )
+            return False, None, None
+
+        except Exception as e:
+            self.processor.logger.error(
+                "Error searching for subroutine '%s': %s",
+                subroutine_name,
+                str(e)
+            )
+            return False, None, None
+
     def find_subroutines(self):
         """
-        Extracts all subroutines from the parsed Fortran module and gathers metadata for each one.
-
-        This method performs the following:
-        - Walks the module tree to identify all `Subroutine_Subprogram` nodes.
-        - Extracts the subroutine name (`subroutine_key`) and its dummy argument list.
-        - Filters out subroutines whose names match patterns in `self.cases_to_exclude` (e.g., 'init', 'clear', 'read').
-        - Saves the full subroutine structure in `self.subroutines`, and tracks the name in `self.subroutine_keys_all`.
-        - Detects all internal and external subroutine calls:
-        - Internal calls are stored in `self.call_within_sub[subroutine_key]`.
-        - External calls (e.g., library or unrelated modules) are detected by checking against `self.allowed_external_subroutines`.
-        - Records all actual arguments passed during calls in `self.actual_arg_spec_list`.
-        - Stores all call statements in `self.call_subroutines`.
-        - Tracks subroutines that are considered "having no call" in `self.subroutine_keys_ncl`.
-        - Determines external subroutines as those that are called but not defined within the current module.
-
-        This function is essential for analyzing dependencies between procedures and for enabling subroutine isolation.
         """
-        for sub in walk(self.module_tree, F23.Subroutine_Subprogram):
+        # Iterate through all subroutine subprograms in the module AST
+        current_module_name = walk(self.module_tree, F23.Module_Stmt)[0].children[1].tostr()
+        module_subroutines_queue = deque(walk(self.module_tree, F23.Subroutine_Subprogram))
+        module_subroutines_avail = set(stmt.children[1].tostr() for stmt in walk(self.module_tree, F23.Subroutine_Stmt))
+
+        #for sub in walk(self.module_tree, F23.Subroutine_Subprogram):
+        while module_subroutines_queue:
+            sub = module_subroutines_queue.popleft()
             subroutine_key, arg_list = None, None
+
+            # Extract the main subroutine statement
             subroutine_stmt = walk(sub, F23.Subroutine_Stmt)[0]
             call_stmt = walk(sub, F23.Call_Stmt)
+
+            # Parse subroutine statement children to extract name and dummy arguments
             for child in subroutine_stmt.children:
                 if child is None:
                     continue
                 if isinstance(child, F23.Name):
                     subroutine_key = child.tostr()
                 elif isinstance(child, F23.Dummy_Arg_List):
-                    arg_list = child
+                    dummy_arg_list = child
                 else:
                     raise ValueError(f"Unexpected type '{type(child)}' encountered in children.")
+
+            # Validate subroutine key extraction
             assert subroutine_key is not None, f"Unexpected type {subroutine_key} encountered in children."
+
+            # Filter out subroutines with excluded naming patterns
             check = all(case not in subroutine_key for case in self.cases_to_exclude)
             if not check:
                 continue
+
+            # Register the subroutine in internal data structures
             self.subroutine_keys_all.add(subroutine_key)
             self.subroutines[subroutine_key] = sub
-            if arg_list is not None:
-                for child in arg_list.children:
+
+            # Extract dummy arguments if present
+            if dummy_arg_list is not None:
+                assert isinstance(dummy_arg_list, F23.Dummy_Arg_List), f"Expected dummy_arg_list, got {type(dummy_arg_list).__name__.lower()}"
+                for child in dummy_arg_list.children:
                     self.dummy_arg_list[subroutine_key].append(child.tostr())
+
+            # Process call statements within the subroutine
             if call_stmt:
                 for item in call_stmt:
                     call_name = item.children[0].tostr()
+
+                    # Skip calls to excluded subroutines
                     check = all(case not in call_name for case in self.cases_to_exclude)
                     if not check:
                         continue
-                    arg_list = item.children[1]
+
+                    actual_arg_spec_list = item.children[1]
                     assert call_name is not None, f"Unexpected type {subroutine_key} encountered in children."
+
+                    # Classify as internal or external call (ioipsl, xios)
                     if call_name not in self.allowed_external_subroutines:
                         self.call_within_sub[subroutine_key].add(call_name)
+                        '''if call_name not in module_subroutines_avail:
+                            self.processor.logger.warning(
+                                "Subroutine '%s' calls '%s' which is not defined in current module",
+                                subroutine_key,
+                                call_name
+                            )
+                            self.external_subroutines.add(call_name)
+                            found, module_file_path, module_tree = self.search_subroutine_in_directory(call_name,  current_module_name, self.module_dir)
+                            if found:
+                                self.processor.logger.info(
+                                        "Found external subroutine '%s' in file: %s, adding to processing queue",
+                                        call_name,
+                                        module_file_path
+                                        )
+                                # Add the found subroutine to the right end of the queue for processing
+                                all_subroutines_in_module = walk(module_tree, F23.Subroutine_Subprogram)
+                                for subroutine_subprogram in all_subroutines_in_module:
+                                    module_subroutines_queue.append(subroutine_subprogram)
+                                    subroutine_stmt = walk(subroutine_subprogram, F23.Subroutine_Stmt)[0]
+                                    for child in subroutine_stmt.children:
+                                        if isinstance(child, F23.Name):
+                                            sub_name = child.tostr()
+                                            module_subroutines_avail.add(sub_name)
+                        '''
                     else:
+                        # call to ioipsl, xios are allowed, so, instead of call_name, subroutine_key is added!
                         self.subroutine_keys_ncl.add(subroutine_key)
-                    if arg_list is not None:
+
+                    # Extract and store actual arguments from call
+                    if actual_arg_spec_list is not None:
+                        assert isinstance(actual_arg_spec_list, F23.Actual_Arg_Spec_List), f"Expected actual_arg_spec_list, got {type(actual_arg_spec_list).__name__.lower()}"
                         arg_string = []
-                        for child in arg_list.children:
+                        for child in actual_arg_spec_list.children:
                             arg_string.append(child.tostr())
+                        #arg_string = [child.tostr() for child in arg_list.children]
                         self.actual_arg_spec_list[call_name].append(arg_string)
+
+                    # Register the call statement
                     self.call_subroutines[call_name].append(item)
             else:
+                # Subroutine has no call statements or call to ioipsl, xios
                 self.subroutine_keys_ncl.add(subroutine_key)
-        self.external_subroutines = {item for item in self.actual_arg_spec_list.keys() \
-                if item not in self.dummy_arg_list.keys()}
 
+        # Identify external subroutines (called but not defined in module)
+        # self.external_subroutines.update(self.allowed_external_subroutines)
+        self.external_subroutines = {
+                item for item in self.actual_arg_spec_list.keys()
+                if item not in self.dummy_arg_list.keys()
+                }
+
+    def extract_function_dummy_args(self, function_tree):
+        """
+        Extract dummy arguments from a function subprogram.
+    
+        Parameters
+        ----------
+        function_subprogram : fparser.two.Fortran2003.Function_Subprogram
+            The parsed function subprogram
+        
+        Returns
+        -------
+        list
+            List of dummy argument names
+        """
+
+        function_stmt = walk(function_tree, F23.Function_Stmt)[0]
+        for child in function_stmt.children:
+            if child is None:
+                continue
+            if isinstance(child, F23.Name):
+                function_key = child.tostr()
+                self.subroutines[function_key] = function_tree
+            elif isinstance(child, F23.Dummy_Arg_List):
+                arg_list = child
+            elif isinstance(child, F23.Suffix):
+                self.func_result[function_key] = child.children[0].tostr()
+        assert function_key is not None, f"Unexpected type {function_key} encountered in children."
+        if arg_list is not None:
+            for child in arg_list.children:
+                self.dummy_arg_list[function_key].append(child.tostr())
+        
+        self.subroutines[function_key] = function_tree
+
+    def find_function_actual_args(self, function_name):
+        """
+        Find actual arguments passed to function calls in the extractor's module tree.
+
+        Parameters
+        ----------
+        function_name : str
+            Name of the function to search for
+
+        Returns
+        -------
+        dict
+            Dictionary mapping call locations to actual argument lists.
+            Each key is a string representation of the call statement/assignment,
+            and each value is a dictionary with:
+            - 'location': Information about where the call occurs
+            - 'actual_arguments': List of actual argument names
+
+        """
+    
+        actual_args_map = {}
+
+        # Search for function calls in assignments (Part_Ref nodes)
+        assignments = walk(self.module_tree, F23.Assignment_Stmt)
+
+        for assign in assignments:
+            part_refs = walk(assign, F23.Part_Ref)
+
+            for part in part_refs:
+                part_name = part.children[0]  # Name node
+
+                if part_name.string == function_name:
+
+                    # Extract actual arguments
+                    section_subscripts = part.children[1]
+                    if section_subscripts is not None:
+                        # Extract argument names
+                        actual_args = [arg.tostr() for arg in section_subscripts.children]
+
+                    self.actual_arg_spec_list[function_name].append(actual_args)
+                    self.call_subroutines[function_name].append(part)
 
     def extract_names(self, subroutine_key):
         """
@@ -447,6 +553,7 @@ class Extractor:
                                     assert call_name in self.general_usage_dict, f"Error: {call_name} not found in self.general_usage_dict"
                                 elif isinstance(grandchild, F23.Actual_Arg_Spec_List):
                                     assert call_name is not None, 'call_name is not defined yet'
+                                    actual_arg = [arg.tostr() for arg in grandchild.children]
                                     for name in grandchild.children:
                                         if name.tostr() in dummy_arg_list:
                                             var_name = name.tostr()
@@ -457,7 +564,9 @@ class Extractor:
                                             if usage[var_name]['first_use_assign'] is None or usage[var_name]['first_use_update']:
                                                 usage[var_name]['first_use_assign'] = child
                                             current_intent = usage[var_name]['intent']
-                                            call_intent = self.general_usage_dict[call_name][var_name]
+                                            corresponding_element = self.dummy_arg_list[call_name][actual_arg.index(var_name)]
+                                            #call_intent = self.general_usage_dict[call_name][var_name]
+                                            call_intent = self.general_usage_dict[call_name][corresponding_element]
                                             if current_intent is None:
                                                 usage[var_name]['intent'] = call_intent
                                             elif current_intent == 'IN' and call_intent in {'OUT', 'INOUT'}:
@@ -515,9 +624,22 @@ class Extractor:
                         traverse_block(child)
 
         traverse_block(block)
-        return F23.Type_Declaration_Stmt(
-            f'{intrinsic_type_spec},dimension({explicit_shape_spec_list}),intent({intent})::{entity_decl_list}'
-        )
+        if not intrinsic_type_spec:
+            raise ValueError("Could not find intrinsic type specification in the block")
+        if not entity_decl_list:
+            raise ValueError("Could not find entity declaration list in the block")
+
+        attributes = []
+        if explicit_shape_spec_list:
+            attributes.append(f"dimension({explicit_shape_spec_list})")
+        attributes.append(f"intent({intent})")
+        attributes_str = ",".join(attributes)
+        return   F23.Type_Declaration_Stmt(
+                f'{intrinsic_type_spec},{attributes_str}::{entity_decl_list}'
+                )
+        #F23.Type_Declaration_Stmt(
+        #f'{intrinsic_type_spec},dimension({explicit_shape_spec_list}),intent({intent})::{entity_decl_list}'
+        #)
 
     def clean_subroutine(self, subroutine_key, subroutine_tree):
         """
@@ -567,6 +689,7 @@ class Extractor:
                             intent_spec = intent[0].tostr()
                         if len(walk(child, F23.Entity_Decl)) > 1:
                             for stmt in self.processor.separate_entity_declarations(child):
+                                stmt.parent = block
                                 entity_decls = walk(stmt, F23.Entity_Decl)
                                 assert len(entity_decls) == 1,\
                                         "walk(declaration_stmt, F23.Entity_Decl), but got a different number."
@@ -766,7 +889,8 @@ class Extractor:
                                 and name == self.func_result[subroutine_key]
                                 )
                             ):
-                        self.var_dummy[subroutine_key].append(node)
+                        new_decl = self.add_intent(node, "out")
+                        self.var_dummy[subroutine_key].append(new_decl)
                     else:
                         var_in_local.add(name)
                         self.var_local[subroutine_key].append(node)
@@ -842,6 +966,14 @@ class Extractor:
                 for i, item in enumerate(cached_data, 1):
                     self.processor.logger.info(f"   {i}. {item.tostr()}")
                 self.dec_global[subroutine_key][declaration] = cached_data
+                any_initialization = walk(walk(cached_data, F23.Initialization), F23.Name)
+                var_initial = [nadi.string for nadi in any_initialization]
+                if var_initial:
+                    self.processor.logger.warning("Attention: there are additional variables to search: %s", var_initial)
+                    self.processor.logger.warning("In the directory: %s", module_dir)
+                    ffile = walk(module_tree, F23.Name)[0].string
+                    self.processor.logger.warning("In the module: %s", ffile)
+                    self.find_global_variables(module_dir, module_tree, var_initial, subroutine_key)
                 continue
             self.finder = Navigator(module_dir, module_tree, self.parsed_modules)
             if declaration not in self.external_subroutines:
@@ -1028,14 +1160,38 @@ class Extractor:
                 shape = walk(walk(item, F23.Allocate_Shape_Spec), F23.Name) if alo_stmt \
                         else walk(walk(item, F23.Explicit_Shape_Spec), F23.Name)
                 if shape:
-                    self.shapes_variables[subroutine_key].update(name.string for name in shape if name.string not in self.exclude)
+                    #self.shapes_variables[subroutine_key].update(name.string for name in shape if name.string not in self.exclude)
+                    valid_shape_names = []
+                    for name in shape:
+                        if (name is not None and
+                                hasattr(name, 'string') and
+                                name.string is not None and
+                                name.string != 'None' and
+                                name.string.strip() != '' and
+                                name.string not in self.exclude):
+                            valid_shape_names.append(name.string)
+                    if valid_shape_names:
+                        self.processor.logger.debug(f"Added shape variables: {valid_shape_names}")
+                        self.shapes_variables[subroutine_key].update(valid_shape_names)
                 else:
                     assert dec_stmt, 'The scalar must be a Type_Declaration_Stmt!'
                     array = walk(item, F23.Dimension_Attr_Spec)
                     if not array:
-                        name = walk(walk(item, F23.Entity_Decl), F23.Name)
-                        if name[0].string not in self.exclude:
-                            self.scalar_variables[subroutine_key].add(name[0].string)
+                        names = walk(walk(item, F23.Entity_Decl), F23.Name)
+                        valid_scalar_names = []
+                        for name in names:
+                            if (name is not None and
+                                    hasattr(name, 'string') and
+                                    name.string is not None and
+                                    name.string != 'None' and
+                                    name.string.strip() != '' and
+                                    name.string not in self.exclude):
+                                valid_scalar_names.append(name.string)
+                        if valid_scalar_names:
+                            self.scalar_variables[subroutine_key].update(valid_scalar_names)
+                            self.processor.logger.debug(f"Added scalar variables: {valid_scalar_names}")
+                        #if name[0].string not in self.exclude:
+                        #    self.scalar_variables[subroutine_key].add(name[0].string)
 
 if __name__ == "__main__":
     import unittest
@@ -1225,10 +1381,10 @@ if __name__ == "__main__":
             self.complex_extractor.find_subroutines()
             sub_key = "complex_sub"
             sub_tree = self.complex_extractor.subroutines[sub_key]
-        
             # First find variables to get globals
             self.complex_extractor.find_variables(sub_tree, sub_key)
             # Now find globals (test_sub in this case)
+            
             self.complex_extractor.find_global_variables(
                 self.test_dir, 
                 self.complex_tree, 
@@ -1281,5 +1437,5 @@ if __name__ == "__main__":
             # Verify scalar and shaped variables
             self.assertEqual(self.simple_extractor.scalar_variables[sub_key], {"a"})
             self.assertEqual(self.simple_extractor.shapes_variables[sub_key], {"n"})
-    
+        
     unittest.main()

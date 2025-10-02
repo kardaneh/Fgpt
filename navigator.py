@@ -193,8 +193,8 @@ class Navigator:
                             self.processor.logger.warning("The containing directory is: %s", self.module_dir_sc)
                             function_name = child
                             function_subprogram = child.parent.parent
-                            function_module = child.get_root()
-                            self.var_declaration.extend([function_subprogram, function_module, self.module_dir_sc])
+                            #function_module = child.get_root()
+                            self.var_declaration.extend([function_name,function_subprogram]) ###, function_module, self.module_dir_sc])
 
             if self.var_declaration:
                 self.return_key_sc = True

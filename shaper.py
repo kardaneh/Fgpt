@@ -11,10 +11,96 @@ from collections import defaultdict
 
 class Shaper:
     """
+    A shape resolver for Fortran arrays that determines explicit shapes from implicit declarations.
+    
+    This class analyzes Fortran code to resolve implicit array shapes (: notation) by tracing
+    through subroutine calls and function assignments to find the corresponding explicit
+    declarations. It handles complex call hierarchies and intrinsic functions like SIZE.
+    
+    Parameters
+    ----------
+    module_dir : str
+        Directory containing the Fortran module files
+    parsed_modules : dict
+        Dictionary of pre-parsed modules for efficient lookup
+    dummy_arg_list : defaultdict
+        Dictionary mapping subroutine names to their dummy argument lists
+    actual_arg_spec_list : defaultdict, optional
+        Dictionary mapping subroutine names to actual argument specifications
+    call_subroutines : defaultdict, optional
+        Dictionary mapping subroutine names to their call statement nodes
+    
+    Attributes
+    ----------
+    module_dir_imp : str
+        Directory containing Fortran module files
+    dummy_arg_list : defaultdict
+        Dictionary of subroutine dummy arguments
+    actual_arg_spec_list : defaultdict
+        Dictionary of actual argument specifications
+    call_subroutines : defaultdict
+        Dictionary of subroutine call statements
+    current_module_imp : str
+        Current module being processed
+    module_tree_imp : fparser.two.Fortran2003.Module
+        Current parsed module tree
+    parsed_modules : dict
+        Dictionary of pre-parsed modules
+    processor : Processor
+        Processor instance for parsing and utility functions
+    cases_to_exclude : list
+        List of subroutine names to exclude from processing
+    
+    Methods
+    -------
+    find_fortran_files_subroutine(subroutine_key)
+        Search Fortran files for a specific subroutine and its calls.
+    shaper_subroutine(node, subroutine_key)
+        Resolve implicit array shapes by tracing through subroutine calls.
+    shaper_function(node, function_tree, function_key, all_array_info)
+        Resolve implicit array shapes in function assignments.
+    shaper_intrinsic_size(node)
+        Handle SIZE intrinsic functions to determine array dimensions.
+    find_enclosing_subroutine(node)
+        Find the enclosing subroutine for a given AST node.
+    
+    Notes
+    -----
+    The class handles complex call hierarchies by performing breadth-first search
+    through module dependencies. It can resolve shapes across multiple levels of
+    subroutine calls and function assignments.
+    
+    Raises
+    ------
+    ValueError
+        When unexpected AST node types are encountered
+    AssertionError
+        When expected conditions are not met during shape resolution
+    RuntimeError
+        When subroutines cannot be found or shapes cannot be resolved
+    
+    See Also
+    --------
+    Navigator : For module traversal and dependency analysis
+    Processor : For Fortran parsing utilities
     """
 
     def __init__(self, module_dir, parsed_modules, dummy_arg_list, actual_arg_spec_list=None, call_subroutines=None):
         """
+        Initialize the Shaper with module directory, parsed modules, and argument mappings.
+        
+        Parameters
+        ----------
+        module_dir : str
+            Directory containing the Fortran module files
+        parsed_modules : dict
+            Dictionary of pre-parsed modules for efficient lookup
+        dummy_arg_list : defaultdict
+            Dictionary mapping subroutine names to their dummy argument lists
+        actual_arg_spec_list : defaultdict, optional
+            Dictionary mapping subroutine names to actual argument specifications
+        call_subroutines : defaultdict, optional
+            Dictionary mapping subroutine names to their call statement nodes
         """
         self.module_dir_imp = module_dir
         self.dummy_arg_list = dummy_arg_list
@@ -28,6 +114,32 @@ class Shaper:
 
     def find_fortran_files_subroutine(self, subroutine_key):
         """
+        Search Fortran files for a specific subroutine and its call sites.
+        
+        This method searches through all Fortran files in the module directory to
+        find where a subroutine is called. It populates the call information
+        dictionaries with the found call statements and argument specifications.
+        
+        Parameters
+        ----------
+        subroutine_key : str
+            The name of the subroutine to search for
+        
+        Returns
+        -------
+        None
+        
+        Raises
+        ------
+        Exception
+            If the subroutine cannot be found in any Fortran files
+        
+        Notes
+        -----
+        - Searches all .f90 and .F90 files in the module directory
+        - Excludes files matching the current module
+        - Populates actual_arg_spec_list and call_subroutines dictionaries
+        - Uses breadth-first search through the file queue
         """
         try:
             fortran_file_queue_imp = deque()
@@ -95,6 +207,37 @@ class Shaper:
 
     def shaper_subroutine(self, node, subroutine_key):
         """
+        Resolve implicit array shapes by tracing through subroutine call hierarchies.
+        
+        This method takes an implicit array declaration and traces through subroutine
+        calls to find the corresponding explicit shape declaration. It handles
+        multiple levels of call nesting and module dependencies.
+        
+        Parameters
+        ----------
+        node : fparser.two.Fortran2003.Type_Declaration_Stmt
+            The implicit array declaration node to resolve
+        subroutine_key : str
+            The name of the subroutine where the array is used
+        
+        Returns
+        -------
+        fparser.two.Fortran2003.Type_Declaration_Stmt
+            The resolved explicit array declaration
+        
+        Raises
+        ------
+        ValueError
+            If the array is not found in dummy argument lists
+        Exception
+            If shape resolution fails at any level
+        
+        Notes
+        -----
+        - Traces through actual argument specifications to find explicit shapes
+        - Uses Navigator for module-level variable resolution when needed
+        - Handles both direct and nested subroutine calls
+        - Logs the resolution path for debugging
         """
         try:
             assert self.actual_arg_spec_list is not None, "Error: actual_arg_spec_list is None!"
@@ -150,12 +293,47 @@ class Shaper:
 
     def shaper_function(self, node, function_tree, function_key, all_array_info):
         """
+        Resolve implicit array shapes in function assignment contexts.
+        
+        This method handles shape resolution for arrays used in function
+        assignments. It searches for function calls and extracts shape
+        information from array references in the assignment statements.
+        
+        Parameters
+        ----------
+        node : fparser.two.Fortran2003.Type_Declaration_Stmt
+            The implicit array declaration node to resolve
+        function_tree : fparser.two.Fortran2003.Function_Subprogram
+            The function tree containing the assignment
+        function_key : str
+            The name of the function being analyzed
+        all_array_info : dict
+            Dictionary containing shape information for all known arrays
+        
+        Returns
+        -------
+        fparser.two.Fortran2003.Type_Declaration_Stmt
+            The resolved explicit array declaration
+        
+        Raises
+        ------
+        AssertionError
+            If array information is missing or invalid
+        Exception
+            If function assignment analysis fails
+        
+        Notes
+        -----
+        - Handles both slice notation (:) and explicit array references
+        - Supports multi-dimensional array shape resolution
+        - Searches through module files when function is not found locally
         """
         try:
             self.module_tree_imp = node.get_root()
             self.current_module_imp = walk(self.module_tree_imp, F23.Name)[0].string
             last_processed_module_dir = None
             function_assignment_stmt = None
+            act_arg_list = None
             fortran_file_queue_imp = deque()
 
             name =  walk(node, F23.Entity_Decl)[0].tostr()
@@ -166,18 +344,24 @@ class Shaper:
             while function_assignment_stmt is None:
                 for assignment_stmt in walk(self.module_tree_imp, F23.Assignment_Stmt):
                     for part_ref in walk(assignment_stmt, F23.Part_Ref):
-                        for child in part_ref.children:
-                            if isinstance(child, F23.Name):
-                                if child.tostr() == function_key:
-                                    function_assignment_stmt = True
-                            if isinstance(child, F23.Section_Subscript_List):
-                                if function_assignment_stmt:
-                                    act_arg_list = child
+                        if isinstance(part_ref.children[0], F23.Name) and part_ref.children[0].tostr() == function_key:
+                            function_assignment_stmt = True
+                            assert isinstance(part_ref.children[1], F23.Section_Subscript_List), f"Expected Section_Subscript_List as second child, got {type(part_ref.children[1])}"
+                            act_arg_list = part_ref.children[1]
+                        #for child in part_ref.children:
+                        #    if isinstance(child, F23.Name):
+                        #        if child.tostr() == function_key:
+                        #            function_assignment_stmt = True
+                        #    if isinstance(child, F23.Section_Subscript_List):
+                        #        if function_assignment_stmt:
+                        #            act_arg_list = child
                         if function_assignment_stmt:
                             act_arg = act_arg_list.children[self.dummy_arg_list[function_key].index(name)]
+                            #print(act_arg, "llllllllllllll======")
                             if ':' in act_arg.tostr() and isinstance(act_arg, F23.Part_Ref):
                                 array_name = act_arg.children[0].tostr()
                                 dims = act_arg.children[1].children
+                                #print('dims:',dims)
                                 shape = []
                                 assert array_name in all_array_info, (
                                         f"Error in shaper_function: Array '{array_name}' not present in all_array_info."
@@ -248,6 +432,35 @@ class Shaper:
 
     def shaper_intrinsic_size(self, node):
         """
+        Handle SIZE intrinsic functions to determine array dimensions.
+        
+        This method processes SIZE intrinsic function calls to compute
+        explicit array dimensions. It handles both explicit DIM arguments
+        and implicit dimension calculations.
+        
+        Parameters
+        ----------
+        node : fparser.two.Fortran2003.Type_Declaration_Stmt
+            The declaration node containing SIZE intrinsic calls
+        
+        Returns
+        -------
+        fparser.two.Fortran2003.Type_Declaration_Stmt
+            The declaration with SIZE intrinsics resolved to explicit dimensions
+        
+        Raises
+        ------
+        AssertionError
+            If intrinsic function structure is invalid
+        Exception
+            If SIZE argument processing fails
+        
+        Notes
+        -----
+        - Handles SIZE with and without DIM arguments
+        - Computes dimension sizes from explicit shape specifications
+        - Supports multi-dimensional size calculations
+        - Replaces intrinsic calls with computed dimension expressions
         """
         try:
             shape = []
@@ -289,6 +502,7 @@ class Shaper:
                                 f"Expected node's parent to be of type F23.Specification_Part, but got {type(node.parent).__name__} instead."
                         for declaration_stmt in walk(node.parent, F23.Type_Declaration_Stmt):
                             entity_decls = walk(declaration_stmt, F23.Entity_Decl)
+                            # bug to fix, if there is multiple variables
                             assert len(entity_decls) == 1,"walk(declaration_stmt, F23.Entity_Decl), but got a different number."
                             if entity_decls[0].tostr() == args[0].tostr():
                                 size = '1'
@@ -326,12 +540,30 @@ class Shaper:
     def find_enclosing_subroutine(self, node):
         """
         Find the enclosing subroutine for a given AST node.
-
-        Args:
-            node (object): The AST node to search from.
-
-        Returns:
-            object: The enclosing subroutine node, or None if not found.
+        
+        Traverses up the AST parent hierarchy to find the subroutine
+        that contains the given node.
+        
+        Parameters
+        ----------
+        node : fparser.two.Fortran2003.Base
+            The AST node to find the enclosing subroutine for
+        
+        Returns
+        -------
+        fparser.two.Fortran2003.Subroutine_Subprogram or None
+            The enclosing subroutine node, or None if not found
+        
+        Raises
+        ------
+        Exception
+            If AST traversal fails
+        
+        Notes
+        -----
+        - Uses parent pointer traversal up the AST
+        - Returns the first enclosing subroutine found
+        - Returns None if no subroutine is found in the hierarchy
         """
         try:
             while node is not None:
