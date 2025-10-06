@@ -9,6 +9,7 @@ import ast
 import copy
 import logging
 import itertools
+from utils import ast_walk
 
 class F2NP:
     """
@@ -85,6 +86,7 @@ class F2NP:
                 r'\bACOS\b': 'np.arccos',
                 r'\bATAN\b': 'np.arctan',
                 r'\bATAN2\b': 'np.arctan2',
+                r'\bAINT\b': 'np.trunc',
                 r'\bMOD\b': 'np.mod',
                 r'\bCEILING\b': 'np.ceil',
                 r'\bFLOOR\b': 'np.floor',
@@ -95,7 +97,7 @@ class F2NP:
                 r'\bRESHAPE\b': 'np.reshape',
                 r'\bALLOCATE\b': 'np.empty',
                 r'\bSIZE\b': 'np.size'
-                }
+            }
         
         self.conditional_ops_map = {
                 '>' : ast.Gt(),
@@ -254,7 +256,7 @@ class F2NP:
             module_stack = []
             
         if counters is None:
-            counters = {'do': 0, 'if': 0, 'elif':0, 'where':0}
+            counters = {'do': 0, 'if': 0, 'elif':0, 'ifwhere':0, 'elifwhere':0}
         
         if hasattr(block, "content"):
             idx = 0
@@ -272,49 +274,83 @@ class F2NP:
                         if walk(child, F23.Part_Ref):
                             child = self.handle_assignment(child)
                             
-                            
                         if_stmt = self.handle_if_condition(child)
                         self.append_to_current_parent(if_stmt, control_stack)
                         control_stack.append(if_stmt)  # if_stmt has body
                         counters['if'] += 1
-                            
+                    
+                    elif isinstance(child,F23.If_Stmt):
+                        if_condition = child.children[0]
+                        condition_stmt = child.children[1]
+                        if_condition_ast = self.handle_expr(if_condition)
+                        condition_stmt_ast = self.handle_expr(condition_stmt)
+                        if_stmt =  ast.If(
+                                test=if_condition_ast,
+                                body=[condition_stmt_ast],
+                                orelse=[]
+                            ) 
+                        if counters["if"] == 0 and counters["do"] == 0:
+                            module_stack.append(if_stmt)
+                        else:
+                            self.append_to_current_parent(if_stmt, control_stack)
+                            # control_stack.append(if_stmt)
+
                     elif isinstance(child,F23.Assignment_Stmt):
                         stmt = self.handle_assignment(child)
                         # print(counters, ast.unparse(ast.fix_missing_locations(stmt)))
                         if counters["if"] == 0 and counters["do"] == 0: # We don't need to check for the counters['elif'] since the if the `if` counters is empty then elif is also empty 
                             # since elif can't exist without the other. 
                             # control_stack.append(stmt)
-                            if counters['where'] > 0:
-                                where_stmt = module_stack[-1]
-                                target_subscript = stmt.targets[0]
+                            if counters['ifwhere'] > 0 or counters["elifwhere"] > 0:
                                 # Need to create a deepcopy if not they will share the same address, found out the hard way during the
                                 # rest of the process
-                                target_subscript_copy = copy.deepcopy(target_subscript)
-                                # Modify the where stmt
-                                where_stmt.value.args.extend([stmt.value, target_subscript_copy])
-                                stmt = ast.Assign(
-                                    targets = [target_subscript],
-                                    value = where_stmt.value
+                                stmt_copy = copy.deepcopy(stmt)
+                                # Now we need to modify the stmt itself
+                                stmt = ast.Assign( 
+                                    targets= [ast.Subscript(
+                                        value = stmt_copy.targets[0],
+                                        slice = ast.Name(id='mask',ctx=ast.Load()),
+                                        ctx = ast.Store()
+                                    )],
+                                    value=stmt_copy.value
                                 )
-                                module_stack[-1] = stmt
-                                
+        
+                                if module_stack and isinstance(module_stack[-1], (ast.If,list)):
+                                    self.append_to_current_parent(stmt, control_stack=module_stack)
+                                else:
+                                    module_stack.append(stmt)
                             else:
                                 # print(ast.unparse(ast.fix_missing_locations(stmt)))
                                 module_stack.append(stmt)
                         else:
-                            if counters['where'] > 0:
-                                where_stmt = module_stack[-1]
-                                target_subscript = stmt.targets[0]
+                            if counters['ifwhere'] > 0:
                                 # Need to create a deepcopy if not they will share the same address, found out the hard way during the
                                 # rest of the process
-                                target_subscript_copy = copy.deepcopy(target_subscript)
-                                # Modify the where stmt
-                                where_stmt.value.args.extend([stmt.value, target_subscript_copy])
-                                stmt = ast.Assign(
-                                    targets = [target_subscript],
-                                    value = where_stmt.value
+                                stmt_copy = copy.deepcopy(stmt)
+                                # Now we need to modify the stmt itself
+                                if isinstance(stmt_copy.targets[0], ast.Name):
+                                    target_name = stmt_copy.targets[0].id
+                                elif isinstance(stmt_copy.targets[0], ast.Subscript) and isinstance(stmt_copy.targets[0].value, ast.Name):
+                                    target_name = stmt_copy.targets[0].value.id
+                                else:
+                                    target_name = None
+                                    
+                                stmt = ast.Assign( 
+                                    targets= [ast.Subscript( # LHS SIDE adjustemeent
+                                        value = stmt_copy.targets[0],
+                                        slice = ast.Name(id='mask',ctx=ast.Load()),
+                                        ctx = ast.Store()
+                                    )],
+                                    # value=stmt_copy.value
+                                    value=self.apply_mask_to_rhs(stmt_copy.value, target_name) # We need to check the RHS to see if the target name is present and and apply the mask
                                 )
-                                control_stack[-1] = stmt
+
+                                if control_stack and isinstance(control_stack[-1], (ast.If,list)):
+                                    self.append_to_current_parent(stmt, control_stack=control_stack)
+                                else:
+                                    control_stack.append(stmt)
+
+                                # self.append_to_current_parent(stmt,control_stack=control_stack)
                             else:
                                 self.append_to_current_parent(stmt, control_stack)
 
@@ -373,7 +409,7 @@ class F2NP:
                                             break  
                                 # print(control_stack) 
                                 if len(control_stack) > 1:
-                                    control_stack.pop() # Now we pop the if corresponding to the pop if 
+                                    control_stack.pop() # Now we pop the if corresponding to the parent if 
                                 # print(control_stack)
                         if counters["do"] == 0 and counters["if"] == 0: # we don't take into account the elif since we primarily based on 
                             # when the end do or end if appear
@@ -400,44 +436,7 @@ class F2NP:
                             raise NotImplementedError(f"When 1363 is present, the approach hasn't be implemented yet")
                             
                     elif isinstance(child,F23.Call_Stmt):
-                        function_name,args_spec_list = child.children
-                        args = []
-                        stmt = None
-                        if not function_name.string in ['ipslerr_p']:
-                            
-                            for arg in args_spec_list.children:
-                                args.append(self.handle_expr(arg))
-                                
-                            stmt = ast.Expr(
-                                value = ast.Call(
-                                    func = ast.Name(id = function_name.string, ctx = ast.Load()),
-                                    args = args,
-                                    keywords = []
-                                )
-                            )
-                        else:
-                            
-                            for arg in args_spec_list.children:
-                                if isinstance(arg, F23.Char_Literal_Constant):
-                                    value = arg.items[0].strip(" ' ") # this will remove the 'hydrol' and if there any extra '' inside
-                                    args.append(value)
-                            
-                            args.insert(0, "Exception:")
-                            final_message = " ".join(args)
-                            
-                            # logging.error AST call
-                            stmt = ast.Expr(
-                                value=ast.Call(
-                                    func=ast.Attribute(
-                                        value=ast.Name(id='logging', ctx=ast.Load()),
-                                        attr='error',
-                                        ctx=ast.Load()
-                                    ),
-                                    args=[ast.Constant(value=final_message)],
-                                    keywords=[]
-                                )
-                            )
-
+                        stmt = self.handle_call_stmt(child)
                         if stmt is None:
                             raise ValueError(f'Call statement is None due to prior error')
                         if counters["do"] == 0 and counters["if"] == 0:
@@ -446,15 +445,73 @@ class F2NP:
                             self.append_to_current_parent(stmt, control_stack)
                             
                     elif isinstance(child,F23.Where_Construct_Stmt):
+                        # This corresponds to the IF format
                         stmt = self.handle_where_stmt(child)
-                        counters['where'] += 1
+                        counters['ifwhere'] += 1
                         if counters["do"] == 0 and counters["if"] == 0:
+
+                            self.append_to_current_parent(stmt,module_stack)
                             module_stack.append(stmt)
                         else:
-                            self.append_to_current_parent(stmt, control_stack,counters)
+                            self.append_to_current_parent(stmt, control_stack)
+                            control_stack.append(stmt)
+
+                    elif isinstance(child,(F23.Masked_Elsewhere_Stmt,F23.Elsewhere_Stmt)):
+                        # This corresponds to the ELSEIF format look at replace_where in modifier.py
+                        if counters["do"] == 0 and counters["if"] == 0:
+                            stack_to_check = module_stack
+                        else:
+                            stack_to_check = control_stack
+
+                        if not stack_to_check or not isinstance(stack_to_check[-1], ast.If):
+                            # print(ast.unparse(ast.fix_missing_locations(control_stack[-1][0])))
+                            raise RuntimeError("Else/Else If for where stmt without a preceding If")
                         
+                        parent_if = stack_to_check[-1] # We go back to the parent if of the current else/else if statement
+                        # print(child)
+                        if isinstance(child, F23.Masked_Elsewhere_Stmt):
+                            # Create new ast.If node for Else If
+                            if isinstance(child, F23.Masked_Elsewhere_Stmt) and walk(child, F23.Part_Ref): 
+                                child = self.handle_assignment(child)
+                            
+                            elif_node = self.handle_where_stmt(child)
+                            # while stack_to_check and not isinstance(stack_to_check[-1], ast.If):
+                            #     stack_to_check.pop()
+                            # Attach to orelse of previous If the new instance IF 
+                            parent_if.orelse.append(elif_node) 
+                            # print(ast.dump(parent_if,indent=4))
+                            # But we move on to the newly created elif_node
+                            stack_to_check.append(elif_node)
+                            counters["elifwhere"] += 1
+
+                        if isinstance(child, F23.Elsewhere_Stmt):
+                            stack_to_check.append(parent_if.orelse)
+
                     elif isinstance(child,F23.End_Where_Stmt):
-                        counters['where'] -= 1
+                        
+                        if counters["do"] == 0 and counters["if"] == 0:
+                            stack_to_check = module_stack
+                        else:
+                            stack_to_check = control_stack
+
+                        if stack_to_check and counters["ifwhere"] != 0:
+                            counters['ifwhere'] -= 1
+
+                        if stack_to_check:
+                            if len(stack_to_check) > 1:
+                                if isinstance(stack_to_check[-1],list) and isinstance(stack_to_check[-2],ast.If): # and counters["if"] != 0
+                                    # This is primarily used for removing the else if present inside the if loop
+                                    stack_to_check.pop()
+                                if counters["elifwhere"] > 0: 
+                                    while counters["elifwhere"] > 0:
+                                        if isinstance(stack_to_check[-1], ast.If):
+                                            stack_to_check.pop()
+                                            counters["elifwhere"] -= 1
+                                        else:
+                                            break  
+                                # print(control_stack) 
+                                if len(stack_to_check) > 1:
+                                    stack_to_check.pop()
 
                     elif isinstance(child,F23.Implicit_Stmt):
                         pass
@@ -493,6 +550,8 @@ class F2NP:
                     raise 
                     
                 idx += 1
+                # print(counters, module_stack, child)
+                # print(f"Counters: {counters},python code : \n {ast.unparse(ast.fix_missing_locations(module_stack[-1])) if isinstance(module_stack[-1],ast.AST) else module_stack[-1]}")
         else:
             raise AttributeError("Block doesn't have the `content` attribute")
         
@@ -577,15 +636,42 @@ class F2NP:
                     raise ValueError('Expected two children: function_name and args_spec_list')
                 
                 function_name,args_spec_list = stmt.children
-                args = [self.handle_expr(arg) for arg in args_spec_list.children]
-
-                stmt = ast.Expr(
-                    value = ast.Call(
-                        func = ast.Name(id = function_name.string, ctx = ast.Load()),
-                        args = args,
-                        keywords = []
+                args = []
+                stmt = None
+                if not function_name.string in ['ipslerr_p']:
+                    
+                    for arg in args_spec_list.children:
+                        args.append(self.handle_expr(arg))
+                        
+                    stmt = ast.Expr(
+                        value = ast.Call(
+                            func = ast.Name(id = function_name.string, ctx = ast.Load()),
+                            args = args,
+                            keywords = []
+                        )
                     )
-                )
+                else:
+                    
+                    for arg in args_spec_list.children:
+                        if isinstance(arg, F23.Char_Literal_Constant):
+                            value = arg.items[0].strip(" ' ") # this will remove the 'hydrol' and if there any extra '' inside
+                            args.append(value)
+                    
+                    args.insert(0, "Exception:")
+                    final_message = " ".join(args)
+                    
+                    # logging.error AST call
+                    stmt = ast.Expr(
+                        value=ast.Call(
+                            func=ast.Attribute(
+                                value=ast.Name(id='logging', ctx=ast.Load()),
+                                attr='error',
+                                ctx=ast.Load()
+                            ),
+                            args=[ast.Constant(value=final_message)],
+                            keywords=[]
+                        )
+                    )
                 return stmt
             except Exception:
                 logging.exception(f'Exception in handle_call_stmt')
@@ -639,7 +725,7 @@ class F2NP:
             return f"{var_part} = np.zeros(({dimensions}),dtype={dtype})"
         else:
             shape = []
-            TYPE = {'REAL':'float64','INTEGER':'int32'}
+            TYPE = {'REAL':'float64','INTEGER':'int32', 'LOGICAL':'bool'}
             try: 
                 for dim in walk(stmt,F23.Explicit_Shape_Spec):
                     shape.append(ast.Name(id=dim.tostr(),ctx=ast.Load()))
@@ -651,7 +737,6 @@ class F2NP:
                 
                 fdtype = walk(stmt,F23.Intrinsic_Type_Spec)[0].children[0]
                 dtype = TYPE.get(fdtype)
-                
                 if dtype is None:
                     raise KeyError("Non corresponding key given")
                 
@@ -734,18 +819,45 @@ class F2NP:
             print(f"np.where({condition})")
             self.result.append(f"np.where({condition})")
         else:
-            # Based on this to create the where stmt : https://github.com/wusunlab/fortran-vs-python
             try:
                 mask_node = []
                 for element in stmt.children:
-                    mask_node.append(self.handle_expr(element))
+                    if element:
+                        mask_node.append(self.handle_expr(element))
                 if len(mask_node) == 1:
-                    return ast.Expr(value = ast.Call(func = ast.Attribute(value = ast.Name(id = 'np', ctx = ast.Load()),
-                                                                        attr = 'where',
-                                                                        ctx = ast.Load()),
-                                                    args = [mask_node[0]],
-                                                    keywords = [])
-                                )
+
+                    if isinstance(mask_node[0],ast.Subscript):
+                        expr_node = ast.Call(
+                                func=ast.Attribute(
+                                    value=ast.Name(id='np',ctx=ast.Load()),
+                                    attr='any',
+                                    ctx=ast.Load()
+                                ),
+                                args = [mask_node[0]],
+                                keywords=[]
+                            )
+                    elif isinstance(mask_node[0], ast.Compare):
+                        expr_node = ast.Call(
+                            func=ast.Attribute(
+                                value=mask_node[0],
+                                attr="any",
+                                ctx=ast.Load()
+                            ),
+                            args=[],
+                            keywords=[]
+                        )
+                    else:
+                        raise NotImplementedError(f"Not implemented error for the where condition type:{type(mask_node[0])}")
+
+                    where_if_stmt = ast.If(
+                        test = expr_node,
+                        body= [ast.Assign(
+                                    targets=[ast.Name(id='mask',ctx=ast.Store())],
+                                    value=mask_node[0]
+                                )],
+                        orelse=[]
+                    )
+                    return where_if_stmt
                 else:
                     raise NotImplementedError("Not implemented handle_where_stmt with multiple conditions")
                 
@@ -813,74 +925,89 @@ class F2NP:
         else:
             # WE directly use the stmt not as the string except for the start which corresponds to the lower bound 
             elements = walk(stmt,F23.Loop_Control)[0].children[1]
-            loop_var, start_end_stride_values = elements[0].string,elements[1]
-            start,end = start_end_stride_values[0], start_end_stride_values[1]
+            if elements: # FOr loop DO in fortran 
+                loop_var, start_end_stride_values = elements[0].string,elements[1]
+                start,end = start_end_stride_values[0], start_end_stride_values[1]
 
-            # Now we need to make sure that the start(lower bound) is compatible which we transform to string
-            start = start.tostr() + '-1'
-            if len(start_end_stride_values) == 2:
-                stride = 1
-            elif len(start_end_stride_values) == 3:
-                stride = start_end_stride_values[2]
-            else:
-                raise ValueError("Loop control error!")
-            
-            arg = []
-            lb = self.simplify_limits(start)
-            if not lb:
-                lb = 0
-            # FOr the lower bound control which is kept as a string 
-            if type(lb) == int: # is of type int
-                arg.append(ast.Constant(value=int(lb)))
-            elif type(lb) == str: # is of type str ex: 'nslm - 1' or '2' or just nslm
-                parts = re.findall(r'\w+|[+-]', lb)
-                if len(parts) == 1 and lb.isdigit():
-                    arg.append(ast.Constant(value=int(lb)))
-                elif len(parts) > 1:
-                    arg.append(self.build_binop(ast.Name(id=parts[0],ctx=ast.Load()),parts[1],ast.Constant(value = int(parts[2]))))
+                # Now we need to make sure that the start(lower bound) is compatible which we transform to string
+                start = start.tostr() + '-1'
+                if len(start_end_stride_values) == 2:
+                    stride = 1
+                elif len(start_end_stride_values) == 3:
+                    stride = start_end_stride_values[2]
                 else:
-                    arg.append(ast.Name(id=lb,ctx=ast.Load()))
-            
-            # Before creating the ast node, we need to verify if the loop_var corresoponds the convention used 
-            # based on the upper bound, THe candidate var is also in string format
-            candidate_var = None
-            if isinstance(end, F23.Name):
-                candidate_var = self.get_conventional_var(loop_var,end.string)
-
-            if candidate_var is not None:
-                loop_var = candidate_var
+                    raise ValueError("Loop control error!")
                 
-            end_ast = None
-            if isinstance(end,F23.Part_Ref):
-                end_ast = ast.Call(func=ast.Name(id='int',ctx=ast.Load()),
-                                                args =[self.handle_expr(end)],
-                                                keywords = [])
-            else:
-                end_ast = self.handle_expr(end)
-            
-            arg.append(end_ast)
-            # We need to verify the type of the stride since the stride could be an integer format or that of the unary format ex : -1 or -nslm 
-            if type(stride) == int:
-                arg.append(ast.Constant(value = stride))
-            else:
-                stride_ast = self.handle_expr(stride)
-                # Before appending we need to verify if that the if the stride is negative thus the end variable need to be negative too
-                if isinstance(stride_ast,ast.UnaryOp):
-                    end_ast = arg[-1]
-                    if isinstance(end_ast, ast.Constant) and isinstance(end_ast.value, int):
-                        if end_ast.value > 0:
-                            end_ast.value = -1 * end_ast.value
-                arg.append(stride_ast)
+                arg = []
+                lb = self.simplify_limits(start)
+                if not lb:
+                    lb = 0
+                # FOr the lower bound control which is kept as a string 
+                if type(lb) == int: # is of type int
+                    arg.append(ast.Constant(value=int(lb)))
+                elif type(lb) == str: # is of type str ex: 'nslm - 1' or '2' or just nslm
+                    parts = re.findall(r'\w+|[+-]', lb)
+                    if len(parts) == 1 and lb.isdigit():
+                        arg.append(ast.Constant(value=int(lb)))
+                    elif len(parts) > 1:
+                        arg.append(self.build_binop(ast.Name(id=parts[0],ctx=ast.Load()),parts[1],ast.Constant(value = int(parts[2]))))
+                    else:
+                        arg.append(ast.Name(id=lb,ctx=ast.Load()))
+                
+                # Before creating the ast node, we need to verify if the loop_var corresoponds the convention used 
+                # based on the upper bound, THe candidate var is also in string format
+                candidate_var = None
+                if isinstance(end, F23.Name):
+                    candidate_var = self.get_conventional_var(loop_var,end.string)
 
-            for_loop = ast.For(
-                target = ast.Name(id=loop_var, ctx = ast.Store()),
-                iter = ast.Call(
-                    func = ast.Name(id="range",ctx = ast.Load()),
-                    args = arg,
-                    keywords = []),
-                body = [],
-                orelse = []
-            )       
+                if candidate_var is not None:
+                    loop_var = candidate_var
+                    
+                end_ast = None
+                if isinstance(end,F23.Part_Ref):
+                    end_ast = ast.Call(func=ast.Name(id='int',ctx=ast.Load()),
+                                                    args =[self.handle_expr(end)],
+                                                    keywords = [])
+                else:
+                    end_ast = self.handle_expr(end)
+                
+                arg.append(end_ast)
+                # We need to verify the type of the stride since the stride could be an integer format or that of the unary format ex : -1 or -nslm 
+                if type(stride) == int:
+                    arg.append(ast.Constant(value = stride))
+                else:
+                    stride_ast = self.handle_expr(stride)
+                    # Before appending we need to verify if that the if the stride is negative thus the end variable need to be negative too
+                    if isinstance(stride_ast,ast.UnaryOp):
+                        end_ast = arg[-1]
+                        if isinstance(end_ast, ast.Constant) and isinstance(end_ast.value, int):
+                            if end_ast.value > 0:
+                                end_ast.value = -1 * end_ast.value
+                    arg.append(stride_ast)
+
+                for_loop = ast.For(
+                    target = ast.Name(id=loop_var, ctx = ast.Store()),
+                    iter = ast.Call(
+                        func = ast.Name(id="range",ctx = ast.Load()),
+                        args = arg,
+                        keywords = []),
+                    body = [],
+                    orelse = []
+                )       
+                
+            else: # While loop DO while 
+                # print(stmt.children)
+                loop_control = walk(stmt,F23.Loop_Control)[0]
+                for cont in loop_control.items:
+                    if cont is not None:
+                        loop_control_ast = self.handle_expr(cont)
+                    
+                for_loop = ast.While(
+                    test = loop_control_ast,
+                    body=[],
+                    orelse=[]
+                )
+
             return for_loop
 
     def handle_if_condition(self, condition) -> Union[str,ast.If]:
@@ -1062,10 +1189,9 @@ class F2NP:
                             attr = 'eps',
                             ctx = ast.Load())
                     }
-                    
                     intrinsic_func = instrinsic_exception.get(pattern,None)
                     if not intrinsic_func:
-                        raise NotImplementedError("Not implemented intrinsic exception")
+                        raise NotImplementedError(f"Not implemented intrinsic exception:{pattern}")
                         
                 if func_name:
                     # Once we retieve the function name we need to identify if the it's just normal instrinics or numpy based intrinsic function
@@ -1242,10 +1368,11 @@ class F2NP:
                         elif isinstance(elements,F23.Section_Subscript_List):
                             for child in elements.children:
                                 node = self.handle_expr(child)
-                                if isinstance(node,ast.Subscript):
+                                if isinstance(node,ast.Subscript) and not any(ast_walk(node,ast.Slice)):
+                                    # Need to check if there is ast.Slice
                                     elts.append(ast.Call(func=ast.Name(id='int',ctx=ast.Load()),
-                                                        args = [node],
-                                                        keywords = []))
+                                                args = [node],
+                                                keywords = []))
                                 else:
                                     elts.append(node)
 
@@ -1254,7 +1381,7 @@ class F2NP:
                                 slice=elts[0] if len(elts)== 1 else ast.Tuple(elts=elts,ctx=ast.Load()),
                                 ctx=ast.Load()
                             )
-                        
+                    # print(ast.unparse(ast.fix_missing_locations(subscript)))
                 return subscript
             except Exception:
                 logging.exception(f'Exception in handle_part_ref')
@@ -1616,12 +1743,99 @@ class F2NP:
             # of instrinsic methods inner variables values 
             if len(expr_node.children) > 1:
                 name, dim = expr_node.children
-                if name.string == "DIM" and isinstance(dim,F23.Int_Literal_Constant):# THis case is valid only eleements
+                if name.string.lower() == "dim" and isinstance(dim,F23.Int_Literal_Constant):# THis case is valid only eleements
                     # that use the axis argument but need to handle in which we might not need this but something else such as where etc... 
-                    if int(dim.children[0]) == 1:
-                        return ast.keyword(arg='axis',value = ast.Constant(value = 0))
+                    # thus requires a verification in amont of before translating this
+                    if isinstance(dim, F23.Int_Literal_Constant):
+                        value = int(dim.children[0]) - 1
+                        return ast.keyword(arg='axis',value = ast.Constant(value = value ))
+                    else:
+                        raise NotImplementedError(f'The axis value for DIM is not implemeneted for :{type(dim)}')
                 else:
-                    raise NotImplementedError("not implemented handle_expr: actual_arg_spec")
+                    if "=" in expr_node.tostr():
+                        return self.handle_assignment(expr_node)
+                    else:
+                        raise NotImplementedError(f"not implemented handle_expr: actual_arg_spec for the expression_node:{expr_node}")
+                    
+        elif isinstance(expr_node,(F23.Write_Stmt,F23.Print_Stmt)):
+            if not any(walk(walk(expr_node,F23.Io_Control_Spec),F23.Int_Literal_Constant)):
+                stmt = self.handle_print_stmt(expr_node)
+                return stmt
+        
+        elif isinstance(expr_node, F23.Call_Stmt):
+            return self.handle_call_stmt(expr_node)
+        
+        elif isinstance(expr_node,F23.Subscript_Triplet):
+            # print(f'subscript: {expr_node.children}, {len(expr_node.children)}')
+            shape = []
+            
+            limits = expr_node.tostr().split(':')
+            lb = limits[0]
+            if len(limits) > 1:
+                ub = limits[1]
+                if lb:
+                    lb = lb + '-1'
+                lb = self.simplify_limits(lb)
+                ub = self.simplify_limits(ub)
+                
+                shape.append((f"{lb}:{ub}",expr_node))
+            elif len(limits)==1:
+                shape.append((f"{lb}",expr_node))
+            args = []
+            for sh,node in shape:
+                if ':' in sh and isinstance(node, F23.Subscript_Triplet):
+                    # It's a slice
+                    if sh == ':':
+                        # Simple ':' slice
+                        slice_node = ast.Slice()
+                    else:
+                        # Possibly lb:ub
+                        lb_ub = sh.split(':')
+                        lb = lb_ub[0].strip() or None
+                        ub = lb_ub[1].strip() if len(lb_ub) > 1 else None
+            
+                        slice_node = ast.Slice(
+                            lower=ast.Name(id=lb, ctx=ast.Load()) if lb else None,
+                            upper=ast.Name(id=ub, ctx=ast.Load()) if ub else None
+                        )
+                    args.append(slice_node)
+                else:
+                    # it's a direct index
+                    # expr_node = ast.parse(sh, mode='eval').body
+                    if isinstance(node,ast.AST):
+                        expr_node = node
+                    else:
+                        expr_node = self.handle_expr(node)
+                    args.append(expr_node)
+            
+            return args 
         else:
             # print(expr_node.children)
             raise NotImplementedError(f"Unsupported node type: {type(expr_node)}")
+        
+    def apply_mask_to_rhs(self,node, target_name):
+        """
+        Recursively walk the RHS and replace `target_name` with `target_name[mask]`
+        """
+        if isinstance(node, ast.Name) and node.id == target_name:
+            # Replace with target_name[mask]
+            return ast.Subscript(
+                value=ast.Name(id=target_name, ctx=ast.Load()),
+                slice=ast.Name(id="mask", ctx=ast.Load()),
+                ctx=ast.Load()
+            )
+        # Recursively traverse all fields of the current AST node to ensure that target_name is replaced
+        # even when it appears deep within nested expressions
+        for field, value in ast.iter_fields(node):
+            if isinstance(value, list):
+                new_values = []
+                for item in value:
+                    if isinstance(item, ast.AST):
+                        new_values.append(self.apply_mask_to_rhs(item, target_name))
+                    else:
+                        new_values.append(item)
+                setattr(node, field, new_values)
+            elif isinstance(value, ast.AST):
+                setattr(node, field, self.apply_mask_to_rhs(value, target_name))
+
+        return node

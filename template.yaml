@@ -96,12 +96,17 @@ Python_templates:
             ffile = FortranFile(path, 'r')
             for attr_name in []:
                 attribute = getattr(self,attr_name)
-                if attribute.dtype == np.float64 and isinstance(attribute, np.ndarray):
+                if isinstance(attribute, np.ndarray):
                     arr_shape = attribute.shape
-                    setattr(self,attr_name, ffile.read_reals(np.float64).reshape(arr_shape, order='F'))
-                elif attribute.dtype == np.int32 and isinstance(attribute, np.ndarray):
-                    arr_shape = attribute.shape
-                    setattr(self,attr_name, ffile.read_ints(np.int32).reshape(arr_shape, order='F'))
+                    if attribute.dtype == np.float64:
+                        data = ffile.read_reals(np.float64)
+                    elif attribute.dtype == np.int32 or attribute.dtype == np.bool:
+                        data = ffile.read_ints(np.int32)
+                        
+                    if data.size != np.prod(arr_shape):
+                        continue
+                    value = data.reshape(arr_shape, order='F')
+                    setattr(self, attr_name, value)
             
     Python_read_dummy_template:
         name: "Python_read_dummy_template"
@@ -114,9 +119,14 @@ Python_templates:
                     if isinstance(var, np.ndarray):
                         arr_shape = var.shape
                         if var.dtype == np.float64:
-                            var[:] = ffile.read_reals(np.float64).reshape(arr_shape, order='F')
-                        elif var.dtype == np.int32:
-                            var[:] = ffile.read_ints(np.int32).reshape(arr_shape, order='F')
+                            data = ffile.read_reals(np.float64)
+                            
+                        elif var.dtype == np.int32 or var.dtype == np.bool:
+                            data = ffile.read_ints(np.int32)
+                            
+                        if data.size != np.prod(arr_shape):
+                            continue
+                        var[:] = data.reshape(arr_shape, order='F')
 
     Python_timer_template:
         name: "Python_timer_template"
@@ -143,7 +153,7 @@ Python_templates:
                 arr_shape = value.shape
                 if value.dtype == np.float64:
                     fortran_value = ffile.read_reals(np.float64).reshape(arr_shape, order='F')
-                elif value.dtype == np.int32:
+                elif value.dtype == np.int32 or value.dtype == np.bool:
                     fortran_value = ffile.read_ints(np.int32).reshape(arr_shape, order='F')
                 
                 if np.allclose(value,fortran_value):
