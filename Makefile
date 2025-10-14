@@ -15,7 +15,7 @@ ORCHIDEE_LIBDIR = -L$(WORK)/modipsl_truck_opt/modeles/ORCHIDEE/lib -lorchidee
 
 FFLAGS = $(IOIPSL_INCDIR) $(XIOS_INCDIR) $(ORCHIDEE_INCDIR) $(NETCDF_INCDIR)
 LDFLAGS = $(ORCHIDEE_LIBDIR) $(IOIPSL_LIBDIR) $(XIOS_LIBDIR) $(NETCDF_LIBDIR)
-FFLAGS_COMMON = -Wall -O0 -Kieee -Ktrap=fp #-Mbounds
+FFLAGS_COMMON = -Wall -g -O0 -Kieee -Ktrap=fp -Mbounds
 FFLAGS_CPU = $(FFLAGS_COMMON) -r8 -i4
 FFLAGS_GPU = $(FFLAGS_COMMON) -r8 -i4 -Minfo=acc -ta=tesla:ccall,cc80 -acc=noautopar
 	

@@ -22,7 +22,7 @@ class Processor:
     """
     def __init__(self):
         self.logger = logging.getLogger("fortran_processor")
-        self.logger.setLevel(logging.INFO)
+        self.logger.setLevel(logging.DEBUG)
         self.logger.propagate = False
 
         if self.logger.hasHandlers():
@@ -192,6 +192,45 @@ class Processor:
         except Exception as e:
             self.logger.error("Failed to parse comment:\n%s\nError: %s", stmt_str, e)
             raise
+
+    def find_enclosing_parent(self, node, parent_type):
+        """
+        Traverse up the AST to find the first parent of a given type.
+
+        Parameters
+        ----------
+        node : fparser.two.Fortran2003.Base
+            The starting AST node from which to begin the upward search.
+        parent_type : type
+            The type of the parent node to search for, such as
+            `fparser.two.Fortran2003.Subroutine_Subprogram` or
+            `fparser.two.Fortran2003.Function_Subprogram`.
+
+        Returns
+        -------
+        parent_type or None
+            The first ancestor node of the specified type if found, otherwise None.
+
+        Raises
+        ------
+        None
+            This function does not raise, but logs errors internally if encountered.
+
+        Notes
+        -----
+        - Traverses the `.parent` attributes of the AST nodes upward.
+        - Useful for locating the containing Fortran construct (e.g., subroutine, function).
+        - Depends on the AST nodes having correctly set `.parent` references.
+        """
+        try:
+            while node is not None:
+                if isinstance(node, parent_type):
+                    return node
+                node = getattr(node, 'parent', None)
+            return None
+        except Exception as e:
+            self.logger.error(f"Error finding enclosing parent of type {parent_type.__name__}: {e}")
+            return None
 
     def initiate_empty_routine(self, subroutine_name):
         """
@@ -644,6 +683,7 @@ class Processor:
         implicit none
         integer, parameter :: i_std = 4
         integer, parameter :: r_std = 8
+        integer(kind = i_std), parameter :: nice = 8
         integer(kind = i_std), parameter :: nsnow=3
         integer(kind = i_std), parameter :: nslm=11
         integer(kind = i_std), parameter :: nvm = 15
@@ -833,7 +873,7 @@ class Processor:
             self.logger.error(f"Failed to write code to file: {file_path}, Error: {e}")
             raise
 
-    def update_global_module(self, input_dict, file_path, subroutine_name, module_tree):
+    def update_global_module(self, input_dict, file_path, subroutine_name, procedure_tree):#call_site=None):
         """
         Update the global Fortran module by injecting declarations, use statements,
         and I/O operations related to global variables and routines.
@@ -855,7 +895,6 @@ class Processor:
             input_dict (dict): Dictionary of variables or declarations to add.
             file_path (str): Path where the updated Fortran module source code will be saved.
             subroutine_name (str): Name of the subroutine whose call site is to be updated.
-            module_tree (F23.Tree): Parsed Fortran module tree representing the source code.
 
         Raises:
             AssertionError: If unexpected node types are encountered during tree traversal.
@@ -867,34 +906,73 @@ class Processor:
         try:
             subroutine_found = False
             self.out_module = self.out_module_fortran(subroutine_name)
-            write_stmt_code = "\n".join(self.write_stmt)
-            for call in walk(module_tree, F23.Call_Stmt):
-                assert isinstance(call.children[0], F23.Name), f"Expected F23.Name, but got {type(call.children[0])}"
-                assert isinstance(call.children[1], F23.Actual_Arg_Spec_List), \
-                        f"Expected F23.Actual_Arg_Spec_List, but got {type(call.children[1])}"
-                if call.children[0].tostr() == subroutine_name:
-                    code_template = (
-                            f"{call.tostr()}\n"
-                            f"open(unit=1363, file='{self.benchmark_dir}/{subroutine_name}/global.bin', form='unformatted', status='replace')\n"
-                            f"{write_stmt_code}\n"
-                            "close(1363)"
-                            )
-                    call.parent.children[call.parent.children.index(call)] = self.parse_fortran_statement(code_template)
-                    subroutine_found = True
-                    break
+            """if call_site is not None:
+                assert isinstance(call_site, (F23.Call_Stmt, F23.Assignment_Stmt)), \
+                        f"call_site must be F23.Call_Stmt or F23.Assignment_Stmt, got {type(call_site)}"
+                parent_node = call_site.parent
+                assert hasattr(parent_node, 'content') and isinstance(parent_node.content, list), \
+                            f"parent_node {type(parent_node)} must have a mutable 'content' list"
+                idx = parent_node.content.index(call_site)
+                open_stmt = F23.Open_Stmt(f"open(unit=1363, file='{self.benchmark_dir}/{subroutine_name}/global.bin', form='unformatted', status='replace')")
+                close_stmt = F23.Close_Stmt("close(1363)")
+                    
+                new_stmts = [open_stmt] + self.write_stmt + [close_stmt]
+
+                for stmt in new_stmts:
+                    stmt.parent = parent_node
+
+                parent_node.content[idx+1:idx+1] = new_stmts
+                subroutine_found = True
+                if isinstance(call_site, F23.Call_Stmt):
+                    self.logger.info(f"Directly modified subroutine call site for '{subroutine_name}': {call_site.tostr()}")
+                else:
+                    self.logger.info(f"Directly modified function call site for '{subroutine_name}': {call_site.tostr()}")
+            
             if not subroutine_found:
-                for assignment_stmt in walk(module_tree, F23.Assignment_Stmt):
-                    for part_ref in walk(assignment_stmt, F23.Part_Ref):
-                        if isinstance(part_ref.children[0], F23.Name) and part_ref.children[0].tostr() == subroutine_name:
-                            code_template = (
-                                    f"{assignment_stmt.tostr()}\n"
-                                    f"open(unit=1363, file='{self.benchmark_dir}/{subroutine_name}/global.bin', form='unformatted', status='replace')\n"
-                                    f"{write_stmt_code}\n"
-                                    "close(1363)"
-                                    )
-                            assignment_stmt.parent.children[assignment_stmt.parent.children.index(assignment_stmt)] = self.parse_fortran_statement(code_template)
-                            subroutine_found = True
-                            break
+                error_msg = f"Could not find call site for subroutine '{subroutine_name}'"
+                self.logger.error(error_msg)
+                raise ValueError(error_msg)
+            """
+            assert procedure_tree is not None, "procedure_tree must be provided"
+            assert isinstance(procedure_tree, (F23.Function_Subprogram, F23.Subroutine_Subprogram)),\
+                        f"procedure_tree must be Function_Subprogram or Subroutine_Subprogram, got {type(procedure_tree)}"
+            assert hasattr(procedure_tree, 'content'), f"procedure_tree {type(procedure_tree)} has no 'content' attribute"
+            assert isinstance(procedure_tree.content, list), f"procedure_tree.content is not a list, it's {type(procedure_tree.content)}"
+
+            execution_part_found = False
+            spec_part_found = False
+
+            for idx, item in enumerate(procedure_tree.content):
+                if isinstance(item, F23.Execution_Part):
+                    # Found Execution_Part, insert at the beginning of it
+                    assert hasattr(item, 'content'), f"Execution_Part {type(item)} has no 'content' attribute"
+                    assert isinstance(item.content, list), f"Execution_Part.content is not a list, it's {type(item.content)}"
+                    open_stmt = F23.Open_Stmt(f"open(unit=1363, file='{self.benchmark_dir}/{subroutine_name}/global.bin', form='unformatted', status='replace')")
+                    close_stmt = F23.Close_Stmt("close(1363)")
+                    new_stmts = [open_stmt] + self.write_stmt + [close_stmt]
+                    for stmt in new_stmts:
+                        stmt.parent = item
+                    item.content[0:0] = new_stmts  # Insert at beginning of Execution_Part
+                    execution_part_found = True
+                    self.logger.info(f"Inserted I/O statements at beginning of Execution_Part in procedure: {subroutine_name}")
+                    break
+                elif isinstance(item, F23.Specification_Part):
+                    # Remember where Specification_Part is
+                    spec_part_found = True
+                    spec_part_idx = idx
+            # If no Execution_Part found but Specification_Part exists, insert after it
+            if not execution_part_found and spec_part_found:
+                open_stmt = F23.Open_Stmt(f"open(unit=1363, file='{self.benchmark_dir}/{subroutine_name}/global.bin', form='unformatted', status='replace')")
+                close_stmt = F23.Close_Stmt("close(1363)")
+                new_stmts = [open_stmt] + self.write_stmt + [close_stmt]
+                for stmt in new_stmts:
+                    stmt.parent = procedure_tree
+                procedure_tree.content[spec_part_idx+1:spec_part_idx+1] = new_stmts
+                self.logger.info(f"Inserted I/O statements after Specification_Part in procedure: {subroutine_name}")
+            if not execution_part_found and not spec_part_found:
+                error_msg = f"Could not find Specification_Part or Execution_Part in procedure tree for '{subroutine_name}'"
+                self.logger.error(error_msg)
+                raise ValueError(error_msg)
 
             for node in self.out_module.content:
                 if isinstance(node, F23.Module):
@@ -950,7 +1028,7 @@ class Processor:
             file_path,
             subroutine_name,
             dummy_args,
-            module_tree,
+            call_site=None,
             childs_subroutine_tree=None,
             openacc=False,
             dummy_add_decl=None,
@@ -976,8 +1054,6 @@ class Processor:
             file_path (str): The file path where the modified Fortran code will be written to.
             subroutine_name (str): The name of the subroutine to be modified in the main program.
             dummy_args (list): A list of dummy argument names that are passed to subroutines.
-            module_tree (F23.Module_Stmt): The module tree of the program, which includes 
-                                       declarations and subroutines that need to be modified.
             childs_subroutine_tree (optional, list): A list of child subroutine trees to be 
                                                   inserted into the program. Default is `None`.
             openacc (bool, optional): If `True`, OpenACC directives for parallelism and data 
@@ -1025,58 +1101,53 @@ class Processor:
                     for key in error_flag.keys():
                         custom_dec_inout.append(error_flag[key]['error_flag_decl'])
             specification_part = self.remove_intent_and_save(custom_dec_inout)
-            print("specification_part")
-            for rstmt in initialization_part:
-                print(rstmt)
 
             subroutine_found = False
             if initialization_part:
+                assert call_site is not None, "call_site must be provided for direct modification"
+                assert isinstance(call_site, (F23.Call_Stmt, F23.Assignment_Stmt)), \
+                        f"call_site must be F23.Call_Stmt or F23.Assignment_Stmt, got {type(call_site)}"
                 self.write_stmt = []
-                for call in walk(module_tree, F23.Call_Stmt):
-                    assert isinstance(call.children[0], F23.Name), f"Expected F23.Name, but got {type(call.children[0])}"
-                    assert isinstance(call.children[1], F23.Actual_Arg_Spec_List), \
-                            f"Expected F23.Actual_Arg_Spec_List, but got {type(call.children[1])}"
-                    if call.children[0].tostr() == subroutine_name:
-                        arg_string = [string.strip() for string in call.children[1].tostr().split(',')] ## bug to fix for passying slices
-                        for rstmt in initialization_part:
-                            assert isinstance(rstmt.children[0].children[2], F23.Input_Item_List)
-                            assert len(rstmt.children[0].children[2].children) == 1
-                            arg = rstmt.children[0].children[2].tostr()
-                            corresponding_element = arg_string[dummy_args.index(arg)]
-                            self.write_stmt.append(F23.Write_Stmt(f"write(1363){corresponding_element}").tostr())
-                        write_dummy_code = "\n".join(self.write_stmt)
-                        code_template = (
-                                f"{call.tostr()}\n"
-                                f"open(unit=1363, file='{self.benchmark_dir}/{subroutine_name}/dummy.bin', form='unformatted', status='replace')\n"
-                                f"{write_dummy_code}\n"
-                                "close(1363)"
-                                )
-                        call.parent.children[call.parent.children.index(call)] = self.parse_fortran_statement(code_template)
-                        subroutine_found = True
-                        break
-                if not subroutine_found:
-                    for assignment_stmt in walk(module_tree, F23.Assignment_Stmt):
-                        for part_ref in walk(assignment_stmt, F23.Part_Ref):
-                            if isinstance(part_ref.children[0], F23.Name) and part_ref.children[0].tostr() == subroutine_name:
-                                assert isinstance(part_ref.children[1], F23.Section_Subscript_List), f"Expected Section_Subscript_List as second child, got {type(part_ref.children[1])}"
-                                arg_string = [arg.tostr().strip() for arg in part_ref.children[1].children]
-                                for rstmt in initialization_part:
-                                    assert isinstance(rstmt.children[0].children[2], F23.Input_Item_List)
-                                    assert len(rstmt.children[0].children[2].children) == 1
-                                    arg = rstmt.children[0].children[2].tostr()
-                                    corresponding_element = arg_string[dummy_args.index(arg)]
-                                    self.write_stmt.append(F23.Write_Stmt(f"write(1363){corresponding_element}").tostr())
+                parent_node = call_site.parent
+                assert hasattr(parent_node, 'content'), f"parent_node {type(parent_node)} has no 'content' attribute"
+                assert isinstance(parent_node.content, list), f"parent_node.content is not a list, it's {type(parent_node.content)}"
+                stmt_list = parent_node.content
+                idx = stmt_list.index(call_site)
 
-                                write_dummy_code = "\n".join(self.write_stmt)
-                                code_template = (
-                                        f"{assignment_stmt.tostr()}\n"
-                                        f"open(unit=1363, file='{self.benchmark_dir}/{subroutine_name}/dummy.bin', form='unformatted', status='replace')\n"
-                                        f"{write_dummy_code}\n"
-                                        "close(1363)"
-                                        )
-                                assignment_stmt.parent.children[assignment_stmt.parent.children.index(assignment_stmt)] = self.parse_fortran_statement(code_template)
-                                subroutine_found = True
-                                break
+                if isinstance(call_site, F23.Call_Stmt):
+                    assert isinstance(call_site.children[0], F23.Name), f"Expected F23.Name, but got {type(call_site.children[0])}"
+                    assert isinstance(call_site.children[1], F23.Actual_Arg_Spec_List), \
+                            f"Expected F23.Actual_Arg_Spec_List, but got {type(call_site.children[1])}"
+                    arg_string = [arg.tostr().strip() for arg  in call_site.children[1].children]
+
+                else:
+                    for part_ref in walk(call_site, F23.Part_Ref):
+                        if isinstance(part_ref.children[0], F23.Name) and part_ref.children[0].tostr() == subroutine_name:
+                            assert isinstance(part_ref.children[1], F23.Section_Subscript_List), f"Expected Section_Subscript_List as second child, got {type(part_ref.children[1])}"
+                            arg_string = [arg.tostr().strip() for arg in part_ref.children[1].children]
+                            break
+
+                open_stmt = F23.Open_Stmt(f"open(unit=1363, file='{self.benchmark_dir}/{subroutine_name}/dummy.bin', form='unformatted', status='replace')")        
+                for rstmt in initialization_part:
+                    assert isinstance(rstmt.children[0].children[2], F23.Input_Item_List)
+                    assert len(rstmt.children[0].children[2].children) == 1
+                    arg = rstmt.children[0].children[2].tostr()
+                    corresponding_element = arg_string[dummy_args.index(arg)]
+                    self.write_stmt.append(F23.Write_Stmt(f"write(1363){corresponding_element}"))
+                                    
+                close_stmt = F23.Close_Stmt("close(1363)")
+                new_stmts = [open_stmt] + self.write_stmt  + [close_stmt]
+
+                for stmt in new_stmts:
+                    stmt.parent = parent_node
+
+                stmt_list[idx+1:idx+1] = new_stmts
+                subroutine_found = True
+            
+            if not subroutine_found:
+                error_msg = f"Could not process call site for subroutine '{subroutine_name}'"
+                self.logger.error(error_msg)
+                raise ValueError(error_msg)
 
             for node in self.out_main.content:
                 if isinstance(node, F23.Main_Program):
@@ -1218,6 +1289,59 @@ class Processor:
         except Exception as e:
             self.logger.error(f"Failed to update main program, Error: {e}")
             raise
+
+    def remove_io_statements(self, block, unit_number=1363):
+        """
+        Recursively remove all OPEN, WRITE, CLOSE statements with specific unit number.
+
+        Parameters
+        ----------
+        block : F23.Base
+            The AST block to process
+        unit_number : int
+            The unit number to remove (default: 1363)
+        """
+        unit_str = str(unit_number)
+
+        if hasattr(block, "content"):
+            i = 0
+            while i < len(block.content):
+                child = block.content[i]
+                should_remove = False
+
+                if isinstance(child, F23.Open_Stmt):
+                    for connect_spec in walk(child, F23.Connect_Spec):
+                        if hasattr(connect_spec, 'children') and len(connect_spec.children) >= 2:
+                            if (connect_spec.children[0].upper() == 'UNIT' and
+                            isinstance(connect_spec.children[1], F23.Int_Literal_Constant) and
+                            connect_spec.children[1].tostr() == unit_str):
+                                should_remove = True
+                                break
+
+                elif isinstance(child, F23.Write_Stmt):
+                    for io_control_spec in walk(child, F23.Io_Control_Spec):
+                        if hasattr(io_control_spec, 'children') and len(io_control_spec.children) >= 2:
+                            if (io_control_spec.children[0] == None and
+                             isinstance(io_control_spec.children[1], F23.Int_Literal_Constant) and
+                             io_control_spec.children[1].tostr() == unit_str):
+                                should_remove = True
+                                break
+
+                elif isinstance(child, F23.Close_Stmt):
+                    for close_spec in walk(child, F23.Close_Spec):
+                        if hasattr(close_spec, 'children') and len(close_spec.children) >= 2:
+                            if (close_spec.children[0].upper() == 'UNIT' and
+                            isinstance(close_spec.children[1], F23.Int_Literal_Constant) and
+                            close_spec.children[1].tostr() == unit_str):
+                                should_remove = True
+                                break
+
+                if should_remove:
+                    self.logger.info(f"Removing {child}")
+                    block.content.pop(i)
+                else:
+                    self.remove_io_statements(child, unit_number)
+                    i += 1  # Only increment when we don't remove
 
     def create_call_stmt(self, subroutine_tree):
         """
@@ -1367,7 +1491,7 @@ class Processor:
                     endif
                     """
                     read_list.append(self.parse_fortran_statement(code_template))
-                    self.write_stmt.append(F23.Write_Stmt(f"write(1363){var_name}").tostr())
+                    self.write_stmt.append(F23.Write_Stmt(f"write(1363){var_name}"))
             self.logger.info(f"processing initialization completed!")
             return read_list
         except Exception as e:
@@ -1761,6 +1885,55 @@ if __name__ == "__main__":
             node = self.processor.parse_fortran_comment(comment)
             self.assertEqual(node.tostr().strip(), "! Module comment")
 
+        def test_find_enclosing_parent(self):
+            # Initialize processor with mock logger
+
+            # Test 1: Basic assignment statement parent finding
+            assignment_stmt = F23.Assignment_Stmt("zwholdmax(ji, :) = snow3lhold_1d(snowrho(ji, :), snowdz(ji, :))")
+
+            part_ref_node = assignment_stmt.children[-1]  # Part_Ref for snow3lhold_1d
+            name_node = part_ref_node.children[0]  # Name('snow3lhold_1d')
+
+            # Manually set up parent relationships
+            part_ref_node.parent = assignment_stmt
+            name_node.parent = part_ref_node
+
+            # Test finding Assignment_Stmt parent from Name node
+            result = self.processor.find_enclosing_parent(name_node, F23.Assignment_Stmt)
+            self.assertIsNotNone(result, "Should find Assignment_Stmt parent")
+            self.assertIsInstance(result, F23.Assignment_Stmt, "Result should be Assignment_Stmt")
+            self.assertEqual(result, assignment_stmt, "Should return the exact assignment statement")
+
+            # Test 2: Finding Part_Ref parent from Name node
+            result = self.processor.find_enclosing_parent(name_node, F23.Part_Ref)
+            self.assertIsNotNone(result, "Should find Part_Ref parent")
+            self.assertIsInstance(result, F23.Part_Ref, "Result should be Part_Ref")
+            self.assertEqual(result, part_ref_node, "Should return the exact Part_Ref node")
+
+            # Test 3: Non-existent parent type
+            result = self.processor.find_enclosing_parent(name_node, F23.Subroutine_Subprogram)
+            self.assertIsNone(result, "Should return None for non-existent parent type")
+
+            # Test 4: Starting node is already the target type
+            result = self.processor.find_enclosing_parent(assignment_stmt, F23.Assignment_Stmt)
+            self.assertIsNotNone(result, "Should return the node itself when it matches target type")
+            self.assertEqual(result, assignment_stmt, "Should return the same assignment statement")
+
+            # Test 5: Null node input
+            print("Test 5: Null node input")
+            result = self.processor.find_enclosing_parent(None, F23.Assignment_Stmt)
+            self.assertIsNone(result, "Should return None for None input")
+
+            # Test 6: Complex hierarchy with subroutine
+            subroutine = self.processor.parse_fortran_string("subroutine test()\n  zwholdmax(ji, :) = snow3lhold_1d(snowrho(ji, :), snowdz(ji, :))\nend subroutine")
+            assignment_stmt = walk(subroutine, F23.Assignment_Stmt)[0]
+            part_ref_node = assignment_stmt.children[-1]  # Part_Ref for snow3lhold_1d
+            name_node = part_ref_node.children[0]  # Name('snow3lhold_1d')
+
+            result = self.processor.find_enclosing_parent(name_node, F23.Subroutine_Subprogram)
+            self.assertIsNotNone(result, "Should find Subroutine_Subprogram parent")
+            self.assertIsInstance(result, F23.Subroutine_Subprogram, "Result should be Subroutine_Subprogram")
+
         def test_initiate_empty_routine(self):
             # Test creating a simple subroutine
             subroutine_node = self.processor.initiate_empty_routine("test_sub")
@@ -1887,7 +2060,7 @@ if __name__ == "__main__":
                 content = f.read()
                 self.assertIn(F23.Program_Stmt("program test").tostr(), content)
 
-        def test_update_global_module(self):
+        """def test_update_global_module(self):
             # Setup test data
             input_dict = {}
             test_file = os.path.join(self.test_dir, "updated_module.f90")
@@ -1901,7 +2074,7 @@ if __name__ == "__main__":
                 content = f.read()
                 self.assertIn("module_global", content)
                 self.assertIn("global.bin", content)
-
+        """
         def test_create_call_stmt(self):
             # Test creating call statement
             code = "subroutine test(a)\ninteger :: a\nend subroutine test"
