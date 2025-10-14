@@ -1,5 +1,6 @@
-from typing import Dict, List,Literal,Optional,Generator,Tuple,Union
+from typing import Dict, List,Literal,Optional,Tuple,Union
 from fparser.two import Fortran2003 as F23
+from collections import defaultdict
 from fparser.two.utils import walk
 from string import Template
 import subprocess
@@ -37,7 +38,7 @@ class Transformer:
         self.ignore_case = ignore_case          # List of string of variables or functions names that are to be ignored
         self.isolator = isolator                # An instance of isolator class just used in the method retrieve_variable to retrieve variable order 
         self.extractor = extractor              # An instance of extractor class 
-        self.cls_mode = None                    # Defines if we should create a class global module or not
+        self.cls_mode = False                   # Defines if we should create a class global module or not
         self.config_path = config_path          # Path to the template.yaml file 
         self.for_loop = False                   # If we want to create with either using using a for loop for the reading binary files 
         self.global_state = False               # Allows to define if the given code template is for global or not
@@ -124,58 +125,80 @@ class Transformer:
             logging.exception(f"Exception in get_imports_from_specs")
             return None 
     
-    def create_instances(self, nodes:List) -> List[ast.Assign]:
+    def create_instances(self, nodes: List, self_mode: bool = False) -> List[ast.Assign]:
         """
         Create instance assignment nodes for given class definitions.
 
-        Generates `ast.Assign` nodes that instantiate classes based on the
-        provided `ast.ClassDef` nodes.
+        Depending on `self_mode`, it generates either:
+        - `variable = Class()` or
+        - `self.variable = Class()`
 
         Parameters
         ----------
-        nodes : list 
+        nodes : list
             List of AST nodes representing class definitions.
+        self_mode : bool
+            If True, generates `self.variable = Class()`.
+            If False, generates `variable = Class()`.
 
         Returns
         -------
         instance_nodes: list
             List of `ast.Assign` nodes representing the created class instances.
         """
-
-        # print(functions_def)
         instance_nodes = []
         try:
             for node in nodes:
-                if isinstance(node, ast.ClassDef):
-                    instance_name = get_instance_name(node.name)
-                    instance_node = ast.Assign(
-                        targets=[ast.Name(id=instance_name, ctx=ast.Store())],
-                        value=ast.Call(
-                            func=ast.Name(id=node.name, ctx=ast.Load()),
-                            args=[],
-                            keywords=[]
-                        )
-                    )
-                    instance_nodes.append(instance_node)
-                else:
+                if not isinstance(node, ast.ClassDef):
                     raise ValueError(f"Node is not an ast.ClassDef: {node}")
+
+                instance_name = get_instance_name(node.name)
+
+                # Create Class() constructor call
+                constructor_call = ast.Call(
+                    func=ast.Name(id=node.name, ctx=ast.Load()),
+                    args=[],
+                    keywords=[]
+                )
+
+                # Choose target based on self_mode
+                if self_mode:
+                    target = ast.Attribute(
+                        value=ast.Name(id='self', ctx=ast.Load()),
+                        attr=instance_name,
+                        ctx=ast.Store()
+                    )
+                else:
+                    target = ast.Name(id=instance_name, ctx=ast.Store())
+
+                assign_node = ast.Assign(
+                    targets=[target],
+                    value=constructor_call
+                )
+
+                instance_nodes.append(assign_node)
+
             return instance_nodes
 
         except Exception:
-            logging.exception(f"Failed to create instance nodes in create_instances.")
+            logging.exception("Failed to create instance nodes in create_instances.")
             return None
+
     
-    def create_cls_info(self, out_module: ast.Module) -> Dict:
+    def create_cls_info(self, out_module: ast.Module,instance_node:List = None, self_mode:bool = False) -> Dict:
         """
         Retrieve class information including attributes and methods from an AST module.
 
         Parses the provided `ast.Module` and extracts structured information about each class defined within it. The result is a nested dictionary where each key is a
-        class name (or instance identifier), and the value is another dictionary with two keys: `attributes` and `methods`.
+        class name (or instance identifier), and the value is another dictionary with two keys: `attributes` and `methods`. This also takes into account the other class
+        instances intialized inside the class itself. 
 
         Parameters
         ----------
         out_module : ast.Module
             The abstract syntax tree (AST) of the Python module to analyze.
+        instance_node : List
+            Instances nodes of classes intialized inside the current class. 
 
         Returns
         -------
@@ -202,6 +225,7 @@ class Transformer:
                 class_name = class_def.name
                 attributes = {}
                 methods = {}
+                instances = {}
         
                 # Collect instance attributes (self.x)
                 for assign in ast_walk(class_def, ast.Assign):
@@ -212,25 +236,41 @@ class Transformer:
                             target.value.id == 'self'
                         ):
                             # attributes.add(target.attr)
-                
+                            if isinstance(assign.value, ast.Call) and isinstance(assign.value.func, ast.Name) and instance_node:
+                                object_class_name = assign.value.func.id   # "Global_module_hydrol_vegupd"
+                                for instance in instance_node:
+                                    if instance.value.func.id == object_class_name:
+                                        instances[target.attr] = {
+                                            "class_name": instance.targets[0] ,
+                                            "attributes": {},  # will fill later
+                                            "methods": {} 
+                                        }
                             # case: self.x = np.int32(val) or np.float64(val)
                             if isinstance(assign.value, ast.Call) and isinstance(assign.value.func, ast.Attribute):
                                 if assign.value.func.attr in ['int32', 'float64']:
-                                    evaluated_value = safe_eval_expr(assign.value.args[0])
-                                    if evaluated_value is None:
-                                        raise ValueError(f'evaluated_value is None')
-                                    
-                                    attributes[target.attr] = [
-                                        evaluated_value,
-                                        assign.value.func.attr       # dtype
-                                    ]
+                                    if isinstance(assign.value.args[0], (ast.BinOp,ast.Constant)):
+                                        
+                                        evaluated_value = safe_eval_expr(assign.value.args[0])
+                                        if evaluated_value is None:
+                                            raise ValueError(f'evaluated_value is None')
+                                        
+                                        attributes[target.attr] = [
+                                            evaluated_value,
+                                            assign.value.func.attr       # dtype
+                                        ]
+                                    else:
+                                        attributes[target.attr] = [
+                                            assign.value.args[0],
+                                            assign.value.func.attr       # dtype
+                                        ]
+                                        
                                 elif assign.value.func.attr in ['bool'] and isinstance(assign.value.args[0], ast.Constant):
                                     attributes[target.attr] = [
                                         assign.value.args[0].value,  # constant value
                                         assign.value.func.attr       # dtype
                                     ]
                                 # case: self.x = np.zeros([...], dtype=np.float64)
-                                elif assign.value.func.attr == 'zeros':
+                                elif assign.value.func.attr in ['zeros','array'] :
                                     # using cls.all_array_info to retrieve all the array info for the global elements
                                     array_info = self.extractor.all_array_info[self.subroutine_name].get(target.attr)
                                     if array_info is None:
@@ -246,16 +286,34 @@ class Transformer:
                                                 dtype = kw.value.id
 
                                     attributes[target.attr] = [array_info,dtype]
-            
+                            # Case of self.x = self.y 
+                            if isinstance(assign.value,(ast.Attribute)):
+                                # First we verify that the value is that it's an attribute and not an array being affected
+                                for child in ast.walk(assign.value):
+                                    if isinstance(child,ast.Name):
+                                        dtype = attributes.get(assign.value.attr)
+                                        if dtype:
+                                            attributes[target.attr] = [
+                                                    assign.value.attr,  # constant value
+                                                    dtype[1] # THis is because we the self.y is usually present before the self.x thus the type of self.x is that of self.y
+                                                ]
                 # Collect methods (def method(self): ...)
                 for node in class_def.body:
                     if isinstance(node, ast.FunctionDef):
                         methods[node.name] = node
-        
-                class_members[class_name] = {
-                    'attributes': attributes,
-                    'methods': methods
-                }
+
+                if not instance_node:
+                    class_members[class_name] = {
+                        'attributes': attributes,
+                        'methods': methods,
+                    }
+                else:
+                    class_members[class_name] = {
+                        'attributes': attributes,
+                        'methods': methods,
+                        'instances': instances
+                    }
+
         
             # Create imports
             specs = [('module_global', [class_name]) for class_name in class_members]
@@ -274,17 +332,26 @@ class Transformer:
             # Match instance nodes to class names
             for class_def, inst_node in zip(class_defs, instance_nodes):
                 class_name = class_def.name
-        
+               
                 if isinstance(inst_node, ast.Assign):
                     target = inst_node.targets[0]
                     if isinstance(target, ast.Name):
-                        instance_name = target.id
-                        cls_info[class_name] = {
-                            instance_name: {
-                                'attributes': class_members[class_name]['attributes'],
-                                'methods': class_members[class_name]['methods']
+                        instance_name = target.id if not self_mode else 'self'
+                        if instance_node:
+                            cls_info[class_name] = {
+                                instance_name: {
+                                    'attributes': class_members[class_name]['attributes'],
+                                    'methods': class_members[class_name]['methods'],
+                                    'instances': class_members[class_name]['instances']
+                                }
                             }
-                        }
+                        else:
+                            cls_info[class_name] = {
+                                instance_name: {
+                                    'attributes': class_members[class_name]['attributes'],
+                                    'methods': class_members[class_name]['methods'],
+                                }
+                            }
                     else:
                         raise AttributeError(f"Unexpected target type in assignment: {ast.dump(target)}")
                 else:
@@ -359,16 +426,22 @@ class Transformer:
                 if method_name:
                     if isinstance(instance_node.value, ast.Call) and isinstance(instance_node.value.func, ast.Name):
                         class_name = instance_node.value.func.id
-                        instance_name = instance_node.targets[0].id
-                
+                        instance_method = None
+                        instance_name = instance_node.targets[0].id if isinstance(instance_node.targets[0], ast.Name) else instance_node.targets[0].attr
+                        if isinstance(instance_node.targets[0], ast.Name):
+                            instance_method = instance_name
+                        elif isinstance(instance_node.targets[0], ast.Attribute):
+                            instance_method = instance_node.targets[0] # this is for the cases of self.gm.method_name() or self.method_name()
+
                         methods = cls_info.get(class_name, {}).get(instance_name, {}).get("methods", None)
-            
+                        
                         if methods:
                             for method in method_name:
                                 method_ast = methods.get(method) # THis is to check if the method to be added is present inside the class methods, thus avoiding to call ghost methods
                                 if method_ast:
-                                    expression = self.create_call_statements(method_ast,instance_name)
+                                    expression = self.create_call_statements(method_ast,instance_method)
                                     functions_def.body.insert(insert_idx, expression)
+                                    insert_idx += 1
                                 else:
                                     raise ValueError(f'Given method name:{method} is not present among the methods of this class:{class_name}')
                         elif method_name and not methods:
@@ -379,7 +452,7 @@ class Transformer:
             logging.exception(f'Exception Error in add_instance')
             raise
         
-    def create_call_statements(self, function_ast: ast.FunctionDef, instance_name:Optional[str]=None) -> ast.Expr | ast.Assign:
+    def create_call_statements(self, function_ast: ast.FunctionDef, instance:Optional[Union[str,ast.AST]]=None) -> ast.Expr | ast.Assign:
         """
         Generate a function or method call AST node with appropriate arguments and return handling.
 
@@ -425,10 +498,18 @@ class Transformer:
                     keywords=[]
                 )
             else:
+                if instance is None:
+                    value = ast.Name(id="self", ctx=ast.Load())
+                elif isinstance(instance, str):
+                    value = ast.Name(id=instance, ctx=ast.Load())
+                elif isinstance(instance, ast.AST):
+                    value = instance
+                else:
+                    raise TypeError(f"Unexpected type for instance: {type(instance)}")
                 
                 call_expr = ast.Call(
                     func = ast.Attribute(
-                        value = ast.Name(id=instance_name if instance_name else 'self',ctx=ast.Load()),
+                        value = value,
                         attr = function_name,
                         ctx = ast.Load()
                     ),
@@ -501,7 +582,7 @@ class Transformer:
             return None
     
     
-    def correct_function(self, function_def:ast.FunctionDef,cls_info:Dict,timer_tree:ast.AST=None) -> None:
+    def correct_function(self, function_def:ast.FunctionDef,cls_info:Dict,timer_tree:ast.AST=None,subroutine_key:str=None,parent_mode:bool=False) -> None:
         """
         Update a translated Python function (from Fortran) by applying argument, decorator, and return modifications.
 
@@ -532,6 +613,9 @@ class Transformer:
         timer_tree : ast.AST
             The AST subtree representing the `@timer` decorator to be optionally inserted.
 
+        parent_mode : bool
+            Parent mode allows us to ensure that the arguments(scalars) are not modified to ensure that 
+        
         Returns
         -------
         None
@@ -544,18 +628,93 @@ class Transformer:
         module_names = list(cls_info.keys())
         try:
             for module_name in module_names:
-                
+                filtered_args = []
+                common_args = set()
                 instance_name = list(cls_info[module_name].keys())[0]
                 global_attr = cls_info[module_name][instance_name]["attributes"]
-            
-                # First we check that among the arguments that we don't have a global instance if so we replace it with the class instance even if 
-                # we have more than one
-                args_list = [args.arg for args in function_def.args.args]
-                common_args = set(args_list) & set(global_attr)
-                if common_args:
-                    function_def.args.args = [arg for arg in function_def.args.args if arg.arg not in common_args]
-                    function_def.args.args.insert(0,ast.arg(arg=instance_name))
+
+                # THE Dummy arg list contains the supposed args to the function itself
+                # Step 1: Get dummy args and actual argument positions
+                dummy_arg_list = self.extractor.dummy_arg_list[subroutine_key]
+                arg_poses = []
+                for args_list in self.extractor.actual_arg_spec_list[subroutine_key]:
+                    for i, arg in enumerate(args_list):
+                        if arg not in dummy_arg_list:
+                            arg_poses.append(i)
+                # Step 2: Prepare for filtering arguments from function_def
+                args_list = [arg.arg for arg in function_def.args.args]
+                common_global_args = set(args_list) & set(global_attr) # we first retrieve the common global args ffrom the class attributes itself
+                # Then check for the atttributes coming form the object classes 
+                common_other_object_args = set()
+                other_object_instances = cls_info[module_name][instance_name].get('instances', {}) # We check if the the actual class has any other attributes
+                if other_object_instances:
+                    for _, instance in other_object_instances.items():
+                        other_attrs = set(instance.get('attributes', []))
+                        matching_args = set(args_list) & other_attrs
+                        if matching_args:
+                            common_other_object_args |= matching_args
+                common_args = common_global_args | common_other_object_args
+                
+                if not arg_poses and common_args:
+                    function_def.args.args = [arg for arg in function_def.args.args if arg.arg not in common_args and arg.arg != 'self']
                     
+                elif arg_poses and common_args:
+                    for i, arg in enumerate(function_def.args.args):
+                        arg_name = arg.arg
+                        if i in arg_poses:
+                            # Argument is used at this position
+                            filtered_args.append(arg)
+                        elif arg_name not in common_args and arg_name != 'self':
+                            filtered_args.append(arg)
+                    function_def.args.args = filtered_args
+                if instance_name == 'self': # Self should always be placed first 
+                    function_def.args.args.insert(0,ast.arg(arg=instance_name))
+                else:
+                    function_def.args.args.append(ast.arg(arg=instance_name))
+                
+                call_indices = defaultdict(int)
+                # walk through and modify function call nodes if present
+                for node in ast_walk(function_def, ast.Expr):
+                    if (isinstance(node.value, ast.Call) and isinstance(node.value.func, ast.Name)):
+                        func_name = node.value.func.id
+                        if func_name not in self.extractor.call_within_sub[self.subroutine_name]:
+                            continue
+
+                        method = cls_info[module_name][instance_name]['methods'].get(func_name)
+                        if not method:
+                            continue
+
+                        i = call_indices[func_name] # since by default all the elements are at 0 
+                        call_indices[func_name] += 1  # increment for next time when we encounter the function itself
+
+                        indexes = []
+                        for arg in method.args.args:
+                            if arg.arg in self.extractor.dummy_arg_list[func_name]:
+                                index = self.extractor.dummy_arg_list[func_name].index(arg.arg)
+                                indexes.append(index)
+
+                        try:
+                            args = [
+                                ast.Name(id=self.extractor.actual_arg_spec_list[func_name][i][idx], ctx=ast.Load())
+                                for idx in indexes
+                            ]
+                            node.value.args = args
+                            # print(ast.unparse(ast.fix_missing_locations(node)))
+
+                        except (IndexError, KeyError) as e:
+                            logging.error(f"Error mapping arguments for call to '{func_name}' at index {i}: {e}")
+
+                scalar_variables = set()
+                if parent_mode:
+                    func_name = function_def.name 
+                    method = cls_info[module_name][instance_name]['methods'].get(func_name)
+                    if not method:
+                        continue
+
+                    for arg in method.args.args:
+                        if arg.arg in self.extractor.scalar_variables[func_name]:
+                            scalar_variables.add(arg.arg)
+
                 # This is to add the timer decorator in the case we need to measure the execution time of the function
                 function_def.decorator_list = [ast.Name(id=next(ast_walk(timer_tree,ast.FunctionDef)).name,ctx=ast.Load())] if timer_tree else []
             
@@ -597,7 +756,13 @@ class Transformer:
                     cons_var.add(value[0])
 
             # Now we visit each node and adjust the subscripts 
-            adjust_indices = AdjustIndices(cons_var,self.extractor.all_array_info[self.subroutine_name],cls_info[module_name][instance_name]["attributes"])
+            sub_name = subroutine_key if subroutine_key else self.subroutine_name
+            # We need to send the all_array_info for two reasons: one being the fact that it also contains the local prsent arrays and the dimesnion info
+            # and the second being that these arrays are sent as another when we call the anotehr function locally inside another function thus ru_infilt becomes ru_infilt_ns when 
+            # we call hydrol_soil_infilt inside the hydrol_soil
+            kwargs = {"exclude_index": scalar_variables} if scalar_variables else {} # This is to exclude the variables that are sent as arguments(scalars) and don't need to be modified
+            # But when we isolate only the children only then we need to ensure that we the arguments which might be used inside the arguments 
+            adjust_indices = AdjustIndices(cons_var,self.extractor.all_array_info[sub_name],cls_info[module_names[-1]][instance_name],**kwargs)
             for element in function_def.body:
                 adjust_indices.visit(element)
             
@@ -701,7 +866,7 @@ class Transformer:
         """
         self.variable_order = []
         try:
-            for read_dec in [self.isolator.processor_sp.reads_in_decleration_routine,self.isolator.processor_sp.reads_in_read_routine]:
+            for read_dec in [self.isolator.processor.reads_in_decleration_routine,self.isolator.processor.reads_in_read_routine]:
                 read_stmt = walk(read_dec,F23.Input_Item_List)
                 for item in read_stmt:
                     self.variable_order.append(item.children[0].string)
@@ -740,7 +905,7 @@ class Transformer:
         kind_map = {
             'REAL': 'np.float64',  
             'INTEGER': 'np.int32',
-            'LOGICAL': 'np.int32'
+            'LOGICAL': 'np.bool'
         }
 
         target = None
@@ -831,21 +996,34 @@ class Transformer:
                                 _,value = initialization.children
                             
                             if 'PARAMETER' in attr_spec:
-                                
                                 if intrinsic_type_spec.children[0] in ['INTEGER', 'REAL'] and not kind_selec: 
                                     # These are only for element thats has parameters and 
                                     # has no kind(KIND argument) inside
                                     # Example case : INTEGER, PARAMETER :: a = 6
                                     # Perhaps removable since even with/without PARAMETER argument in attribute specification this will changed similarly to INTEGER :: a = 6
                                     if value is not None:
-                                        num_var = float(value.string) if intrinsic_type_spec[0].children[0] == "REAL" else int(value.string)
-                                        assign = ast.Assign(
-                                                    targets=[target],
-                                                    value=ast.Call( func=ast.Attribute(value=ast.Name(id=idx, ctx=ast.Load()), attr=attr, ctx=ast.Load()),
-                                                                args=[ast.Constant(value=num_var)],
-                                                                keywords = []
-                                                            )
+                                        if not isinstance(value,F23.Name):
+                                            num_var = float(value.string) if intrinsic_type_spec[0].children[0] == "REAL" else int(value.string)
+                                            assign = ast.Assign(
+                                                        targets=[target],
+                                                        value=ast.Call( func=ast.Attribute(value=ast.Name(id=idx, ctx=ast.Load()), attr=attr, ctx=ast.Load()),
+                                                                    args=[ast.Constant(value=num_var)],
+                                                                    keywords = []
+                                                                )
+                                                    )
+                                        else:
+                                            if cls_mode:
+                                                name_val = ast.Attribute(
+                                                    value=ast.Name(id="self",ctx=ast.Load()),
+                                                    attr=value.string,
+                                                    ctx= ast.Load()
                                                 )
+                                            else:
+                                                name_val = ast.Name(id=value.string,ctx=ast.Load())
+                                            assign = ast.Assign(
+                                                        targets=[target],
+                                                        value= name_val
+                                                    )
                                     else:
                                         
                                         assign = ast.Assign(
@@ -858,35 +1036,63 @@ class Transformer:
                                     ast_nodes.append(assign)
                                     # print(f'Dtype:{intrinsic_type_spec}, value:{entity_decl_list}')
                                 elif intrinsic_type_spec.children[0] in ['INTEGER', 'REAL'] and kind_selec: # IF the keyword KIND is present  
-                                    
                                     # np_dtype = kind_map.get(intrinsic_type_spec.children[0], 'np.float64') 
                                     # Create: var = np.array(value, dtype=np_dtype)
                                     # idx,attr = np_dtype.split('.')
                                     value_ = None
                                     val = None
                                     if value is not None:
-                                        
-                                        if len(value.children) > 2:
-                                            num1,_, num2 = value.children
-                                            value_ = ast.BinOp(
-                                                left=ast.Constant(value=float(num1.string)),
-                                                op=ast.Mult(),
-                                                right=ast.Constant(value=float(num2.string))
+
+                                        if 'DIMENSION' in allocation_spec:
+                                            # Parse array constructor
+                                            elements = []
+                                            for val in walk(value,F23.Real_Literal_Constant):  
+                                                num_str = val.string.split('_')[0] 
+                                                num_val = float(num_str) if intrinsic_type_spec.children[0] == "REAL" else int(num_str)
+                                                elements.append(ast.Constant(value=num_val))
+                                            
+                                            val = ast.Call(
+                                                func=ast.Attribute(value=ast.Name(id='np', ctx=ast.Load()), attr='array', ctx=ast.Load()),
+                                                args=[ast.List(elts=elements, ctx=ast.Load())],
+                                                keywords=[ast.keyword(arg='dtype',
+                                                        value=ast.Attribute(value=ast.Name(id=idx, ctx=ast.Load()), attr=attr, ctx=ast.Load()))]
+                                            )
+                                            assign = ast.Assign(
+                                                targets=[target],
+                                                value=val
                                             )
                                         else:
-                                            if attr == "int32":
-                                                value_ = ast.Constant(value=int(value.children[0]))
+                                            if len(value.children) > 2:
+                                                num1,_, num2 = value.children
+                                                value_ = ast.BinOp(
+                                                    left=ast.Constant(value=float(num1.string)),
+                                                    op=ast.Mult(),
+                                                    right=ast.Constant(value=float(num2.string))
+                                                )
                                             else:
-                                                value_ = ast.Constant(value=float(value.children[0]))
+                                                if not isinstance(value,F23.Name):
+                                                    if attr == "int32":
+                                                        value_ = ast.Constant(value=int(value.children[0]))
+                                                    else:
+                                                        value_ = ast.Constant(value=float(value.children[0]))
+                                                else:
+                                                    if cls_mode:
+                                                        val = ast.Attribute(
+                                                            value=ast.Name(id="self",ctx=ast.Load()),
+                                                            attr=value.string,
+                                                            ctx= ast.Load()
+                                                        )
+                                                    else:
+                                                        val = ast.Name(id=value.string,ctx=ast.Load())
 
-                                        val = ast.Call(
-                                            func=ast.Attribute(value=ast.Name(id=idx, ctx=ast.Load()), attr=attr, ctx=ast.Load()),
-                                            args=[value_],
-                                            keywords = []
-                                            # keywords=[
-                                            #     ast.keyword(arg='dtype', value=ast.Attribute(value=ast.Name(id=idx, ctx=ast.Load()), attr=attr, ctx=ast.Load()))
-                                            # ]
-                                        )
+                                            val = ast.Call(
+                                                func=ast.Attribute(value=ast.Name(id=idx, ctx=ast.Load()), attr=attr, ctx=ast.Load()),
+                                                args=[value_],
+                                                keywords = []
+                                                # keywords=[
+                                                #     ast.keyword(arg='dtype', value=ast.Attribute(value=ast.Name(id=idx, ctx=ast.Load()), attr=attr, ctx=ast.Load()))
+                                                # ]
+                                            )
                                     else:
                                         val = ast.Call(func=ast.Attribute(value=ast.Name(id=idx, ctx=ast.Load()), attr=attr, ctx=ast.Load()),
                                                         args=[ast.Constant(value=0)],
@@ -897,7 +1103,7 @@ class Transformer:
                                         targets=[target],
                                         value=val
                                     )
-                        
+                                    
                                 ast_nodes.append(assign)
 
                             elif 'DIMENSION' in allocation_spec:
@@ -1013,6 +1219,7 @@ class Transformer:
                                 
                                 # Need to handle case where there could be a value if the kind_selec is None but still has a value
                                 elif not kind_selec:
+                                    
                                     if value is None: # Example cases : INTEGER :: ier 
                                         assign = ast.Assign(
                                                 targets=[target],
@@ -1023,13 +1230,28 @@ class Transformer:
                                                 )
                                     
                                     else:
-                                        assign = ast.Assign(
-                                            targets=[target],
-                                            value=ast.Call( func=ast.Attribute(value=ast.Name(id=idx, ctx=ast.Load()), attr=attr, ctx=ast.Load()),
-                                                            args=[ast.Constant(value=value.string)],
-                                                            keywords = []
-                                                        )
-                                        )
+                                        if not isinstance(value, F23.Name):
+                                            num_val = int(value.string) if intrinsic_type_spec.children[0] == "INTEGER" else float(value.string)
+                                            assign = ast.Assign(
+                                                targets=[target],
+                                                value=ast.Call( func=ast.Attribute(value=ast.Name(id=idx, ctx=ast.Load()), attr=attr, ctx=ast.Load()),
+                                                                args=[ast.Constant(value=num_val)],
+                                                                keywords = []
+                                                            )
+                                            )
+                                        else:
+                                            if cls_mode:
+                                                name_val = ast.Attribute(
+                                                    value=ast.Name(id="self",ctx=ast.Load()),
+                                                    attr=value.string,
+                                                    ctx= ast.Load()
+                                                )
+                                            else:
+                                                name_val = ast.Name(id=value.string,ctx=ast.Load())
+                                            assign = ast.Assign(
+                                                targets=[target],
+                                                value=name_val
+                                                )
                                         
                                     ast_nodes.append(assign)
                 
@@ -1044,14 +1266,28 @@ class Transformer:
                                                 )
                                     else:
                                         # Verify that the value is a string
-                                        num_val = int(value.string) if intrinsic_type_spec.children[0] == "INTERGER" else float(value.string)
-                                        assign = ast.Assign(
-                                                targets=[target],
-                                                value=ast.Call( func=ast.Attribute(value=ast.Name(id=idx, ctx=ast.Load()), attr=attr, ctx=ast.Load()),
-                                                                args=[ast.Constant(value=num_val)],
-                                                                keywords = []
-                                                            )
+                                        if not isinstance(value, F23.Name):
+                                            num_val = int(value.string) if intrinsic_type_spec.children[0] == "INTEGER" else float(value.string)
+                                            assign = ast.Assign(
+                                                    targets=[target],
+                                                    value=ast.Call( func=ast.Attribute(value=ast.Name(id=idx, ctx=ast.Load()), attr=attr, ctx=ast.Load()),
+                                                                    args=[ast.Constant(value=num_val)],
+                                                                    keywords = []
+                                                                )
+                                                    )
+                                        else:
+                                            if cls_mode:
+                                                name_val = ast.Attribute(
+                                                    value=ast.Name(id="self",ctx=ast.Load()),
+                                                    attr=value.string,
+                                                    ctx= ast.Load()
                                                 )
+                                            else:
+                                                name_val = ast.Name(id=value.string,ctx=ast.Load())
+                                            assign = ast.Assign(
+                                                    targets=[target],
+                                                    value=name_val
+                                                    )
                                         
                                     ast_nodes.append(assign)
             if fix_loc:    
@@ -1205,7 +1441,6 @@ class Transformer:
             The index position after the method call where elements can be inserted. 
             Returns `None` if no suitable position is found.
         """
-
         for i in range(len(function.body) - 1):
             stmt1 = function.body[i]
             stmt2 = function.body[i + 1]
@@ -1217,11 +1452,18 @@ class Transformer:
                 and isinstance(stmt1.value.func, ast.Name)
                 and stmt1.value.func.id == class_name
                 and len(stmt1.targets) == 1
-                and isinstance(stmt1.targets[0], ast.Name)
+                and isinstance(stmt1.targets[0], (ast.Name, ast.Attribute))
             ):  
                 # THis is to handle both self and non self aspects
-                var_name = stmt1.targets[0].id if isinstance(stmt1.targets[0],ast.Name) else stmt1.targets[0].attr 
-
+                target = stmt1.targets[0]
+                if isinstance(target, ast.Name):
+                    var_name = target.id
+                elif isinstance(target, ast.Attribute):
+                    if isinstance(target.value, ast.Name) and target.value.id == "self":
+                        var_name = target.attr
+                    else:
+                        continue
+                
                 # Look for method call: var.method_name() or self.var.method_name inside class 
                 if (isinstance(stmt2, ast.Expr) and isinstance(stmt2.value, ast.Call) and isinstance(stmt2.value.func, ast.Attribute)):
                     if isinstance(stmt2.value.func.value, ast.Name): # Here we have an instance of a.method() 
@@ -1233,7 +1475,8 @@ class Transformer:
                                     return None  # Found an assignment later, reject it since the follwoing elements could be variables that might depend on this until 
                                     # we stumble upon another class instance and method call 
                             return i + 2  # Plus two since we are removing -1 from range 
-                    elif isinstance(stmt2.value.func.value,ast.Attribute): # Here we have an instance of self.a.method()
+                    elif isinstance(stmt2.value.func.value, ast.Attribute): # Here we have an instance of self.a.method()
+                        
                         if stmt2.value.func.value.attr == var_name and stmt2.value.func.attr == method_name:
                             for stmt in function.body[i + 2:]:
                                 if isinstance(stmt, ast.Assign):
@@ -1270,7 +1513,6 @@ class Transformer:
 
         # This is to handle cases when we a class instance followed by a method call
         insert_pos = self._find_init_pattern(function, class_name=class_name, method_name=method_name)
-
         # If not found, default to after last assignment
         if insert_pos is None:
             assign_positions = [pos for pos, stmt in enumerate(function.body) if isinstance(stmt, ast.Assign)]
@@ -1356,7 +1598,7 @@ class Transformer:
                                     class_name = kwargs.get('class_name')
                                     method = kwargs.get('method')
                                     insert_pos,return_stmt_pos = self._check_position_within_function(functions,class_name=class_name,method_name=method)
-            
+                                    
                                     if idx and (return_stmt_pos is None or idx < return_stmt_pos) and idx > insert_pos:
                                         functions.body.insert(idx,ast_node)
                                     else:
@@ -1364,6 +1606,9 @@ class Transformer:
                                         functions.body.insert(insert_pos, ast_node)
                             else: # By default we will place it inside the __init__ method 
                                 if functions.name == "__init__":
+                                    class_name = kwargs.get('class_name')
+                                    method = kwargs.get('method')
+                                    
                                     assign_statement = [pos for pos, assign in enumerate(functions.body) if isinstance(assign, ast.Assign)]
                                     insert_pos = assign_statement[-1] + 1 if assign_statement else len(functions.body)
                                     if idx:
@@ -1400,7 +1645,42 @@ class Transformer:
                         python_template.body.insert(import_stmts[-1] + 1,ast_node)
                     else:
                         python_template.body.insert(0,ast_node)
+                
+                elif isinstance(ast_node, ast.ClassDef):
+                    import_positions = [ pos for pos, stmt in enumerate(ast.iter_child_nodes(python_template))
+                            if isinstance(stmt, (ast.Import, ast.ImportFrom))]
+                    if idx:
+                        if import_positions:
+                            last_import_pos = import_positions[-1] + 1
+                            
+                            if idx <= last_import_pos:
+                                logging.info( f'The given idx ({idx}) is before or within the import statements. ' 
+                                                f'Correcting and placing it after the last import at position {last_import_pos}.'
+                                )
+                                python_template.body.insert(last_import_pos, ast_node)
+                            else:
+                                python_template.body.insert(idx, ast_node)
+                    else:
+                        # Perhaps check for any other elemnts especially if the __name__ == '__main__' type elements is present which can be used as 
+                        # an anchor point to to place the class or another class or function can be used to place
                     
+                        function_positions = [pos for pos, stmt in enumerate(ast.iter_child_nodes(python_template))
+                            if isinstance(stmt, ast.FunctionDef)]
+                        
+                        _name_format = [pos for pos, stmt in enumerate(ast.iter_child_nodes(python_template)) # This is for the __name__ format if 
+                            if isinstance(stmt, ast.If) and isinstance(stmt.test, ast.Compare)]
+                        
+                        if function_positions:
+                            last_func_pos = function_positions[-1]
+                            python_template.body.insert(last_func_pos, ast_node)
+                        
+                        elif not function_positions and _name_format:
+                            last_name_format_pos = _name_format[0]
+                            python_template.body.insert(last_name_format_pos,ast_node)
+                        elif not (function_positions and _name_format) and import_positions:
+                            last_import_pos = import_positions[-1]
+                            python_template.body.insert(last_import_pos,ast_node)
+                        
                 elif isinstance(ast_node, ast.FunctionDef):
                     if idx:
                         # Gather positions of all import statements
@@ -1918,13 +2198,14 @@ class Transformer:
         """
 
         try:
+            name = None
+            name_to_node = {}
             if self.global_state:
                 diff = list(set(
                     assign.targets[0].id if isinstance(assign.targets[0], ast.Name) else assign.targets[0].attr
                     for assign in assign_nodes) - set(self.variable_order))
-                name = None
                 # DO it in two steps first the declared and intializd variables and then the variable order
-                # The declared and intialized variables 
+                # The declared and non intialized variables 
                 if len(diff) != 0:
                     for assign_node in assign_nodes:
                         if not assign_node.targets:
@@ -1941,7 +2222,14 @@ class Transformer:
                             raise AttributeError(f"node doesn't have either attribute or id or attr :{ast.unparse(ast.fix_missing_locations(assign_node))} ")
                         
                         if name in diff:
-                            self.insert_at(None,assign_node,code_tree,method_name=method_name)
+                            # self.insert_at(None,assign_node,code_tree,method_name=method_name)
+                            name_to_node[name] = assign_node
+                    
+                    ordered_vars = order_assignments(assign_nodes, diff)
+                    # Insert assignment nodes in the resolved order
+                    for var in ordered_vars:
+                        if var in name_to_node:
+                            self.insert_at(None, name_to_node[var], code_tree, method_name=method_name)
 
                 # Now all the declared and not intialized variables
                 # assign_node_names = [assign.targets[0].id if isinstance(assign.targets[0], ast.Name) else assign.targets[0].attr  for assign in assign_nodes]
@@ -1963,9 +2251,21 @@ class Transformer:
                         if var == name and var not in list(self.dependant_variables.keys()):
                             self.insert_at(None,assign_node,code_tree,method_name=method_name)
             else:
-                
                 for assign_node in assign_nodes:
-                    self.insert_at(None,assign_node,code_tree,method_name=method_name,**kwargs)
+                    target = assign_node.targets[0]
+                    if isinstance(target, ast.Name):
+                        name = target.id
+                    elif isinstance(target, ast.Attribute):
+                        name = target.attr
+                    else:
+                        raise TypeError(f"Unsupported assignment target type: {type(target).__name__}")
+                    
+                    name_to_node[name] = assign_node
+
+                ordered_vars = order_assignments(assign_nodes,None)
+                for var in ordered_vars:
+                    if var in name_to_node:
+                        self.insert_at(None,name_to_node[var],code_tree,method_name=method_name,**kwargs)
 
             # code_tree = ast.fix_missing_locations(code_tree)
         except Exception as e:
@@ -2466,7 +2766,7 @@ ffile = FortranFile(path, 'r')
 
             # 2. Retrieve all the assignement python ast statements as well procesdure nodes(USE) for the global declarations
             declaration_stmts = list(self.extractor.dec_global[self.subroutine_name].values())
-            ast_nodes = self.convert_SPECIFICATION_PART(declaration_stmts,cls_mode=cls_mode)
+            ast_nodes = self.convert_SPECIFICATION_PART(declaration_stmts=declaration_stmts,cls_mode=cls_mode)
             if ast_nodes is None:
                 raise ValueError(f'Ast_nodes are None')
             
@@ -2652,7 +2952,7 @@ ffile = FortranFile(path, 'r')
             logging.exception(f'Exception in prepare_read_code_for_main_template')
             raise
 
-    def update_main_python(self,out_module:ast.Module):
+    def update_main_python(self,out_module:ast.Module,parent_mode:bool=False):
         self.global_state = False 
         try:
             
@@ -2673,23 +2973,18 @@ ffile = FortranFile(path, 'r')
             # We will use the same approach used in the processor.update_main_program to add the elements onto the main function
             # 1. Create the global instance and then add them
             cls_info, import_nodes, instance_nodes = self.create_cls_info(out_module)
-            
+                
             if not all((cls_info,import_nodes,instance_nodes)):
                 raise ValueError(f'ONe of these three elements is None:cls_info,import_nodes,instance_nodes')
             
-            # Since we add the global instance first since the following variables could depend on this global instance
-            for instance_node in instance_nodes:
-                self.add_instance(idx,instance_node,cls_info,main_function_def,["declaration_initialization"])
             # Add the import node inside the main template
             for import_node in import_nodes:
                 self.insert_at(idx = None,ast_node=import_node,python_template=out_main_template,method_name=None)
-                
-            idx = len(main_function_def.body)
-
+            
             # 2. Now we add the dummy arg variables onto the main function on which 
             declaration_stmts = [[elements] for elements in self.extractor.var_dummy[self.subroutine_name]]
-                
-            ast_nodes = self.convert_SPECIFICATION_PART(declaration_stmts,True,cls_mode=False) # THis turns ast_nodes that contains
+                    
+            ast_nodes = self.convert_SPECIFICATION_PART(declaration_stmts,fix_loc=True,cls_mode=parent_mode) # THis turns ast_nodes that contains
             # Assign statemetn and procedure statement(use, which appear as specification part in fortran) and we need to separate them into assign_nodes and precodure_nodes.
             if ast_nodes is None:
                 raise ValueError(f'Ast_nodes is None')
@@ -2703,86 +2998,192 @@ ffile = FortranFile(path, 'r')
                 elif isinstance(node, (ast.Assign, ast.Assign)):
                     assign_nodes.append(node)
             
-            self.insert_all_assign_nodes(assign_nodes,main_function_def,method_name="main",class_name=list(cls_info)[-1],method="declaration_initialization")
             # Now we need to ensure that we add the procedure_nodes if they exist
             if procedure_nodes:
                 for procedure_node in procedure_nodes:
                     self.insert_at(None,procedure_node,out_main_template)
-                        
-            # We need to then see if these variables have any dependencies of the global instance, and replace them if necessary 
-            identify_replace_all(main_function_def.body,cls_info) # THis function allows us to identify and replace them recursivly. 
-            idx = len(main_function_def.body) 
             
-            # 3. Now we need to get the read template for these declared variables within the main function
-            read_dummy_ast = self.prepare_read_code_for_main_template(self.extractor.var_dummy[self.subroutine_name],assign_nodes) # THis will create the read_dummy function in Python AST
-            read_dummy_ast_call_stmt = self.create_call_statements(read_dummy_ast)
-
-            if read_dummy_ast_call_stmt is None:
-                raise ValueError(f'Read_ast_call_stmt is None')
-            
-            call_stmts.append(read_dummy_ast_call_stmt) # This will keep in the current order the list of call statements
-            function_stmts.append(read_dummy_ast)
-                    
-            # Need to add a timer for this subroutine to measure the time elapsed during the execution and since get_timer sends an AST tree for the 
-            # the decorator method present in template.yaml(@timer)
-            timer_tree = self.get_timer()
-            if timer_tree is None:
-                raise ValueError("Timer tree(@timer) is None")
-            
-            function_stmts.append(timer_tree)
-
-            # 4. Now we transform/translate the function definition of the subroutine    
-            subroutine_tree = self.extractor.subroutines[self.subroutine_name]
-            _,_,module_stack = self.f2np.recursive_ast(subroutine_tree) # THis will give out a list containing all the transformations done to the execution part
-            # with respect to the hierarchy and nested loops, all of this being present inside the function parent body.
-            if len(module_stack) == 1:
-                function_def = module_stack[0] # The list should only have one elements which should correspond to the function ast definintion itself.
-            else:
-                raise ValueError(f'The length of module stack is greater than 1:{len(module_stack)}')
-            # After this, we need to correct the function, which just means since we translated the from the subroutine tree the subrotuine itself
-            # the arguments might have elements that depend on the global attribute or other class eleemnts, we perhaps need to add return stmts 
-            # inside thus this requires some changes
-            self.correct_function(function_def,cls_info,timer_tree=timer_tree)
-            function_def_call_stmt = self.create_call_statements(function_def)
-            if function_def_call_stmt is None:
-                raise ValueError(f'Function defintions call statement is None')
-            
-            call_stmts.append(function_def_call_stmt) # CREATE The call statement
-            
-            # Now we only need to ensure that the elements inside the function body which might depend on the global or other class attributes gets
-            # replaced.
-            identify_replace_all(function_def.body,cls_info)
-            # print(ast.unparse(ast.fix_missing_locations(function_def)))
-            function_stmts.append(function_def)
-            # 5. Now we create the test function to test out the subroutine
-            # Try to first find if the subroutines still has the benchmark
-
-            if os.path.exists(os.path.join(self.benchmark_dir,self.subroutine_name,'output.bin')):
-                test_subroutine_function = self.create_test_function(cls_info) # This will create the TEST function to test the output of Python to that of 
-                # the FORTRAN ouptut
-                if test_subroutine_function is None:
-                    raise ValueError(f'TEST subroutine {self.subroutine_name} is None')
+            if not parent_mode:
                 
-                test_subroutine_function_call_stmt = self.create_call_statements(test_subroutine_function)
-                if test_subroutine_function_call_stmt is None:
-                    raise ValueError(f'Test functions call statement is None')
+                # Since we add the global instance first since the following variables could depend on this global instance
+                for instance_node in instance_nodes:
+                    self.add_instance(idx,instance_node,cls_info,main_function_def,["declaration_initialization"])
+                    
+                idx = len(main_function_def.body)
 
-                call_stmts.append(test_subroutine_function_call_stmt)
-                function_stmts.append(test_subroutine_function)
-            
-            # 6. Now we can add the call onto the main function
-            for call_stmt in call_stmts:
-                if isinstance(call_stmt,ast.AST):
-                    self.insert_at(idx,call_stmt,main_function_def,"main")
-                    idx+= 1
+                self.insert_all_assign_nodes(assign_nodes,main_function_def,method_name="main",class_name=list(cls_info)[-1],method="declaration_initialization")
+                            
+                # We need to then see if these variables have any dependencies of the global instance, and replace them if necessary 
+                identify_replace_all(main_function_def.body,cls_info) # THis function allows us to identify and replace them recursivly. 
+                idx = len(main_function_def.body) 
+                
+                # 3. Now we need to get the read template for these declared variables within the main function perhaps add a dummy only in the case if the input is present
+                if os.path.exists(os.path.join(self.benchmark_dir,self.subroutine_name,'dummy.bin')):
+                    read_dummy_ast = self.prepare_read_code_for_main_template(self.extractor.var_dummy[self.subroutine_name],assign_nodes) # THis will create the read_dummy function in Python AST
+                    read_dummy_ast_call_stmt = self.create_call_statements(read_dummy_ast)
+
+                    if read_dummy_ast_call_stmt is None:
+                        raise ValueError(f'Read_ast_call_stmt is None')
+                    
+                    call_stmts.append(read_dummy_ast_call_stmt) # This will keep in the current order the list of call statements
+                    function_stmts.append(read_dummy_ast)
+                        
+                # Need to add a timer for this subroutine to measure the time elapsed during the execution and since get_timer sends an AST tree for the 
+                # the decorator method present in template.yaml(@timer)
+                timer_tree = self.get_timer()
+                if timer_tree is None:
+                    raise ValueError("Timer tree(@timer) is None")
+                
+                function_stmts.append(timer_tree)
+
+                # 4. Now we transform/translate the function definition of the subroutine    
+                subroutine_tree = self.extractor.subroutines[self.subroutine_name]
+                _,_,module_stack = self.f2np.recursive_ast(subroutine_tree) # THis will give out a list containing all the transformations done to the execution part
+                # with respect to the hierarchy and nested loops, all of this being present inside the function parent body.
+                if len(module_stack) == 1:
+                    function_def = module_stack[0] # The list should only have one elements which should correspond to the function ast definintion itself.
                 else:
-                    main_function_def.body.extend(call_stmt)
-                    idx += len(call_stmt)
-            
-            # 7. Now we add the functions created onto the main file python AST
-            for functions in function_stmts:
-                self.insert_at(None,functions,out_main_template)
-            
+                    raise ValueError(f'The length of module stack is greater than 1:{len(module_stack)}')
+                # After this, we need to correct the function, which just means since we translated the from the subroutine tree the subrotuine itself
+                # the arguments might have elements that depend on the global attribute or other class eleemnts, we perhaps need to add return stmts 
+                # inside thus this requires some changes
+                self.correct_function(function_def,cls_info,timer_tree=timer_tree)
+                function_def_call_stmt = self.create_call_statements(function_def)
+                if function_def_call_stmt is None:
+                    raise ValueError(f'Function defintions call statement is None')
+                
+                call_stmts.append(function_def_call_stmt) # CREATE The call statement
+                
+                # Now we only need to ensure that the elements inside the function body which might depend on the global or other class attributes gets
+                # replaced.
+                identify_replace_all(function_def.body,cls_info)
+                # print(ast.unparse(ast.fix_missing_locations(function_def)))
+                function_stmts.append(function_def)
+                # 5. Now we create the test function to test out the subroutine
+                # Try to first find if the subroutines still has the benchmark
+
+                if os.path.exists(os.path.join(self.benchmark_dir,self.subroutine_name,'output.bin')):
+                    test_subroutine_function = self.create_test_function(cls_info) # This will create the TEST function to test the output of Python to that of 
+                    # the FORTRAN ouptut
+                    if test_subroutine_function is None:
+                        raise ValueError(f'TEST subroutine {self.subroutine_name} is None')
+                    
+                    test_subroutine_function_call_stmt = self.create_call_statements(test_subroutine_function)
+                    if test_subroutine_function_call_stmt is None:
+                        raise ValueError(f'Test functions call statement is None')
+
+                    call_stmts.append(test_subroutine_function_call_stmt)
+                    function_stmts.append(test_subroutine_function)
+                
+                # 6. Now we can add the call onto the main function
+                for call_stmt in call_stmts:
+                    if isinstance(call_stmt,ast.AST):
+                        self.insert_at(idx,call_stmt,main_function_def,"main")
+                        idx+= 1
+                    else:
+                        main_function_def.body.extend(call_stmt)
+                        idx += len(call_stmt)
+                
+                # 7. Now we add the functions created onto the main file python AST
+                for functions in function_stmts:
+                    self.insert_at(None,functions,out_main_template)
+            else:
+                main_class_template = self.out_module_python()
+
+                for node in ast.iter_child_nodes(main_class_template):
+                    if isinstance(node, ast.ClassDef):
+                        node.body = [
+                            item for item in node.body
+                            if not (isinstance(item, ast.FunctionDef) and item.name == "declaration_initialization")
+                        ]
+                
+                main_class_name = ast_walk(main_class_template,ast.ClassDef)
+                class_def = next(iter(main_class_name))
+                l = [self.subroutine_name[0].upper(), self.subroutine_name[1:]]
+                class_def.name = "".join(l)
+
+                # Use the instance_nodes to create the assign_node to be placed inside the __init__ as an arg and sent as argument
+                out_module_class_def = list(ast_walk(out_module,ast.ClassDef))
+                instance_nodes = self.create_instances(out_module_class_def,True)
+                
+                init_function_def = next(iter(ast_walk(class_def, ast.FunctionDef)))
+                # Adding the object composition inside the main class template
+                for instance_node in instance_nodes:
+                    self.add_instance(None,instance_node,cls_info,init_function_def,method_name = ["declaration_initialization"])
+                # Adding the attributes 
+                self.insert_all_assign_nodes(assign_nodes,main_class_template,method_name='__init__',class_name=list(cls_info)[-1],method="declaration_initialization")
+                
+                # Now we transform each subroutine onto Python AST
+                all_child_subroutines = []
+                for subroutines in self.isolator.child_subroutine_call[self.subroutine_name]:
+                    _,_,child_subroutine_ast = self.f2np.recursive_ast(subroutines)
+                    if len(child_subroutine_ast) > 1:
+                        raise ValueError(f'The length of module stack for children AST is greater than 1:{len(child_subroutine_ast)}')
+                    all_child_subroutines.append(child_subroutine_ast[-1])
+
+                # Now we transform the parent_subroutine
+                subroutine_tree = self.extractor.subroutines[self.subroutine_name]
+
+                _,_,parent_subroutine_ast = self.f2np.recursive_ast(subroutine_tree)
+                if len(parent_subroutine_ast) > 1:
+                    raise ValueError(f'The length of module stack for Parent AST is greater than 1:{len(child_subroutine_ast)}')
+                else:
+                    parent_subroutine_ast = parent_subroutine_ast[-1]
+                    # all_subroutines.append(parent_subroutine_ast)
+                
+                # Now we add them inside the class as methods, since we still have the all the 
+                class_def.body.extend(all_child_subroutines + [parent_subroutine_ast])
+
+                # We will now create the cls information on this class defintion which has a composition type from another class which is why we are
+                # sending the instance_nodes of the Global modules of the parent class 
+                new_cls_info, _ , _ = self.create_cls_info(class_def,instance_nodes,self_mode=True)
+                
+                # Now we correct the read_ast created before
+                read_dummy_ast = self.prepare_read_code_for_main_template(self.extractor.var_dummy[self.subroutine_name],assign_nodes)
+                self.correct_function(read_dummy_ast,new_cls_info)
+                identify_replace_all(read_dummy_ast.body,new_cls_info)
+                class_def.body.extend([read_dummy_ast])
+                
+                # METHODS to call in the main fucntion : 
+                methods_to_call = ["read_dummy", self.subroutine_name]
+                new_cls_info = update_dict( # we update the parent class to keep in memory the information about the class is used internally
+                    primary_dict=new_cls_info,
+                    secondary_dict=cls_info,
+                )
+
+                if os.path.exists(os.path.join(self.benchmark_dir,self.subroutine_name,'output.bin')):
+                    test_subroutine_function = self.create_test_function(new_cls_info) # This will create the TEST function to test the output of Python to that of 
+                    self.correct_function(test_subroutine_function,new_cls_info)
+                    # the FORTRAN ouptut
+                    if test_subroutine_function is None:
+                        raise ValueError(f'TEST subroutine {self.subroutine_name} is None')
+
+                    class_def.body.extend([test_subroutine_function])
+                    methods_to_call.append(f"test_{self.subroutine_name}")
+
+                for child_idx, child_subroutine_key in enumerate(self.extractor.call_within_sub[self.subroutine_name]):
+                    self.correct_function(all_child_subroutines[child_idx],new_cls_info,None,child_subroutine_key,parent_mode=parent_mode)
+                    identify_replace_all(all_child_subroutines[child_idx].body,new_cls_info)
+                
+                #Now we correct the parent
+                self.correct_function(parent_subroutine_ast,new_cls_info,None,self.subroutine_name)
+                identify_replace_all(parent_subroutine_ast.body,new_cls_info)
+
+                # We need to ensure thta the variables intialized inside the class doesn't depend on the variables from the composed class, if so we need to modify
+                init_func = None
+                for func in ast_walk(class_def, ast.FunctionDef):
+                    if func.name == '__init__':
+                        init_func = func
+
+                identify_replace_all(init_func.body,new_cls_info)
+
+                # NOw we insert the class node inside the out_main_template
+                self.insert_at(idx = None,ast_node = class_def,python_template = out_main_template) 
+                final_cls_info, _ , final_instance_nodes = self.create_cls_info(class_def)
+                
+                for instances in final_instance_nodes:
+                    self.add_instance(len(main_function_def.body), instances, final_cls_info, main_function_def,methods_to_call)
+                
             # print(ast.unparse(ast.fix_missing_locations(out_main_template)))
             return ast.fix_missing_locations(out_main_template)
         
