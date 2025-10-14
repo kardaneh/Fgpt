@@ -7,6 +7,7 @@ from shaper import Shaper
 import re
 from fparser.common.readfortran import FortranStringReader
 from collections import defaultdict, deque
+import shutil 
 
 class Extractor:
     """
@@ -25,21 +26,21 @@ class Extractor:
             self.actual_arg_spec_list = defaultdict(list)
             self.external_subroutines = set()
             self.call_subroutines = defaultdict(list)
-            self.call_within_sub = defaultdict(set)
+            self.call_within_sub = defaultdict(lambda: defaultdict(list)) ##defaultdict(set)
             self.loop_dict = defaultdict(set)
             self.loop_vect = defaultdict(lambda: None)
-            self.exclude = {'kjpindex', 'nslm', 'nstm', 'nvm', 'nsnow', 'DIM', 'dim', 'MASK', 'next_calc_loop'}
+            self.exclude = {'kjpindex', 'nslm', 'nstm', 'nvm', 'nsnow', 'nice', 'DIM', 'dim', 'MASK', 'next_calc_loop'}
             self.cases_to_exclude = ['clear', 'finalize', 'init', 'initialize', 'read', 'write']
             self.allowed_external_subroutines = {'ipslerr_p', 'xios_orchidee_send_field', 'xios_orchidee_recv_field', 'flinget', 'flininfo', 'scatter'}
             self.dec_global = defaultdict(lambda: defaultdict(list))
             self.all_array_info = defaultdict(lambda: defaultdict(list))
             self.imp_shape = defaultdict(dict)
-            self.scalar_variables = defaultdict(set)
-            self.shapes_variables = defaultdict(set)
+            self.scalar_variables = defaultdict(list)
+            self.shapes_variables = defaultdict(list)
             self.var_modif_info = defaultdict(lambda: defaultdict(list))
             self.general_usage_dict = defaultdict()
             self.parsed_modules = defaultdict()
-            self.var_global = defaultdict(set)
+            self.var_global = defaultdict(list) #defaultdict(set)
             self.var_dummy = defaultdict(list)
             self.var_local = defaultdict(list)
             self.var_modif = defaultdict(set)
@@ -47,6 +48,7 @@ class Extractor:
             self.var_declared = defaultdict(set)
             self.module_global_stock = {}
             self.module_path = {}
+            self.org_files_loaded = set()
             self.processor = Processor() 
         except Exception as e:
             self.processor.logger.error("Error in __init__: %s", str(e))
@@ -137,7 +139,6 @@ class Extractor:
         """
         try:
             # Start search in current directory
-            self.module_path[current_module_name] = os.path.join(current_dir, current_module_name)
             search_dir = os.path.normpath(current_dir)
             searched_dirs = set()
 
@@ -150,10 +151,12 @@ class Extractor:
                 fortran_file_queue = deque()
                 for file in os.listdir(search_dir):
                     if file.endswith(('.f90', '.F90')):
+                        if '_org.f90' in file or '_org.F90' in file:
+                            continue
                         file_base, _ = os.path.splitext(file)
+                        module_file_path = os.path.join(search_dir, file)
+                        self.module_path[file_base] = module_file_path
                         if file_base != current_module_name:
-                            module_file_path = os.path.join(search_dir, file)
-                            self.module_path[file_base] = module_file_path
                             fortran_file_queue.append(module_file_path)
 
                 # Search through all Fortran files in current directory
@@ -162,11 +165,19 @@ class Extractor:
                     module_file_name = os.path.basename(module_file_path)
                     module_name, _ = os.path.splitext(module_file_name)
 
+                    path_to_original = module_file_path.replace('.f90', '_org.f90').replace('.F90', '_org.F90')
+                    if os.path.exists(path_to_original) and module_name not in self.org_files_loaded:
+                        file_to_parse = path_to_original
+                        self.org_files_loaded.add(module_name)  # Mark that we're using org file
+                    else:
+                        file_to_parse = module_file_path
+                    #file_to_parse = path_to_original if os.path.exists(path_to_original) else module_file_path
+
                     # Get or parse the module tree
                     if module_name in self.parsed_modules:
                         module_tree = self.parsed_modules[module_name]
                     else:
-                        module_tree = self.processor.parse_fortran_file(module_file_path)
+                        module_tree = self.processor.parse_fortran_file(file_to_parse)
                         self.parsed_modules[module_name] = module_tree
 
                     # Search for the subroutine in this module
@@ -183,6 +194,18 @@ class Extractor:
                                         subroutine_name,
                                         module_file_path
                                     )
+                                    
+                                    if not os.path.exists(path_to_original):
+                                        shutil.copy(module_file_path, path_to_original)
+                                        self.processor.logger.info(
+                                                "Created backup of original file: %s",
+                                                path_to_original
+                                                )
+                                    else:
+                                        self.processor.logger.info(
+                                                "Backup file already exists: %s",
+                                                path_to_original
+                                                )
                                     return True, module_file_path, module_tree
 
                 # If not found in current directory, move up one level
@@ -267,8 +290,8 @@ class Extractor:
 
                     # Classify as internal or external call (ioipsl, xios)
                     if call_name not in self.allowed_external_subroutines:
-                        self.call_within_sub[subroutine_key].add(call_name)
-                        '''if call_name not in module_subroutines_avail:
+                        self.call_within_sub[subroutine_key][call_name].append(item) #.add(call_name)
+                        if call_name not in module_subroutines_avail:
                             self.processor.logger.warning(
                                 "Subroutine '%s' calls '%s' which is not defined in current module",
                                 subroutine_key,
@@ -291,7 +314,7 @@ class Extractor:
                                         if isinstance(child, F23.Name):
                                             sub_name = child.tostr()
                                             module_subroutines_avail.add(sub_name)
-                        '''
+                        
                     else:
                         # call to ioipsl, xios are allowed, so, instead of call_name, subroutine_key is added!
                         self.subroutine_keys_ncl.add(subroutine_key)
@@ -312,11 +335,11 @@ class Extractor:
                 self.subroutine_keys_ncl.add(subroutine_key)
 
         # Identify external subroutines (called but not defined in module)
-        # self.external_subroutines.update(self.allowed_external_subroutines)
-        self.external_subroutines = {
-                item for item in self.actual_arg_spec_list.keys()
-                if item not in self.dummy_arg_list.keys()
-                }
+        self.external_subroutines.update(self.allowed_external_subroutines)
+        #self.external_subroutines = {
+        #        item for item in self.actual_arg_spec_list.keys()
+        #        if item not in self.dummy_arg_list.keys()
+        #        }
 
     def extract_function_dummy_args(self, function_tree):
         """
@@ -809,7 +832,7 @@ class Extractor:
         """
 
         var_in_local = set()
-        shapes = set()
+        shapes = {}
         self.var_dummy[subroutine_key].clear()
         self.var_local[subroutine_key].clear()
 
@@ -817,9 +840,18 @@ class Extractor:
         self.var_declared[subroutine_key] = {name.tostr() for name in  walk(declared, F23.Entity_Decl)}
         names_declared, names_used = walk(declared, F23.Name), walk(used, F23.Name)
 
-        var_declared = {name.string for name in names_declared }
-        var_used = {name.string for name in names_used}
-        self.var_global[subroutine_key] = var_used - var_declared
+        declared_names_str = {name.string for name in names_declared }
+        #var_used = {name.string for name in names_used}
+        
+        seen = {}
+        for name in names_used:
+            if (
+                    name.string not in declared_names_str and 
+                    name.string not in self.exclude
+                    ):
+                seen[name.string] = name
+
+        self.var_global[subroutine_key] = list(seen.values()) #var_used - var_declared
 
         for declaration_stmt in walk(declared, F23.Type_Declaration_Stmt):
             if len(walk(declaration_stmt, F23.Entity_Decl)) > 1:
@@ -834,7 +866,7 @@ class Extractor:
                     self.processor.logger.warning("Node: %s", node)
 
                     if isinstance(subroutine_tree, F23.Subroutine_Subprogram):
-                        shape_finder = Shaper(self.module_dir, self.parsed_modules, \
+                        shape_finder = Shaper(self.module_dir, self.parsed_modules, self.module_path,\
                                 self.dummy_arg_list, self.actual_arg_spec_list, \
                                 self.call_subroutines)
                         nodes = shape_finder.shaper_subroutine(node, subroutine_key)
@@ -845,7 +877,7 @@ class Extractor:
                             self.imp_shape[subroutine_key][entity_decl] = node
                     elif isinstance(subroutine_tree, F23.Function_Subprogram):
                         assert parent_subroutine_key is not None, "Error: 'parent_subroutine_key' must not be None."
-                        shape_finder = Shaper(self.module_dir, self.parsed_modules, self.dummy_arg_list)
+                        shape_finder = Shaper(self.module_dir, self.parsed_modules, self.module_path, self.dummy_arg_list)
                         nodes = shape_finder.shaper_function(node, subroutine_tree, subroutine_key, self.all_array_info[parent_subroutine_key])
                         self.processor.logger.info("found: %s", nodes)
                         node = nodes
@@ -856,7 +888,7 @@ class Extractor:
                     self.processor.logger.warning("Warning: Intrinsic name detected in the declaration!")
                     self.processor.logger.warning("Node: %s", node)
                     if isinstance(subroutine_tree, F23.Function_Subprogram):
-                        shape_finder = Shaper(self.module_dir, self.parsed_modules, self.dummy_arg_list)
+                        shape_finder = Shaper(self.module_dir, self.parsed_modules, self.module_path, self.dummy_arg_list)
                         nodes = shape_finder.shaper_intrinsic_size(node)
                         self.processor.logger.info("found: %s", nodes)
                         node = nodes
@@ -868,10 +900,19 @@ class Extractor:
                 assert len(entity_decls) == 1,\
                         "walk(declaration_stmt, F23.Entity_Decl), but got a different number."
                 name = entity_decls[0].tostr()
-                for explicit_shape_spec in walk(node, F23.Explicit_Shape_Spec):
+                """for explicit_shape_spec in walk(node, F23.Explicit_Shape_Spec):
                     for dim in explicit_shape_spec.children:
                         if isinstance(dim, F23.Name):
                             shapes.add(dim.tostr())
+                """
+                for shape_spec in walk(node, F23.Explicit_Shape_Spec):
+                    for dim in walk(shape_spec, F23.Name):
+                        dim_str = dim.tostr()
+                        if (
+                                dim_str not in self.dummy_arg_list[subroutine_key] and 
+                                dim_str not in self.exclude
+                                ):
+                            shapes[dim_str] = dim
                 if intent:
                     intent_spec = intent[0].tostr()
                     if name not in self.exclude:
@@ -896,9 +937,15 @@ class Extractor:
                         self.var_local[subroutine_key].append(node)
 
         self.var_dummy[subroutine_key].sort(key=lambda node: node.children[-1].tostr().lower())
-        self.var_global[subroutine_key] -= self.exclude
-        shapes -= self.exclude
-        self.var_global[subroutine_key].update(shapes)
+        existing_names = {v.tostr() for v in self.var_global[subroutine_key]}
+        self.var_global[subroutine_key].extend(
+                dim_node for dim_str, dim_node in seen.items()
+                if dim_str not in existing_names
+                )
+        #self.var_global[subroutine_key] -= self.exclude
+        #shapes -= self.exclude
+        #self.var_global[subroutine_key].update(shapes)
+
 
         for stmt in walk(subroutine_tree, F23.Execution_Part):
             for assign_stmt in walk(stmt, F23.Assignment_Stmt):
@@ -958,16 +1005,24 @@ class Extractor:
         ValueError
             When a global variable or external procedure is not found in the module hierarchy.
         """
-        for declaration in var_global:
+        for var in var_global:
+            assert isinstance(var, F23.Name), "Expected var_global to contain F23.Name nodes"
+            declaration = var.tostr()
             if declaration in self.module_global_stock:
                 cached_data = self.module_global_stock[declaration]
                 decl_type = "procedure" if declaration in self.external_subroutines else "variable"
                 self.processor.logger.info(f"ℹ️  Found '{decl_type}' '{declaration}' in global stock ➡️  reusing:")
                 for i, item in enumerate(cached_data, 1):
-                    self.processor.logger.info(f"   {i}. {item.tostr()}")
+                    self.processor.logger.info(f"   {i}. {item}")
+                if walk(cached_data, F23.Function_Subprogram):
+                    parent = self.processor.find_enclosing_parent(var, F23.Assignment_Stmt)
+                    self.processor.logger.info(f"The global {declaration} used in {parent} is a Function_Subprogram.")
+                    self.call_subroutines[declaration].append(parent)
+                    self.call_within_sub[subroutine_key][declaration].append(parent)
                 self.dec_global[subroutine_key][declaration] = cached_data
-                any_initialization = walk(walk(cached_data, F23.Initialization), F23.Name)
-                var_initial = [nadi.string for nadi in any_initialization]
+                #any_initialization
+                var_initial = walk(walk(cached_data, F23.Initialization), F23.Name)
+                #var_initial = [nadi.string for nadi in any_initialization]
                 if var_initial:
                     self.processor.logger.warning("Attention: there are additional variables to search: %s", var_initial)
                     self.processor.logger.warning("In the directory: %s", module_dir)
@@ -975,13 +1030,57 @@ class Extractor:
                     self.processor.logger.warning("In the module: %s", ffile)
                     self.find_global_variables(module_dir, module_tree, var_initial, subroutine_key)
                 continue
-            self.finder = Navigator(module_dir, module_tree, self.parsed_modules)
+            self.finder = Navigator(module_dir, module_tree, self.parsed_modules, self.module_path)
             if declaration not in self.external_subroutines:
                 self.processor.logger.info(f"⏳... Searching for variable '{declaration}'")
                 self.finder.variable_finder(declaration)
                 if self.finder.var_declaration:
                     self.processor.logger.info("✅ Variable found!")
                     declaration_data = list(self.finder.var_declaration)
+                    if walk(declaration_data, F23.Function_Subprogram):
+                        function_name = declaration_data[0]  # F23.Name
+                        function_subprogram = declaration_data[1]  # F23.Function_Subprogram
+                        module_name = declaration_data[2]  # module name string
+                        assert module_name in self.module_path, \
+                                f"Module '{module_name}' not found in module_path. Available modules: {list(self.module_path.keys())}"
+                        current_module_path = self.module_path[module_name]
+                        path_to_original = current_module_path.replace('.f90', '_org.f90').replace('.F90', '_org.F90')
+                        if os.path.exists(path_to_original) and module_name not in self.org_files_loaded:
+                            self.processor.logger.info(f"Loading original file for function '{declaration}': {path_to_original}")
+                            original_module_tree = self.processor.parse_fortran_file(path_to_original)
+                            self.parsed_modules[module_name] = original_module_tree
+                            self.org_files_loaded.add(module_name)
+                            # Search for the function in the original file
+                            for sub in walk(original_module_tree, F23.Function_Subprogram):
+                                function_stmt = walk(sub, F23.Function_Stmt)[0]
+                                for func_child in function_stmt.children:
+                                    if isinstance(func_child, F23.Name) and func_child.tostr() == declaration:
+                                        # Use the function from the original file
+                                        function_name = func_child
+                                        function_subprogram = sub
+                                        break
+                        elif not os.path.exists(path_to_original):
+                            shutil.copy(current_module_path, path_to_original)
+                            self.processor.logger.info(
+                                    "Created backup of original file: %s",
+                                    path_to_original)
+                        parent = self.processor.find_enclosing_parent(var, F23.Assignment_Stmt)
+                        self.processor.logger.info(f"The global {declaration} used in {parent} is a Function_Subprogram.")
+                        self.call_subroutines[declaration].append(parent)
+                        self.call_within_sub[subroutine_key][declaration].append(parent)
+                        
+                        self.processor.logger.info(
+                                f"Calling Function_Subprogram {declaration} in Subroutine_Subprogram {subroutine_key}."
+                                )
+                        
+                        assert isinstance(function_subprogram, F23.Function_Subprogram), (
+                                f"Expected type 'F23.Function_Subprogram', but got '{type(values[0]).__name__}' instead.")
+
+                        assert isinstance(function_name, F23.Name), (
+                                f"Expected type 'F23.Name', but got '{type(values[0]).__name__}' instead."
+                                )
+                        self.subroutines[function_name.tostr()] = function_subprogram
+
                     self.dec_global[subroutine_key][declaration] = declaration_data #[item for item in self.finder.var_declaration]
                     self.module_global_stock[declaration] = declaration_data
                 else:
@@ -1161,35 +1260,43 @@ class Extractor:
                         else walk(walk(item, F23.Explicit_Shape_Spec), F23.Name)
                 if shape:
                     #self.shapes_variables[subroutine_key].update(name.string for name in shape if name.string not in self.exclude)
-                    valid_shape_names = []
+                    #valid_shape_names = []
+                    seen = {n.string for n in self.shapes_variables[subroutine_key]}
                     for name in shape:
                         if (name is not None and
-                                hasattr(name, 'string') and
-                                name.string is not None and
-                                name.string != 'None' and
-                                name.string.strip() != '' and
-                                name.string not in self.exclude):
-                            valid_shape_names.append(name.string)
-                    if valid_shape_names:
-                        self.processor.logger.debug(f"Added shape variables: {valid_shape_names}")
-                        self.shapes_variables[subroutine_key].update(valid_shape_names)
+                                name.tostr() is not None and
+                                name.tostr() != 'None' and
+                                name.tostr().strip() != '' and
+                                name.tostr() not in self.exclude and 
+                                name.tostr() not in seen
+                                ):
+                            #valid_shape_names.append(name.string)
+                            self.shapes_variables[subroutine_key].append(name)
+                            seen.add(name.string)
+                    #if valid_shape_names:
+                    #    self.processor.logger.debug(f"Added shape variables: {valid_shape_names}")
+                    #    self.shapes_variables[subroutine_key].update(valid_shape_names)
                 else:
                     assert dec_stmt, 'The scalar must be a Type_Declaration_Stmt!'
                     array = walk(item, F23.Dimension_Attr_Spec)
                     if not array:
+                        seen = {n.string for n in self.scalar_variables[subroutine_key]}
                         names = walk(walk(item, F23.Entity_Decl), F23.Name)
-                        valid_scalar_names = []
+                        #valid_scalar_names = []
                         for name in names:
                             if (name is not None and
-                                    hasattr(name, 'string') and
-                                    name.string is not None and
-                                    name.string != 'None' and
-                                    name.string.strip() != '' and
-                                    name.string not in self.exclude):
-                                valid_scalar_names.append(name.string)
-                        if valid_scalar_names:
-                            self.scalar_variables[subroutine_key].update(valid_scalar_names)
-                            self.processor.logger.debug(f"Added scalar variables: {valid_scalar_names}")
+                                    name.tostr() is not None and
+                                    name.tostr() != 'None' and
+                                    name.tostr().strip() != '' and
+                                    name.tostr() not in self.exclude and
+                                    name.tostr() not in seen
+                                    ):
+                                self.scalar_variables[subroutine_key].append(name)
+                                seen.add(name.string)
+                                #valid_scalar_names.append(name.string)
+                        #if valid_scalar_names:
+                        #    self.scalar_variables[subroutine_key].update(valid_scalar_names)
+                        #    self.processor.logger.debug(f"Added scalar variables: {valid_scalar_names}")
                         #if name[0].string not in self.exclude:
                         #    self.scalar_variables[subroutine_key].add(name[0].string)
 
@@ -1317,8 +1424,8 @@ if __name__ == "__main__":
         
             # Test with complex module
             self.complex_extractor.find_subroutines()
-            self.assertEqual(self.complex_extractor.subroutine_keys_all, {"complex_sub", "helper_fn"})
-            self.assertEqual(self.complex_extractor.call_within_sub["complex_sub"], {"test_sub"})
+            self.assertEqual(self.complex_extractor.subroutine_keys_all, {'test_sub', 'complex_sub', 'helper_fn'})
+            self.assertEqual(set(self.complex_extractor.call_within_sub["complex_sub"].keys()), {"test_sub"})
 
         def test_extract_names(self):
             # Test name extraction
@@ -1435,7 +1542,7 @@ if __name__ == "__main__":
             self.simple_extractor.process_declaration_variables(self.simple_extractor.var_dummy[sub_key], sub_key)
         
             # Verify scalar and shaped variables
-            self.assertEqual(self.simple_extractor.scalar_variables[sub_key], {"a"})
-            self.assertEqual(self.simple_extractor.shapes_variables[sub_key], {"n"})
+            self.assertEqual(self.simple_extractor.scalar_variables[sub_key], [F23.Name("a")])
+            self.assertEqual(self.simple_extractor.shapes_variables[sub_key], [F23.Name("n")])
         
     unittest.main()

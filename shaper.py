@@ -85,7 +85,7 @@ class Shaper:
     Processor : For Fortran parsing utilities
     """
 
-    def __init__(self, module_dir, parsed_modules, dummy_arg_list, actual_arg_spec_list=None, call_subroutines=None):
+    def __init__(self, module_dir, parsed_modules, module_path,dummy_arg_list, actual_arg_spec_list=None, call_subroutines=None):
         """
         Initialize the Shaper with module directory, parsed modules, and argument mappings.
         
@@ -109,6 +109,7 @@ class Shaper:
         self.current_module_imp = ''
         self.module_tree_imp = None
         self.parsed_modules = parsed_modules
+        self.module_path = module_path
         self.processor = Processor()
         self.cases_to_exclude = ['clear', 'finalize', 'init', 'initialize', 'read']
 
@@ -283,7 +284,7 @@ class Shaper:
                     act_arg, subroutine_key, module_name
                     )
 
-            self.finder = Navigator(self.module_dir_imp, self.module_tree_imp, self.parsed_modules)
+            self.finder = Navigator(self.module_dir_imp, self.module_tree_imp, self.parsed_modules, self.module_path)
             self.finder.variable_finder(act_arg)
             return self.processor.combine_allocate_declaration(self.finder.var_declaration)
         
@@ -648,6 +649,9 @@ class TestShaper(unittest.TestCase):
         cls.parsed_modules = {
             "level1_mod": cls.level1_tree
         }
+        cls.module_path = {
+                "level1_mod": cls.level1_module
+                }
 
     @classmethod
     def tearDownClass(cls):
@@ -674,6 +678,7 @@ class TestShaper(unittest.TestCase):
         self.shaper_level1 = Shaper(
             self.test_dir,
             self.parsed_modules,
+            self.module_path,
             self.dummy_arg_list,
             self.actual_arg_spec_list,
             self.call_subroutines
@@ -779,6 +784,7 @@ class TestShaper(unittest.TestCase):
         mixed_shaper = Shaper(
             self.test_dir,
             self.parsed_modules,
+            self.module_path,
             self.dummy_arg_list,
             self.actual_arg_spec_list,
             self.call_subroutines

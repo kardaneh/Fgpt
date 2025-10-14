@@ -90,7 +90,7 @@ class Navigator:
     Processor : Supporting class for Fortran parsing utilities
     """
 
-    def __init__(self, subroutine_dir, module_tree, parsed_modules):
+    def __init__(self, subroutine_dir, module_tree, parsed_modules, module_path):
         """
         Initialize the Navigator with directory, module tree, and parsed modules.
         
@@ -117,6 +117,7 @@ class Navigator:
         self.main_dir = 'src_driver'
         self.full_scout = False
         self.parsed_modules = parsed_modules
+        self.module_path = module_path
         self.processor = Processor()
 
     def find_variable_in_module(self):
@@ -181,8 +182,9 @@ class Navigator:
                                         break
                             else:
                                 stmt = stmts
-                            any_additional = walk(walk(stmt, F23.Initialization), F23.Name)
-                            self.var_initial = [nadi.string for nadi in any_additional]
+                            #any_additional 
+                            self.var_initial = walk(walk(stmt, F23.Initialization), F23.Name)
+                            #self.var_initial = [nadi.string for nadi in any_additional]
                             self.var_declaration.append(stmt)
                             self.processor.logger.info(
                                     f"'{self.variable_name_sc}' is found in '{morr}' of the module '{module_name}'"
@@ -194,7 +196,7 @@ class Navigator:
                             function_name = child
                             function_subprogram = child.parent.parent
                             #function_module = child.get_root()
-                            self.var_declaration.extend([function_name,function_subprogram]) ###, function_module, self.module_dir_sc])
+                            self.var_declaration.extend([function_name,function_subprogram, module_name]) ###, function_module, self.module_dir_sc])
 
             if self.var_declaration:
                 self.return_key_sc = True
@@ -420,6 +422,7 @@ class Navigator:
                 if module_name in self.parsed_modules:
                     module_found = True
                     child_module_tree = self.parsed_modules[module_name]
+                    self.module_dir_sc = os.path.dirname(self.module_path[module_name])
                 else:
                     module_filename_lower = os.path.join(self.module_dir_sc, module_name + ".f90")
                     module_filename_upper = os.path.join(self.module_dir_sc, module_name + ".F90")
@@ -429,6 +432,7 @@ class Navigator:
                         child_module_tree = self.processor.parse_fortran_file(selected_filename)
                         module_found = True
                         self.parsed_modules[module_name] = child_module_tree
+                        self.module_path[module_name] = selected_filename
                     else:
                         parent_directory = os.path.abspath(os.path.join(self.module_dir_sc, '../'))
                         for directory in os.listdir(parent_directory):
@@ -445,6 +449,7 @@ class Navigator:
                                         self.module_dir_sc = full_directory
                                         module_found = True
                                         self.parsed_modules[module_name] = child_module_tree
+                                        self.module_path[module_name] = selected_filename
                                         break 
                 if module_found:
                     self.visited_modules_sc.add(module_name)
@@ -546,6 +551,10 @@ class TestNavigator(unittest.TestCase):
             "simple_mod": cls.simple_tree,
             "dependent_mod": cls.dependent_tree
         }
+        cls.module_path = {
+                "simple_mod": cls.simple_module,
+                "dependent_mod":cls.dependent_module
+                }
 
     @classmethod
     def tearDownClass(cls):
@@ -554,8 +563,8 @@ class TestNavigator(unittest.TestCase):
 
     def setUp(self):
         # Create fresh Navigator instances for each test
-        self.simple_navigator = Navigator(self.test_dir, self.simple_tree, self.parsed_modules)
-        self.dependent_navigator = Navigator(self.test_dir, self.dependent_tree, self.parsed_modules)
+        self.simple_navigator = Navigator(self.test_dir, self.simple_tree, self.parsed_modules, self.module_path)
+        self.dependent_navigator = Navigator(self.test_dir, self.dependent_tree, self.parsed_modules, self.module_path)
 
     def test_initialization(self):
         # Test that initialization sets up all attributes correctly
