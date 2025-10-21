@@ -232,7 +232,7 @@ class Processor:
             self.logger.error(f"Error finding enclosing parent of type {parent_type.__name__}: {e}")
             return None
 
-    def initiate_empty_routine(self, subroutine_name):
+    def initiate_empty_routine(self, subroutine_name,  bin_filename="dummy.bin", routine_name="read_dummy"):
         """
         Generates a dummy Fortran subroutine with an open statement and a print,
         then parses and returns its AST node.
@@ -263,10 +263,10 @@ class Processor:
         """
         try:
             code_template = f"""
-            subroutine read_dummy()
-                open(unit=1363, file='{self.benchmark_dir}/{subroutine_name}/dummy.bin', form='unformatted', status='old')
-                write(*,*) '--- inside the read dummy routine for {subroutine_name} ---'
-            end subroutine read_dummy
+            subroutine {routine_name}()
+                open(unit=1363, file='{self.benchmark_dir}/{subroutine_name}/{bin_filename}', form='unformatted', status='old')
+                write(*,*) '--- inside the {routine_name} routine for {subroutine_name} ---'
+            end subroutine {routine_name}
             """
             reader = FortranStringReader(code_template, ignore_comments=True)
             parse_tree = self.parser(reader)
@@ -693,10 +693,6 @@ class Processor:
         integer(kind = i_std)            :: ic0, ic
         real(kind = r_std)               :: icr, start_time, stop_time
         contains
-        subroutine declaration_initialization()
-        open(unit=1363, file='{self.benchmark_dir}/{subroutine_name}/global.bin', form='unformatted', status='old')
-        write(*,*)'--- add the declaration and initialization in module global ---'
-        end subroutine declaration_initialization
         end module module_global
         """
         try:
@@ -873,7 +869,7 @@ class Processor:
             self.logger.error(f"Failed to write code to file: {file_path}, Error: {e}")
             raise
 
-    def update_global_module(self, input_dict, file_path, subroutine_name, procedure_tree):#call_site=None):
+    def update_global_module(self, input_dict, file_path, subroutine_name, procedure_tree, custom_subroutine_trees):
         """
         Update the global Fortran module by injecting declarations, use statements,
         and I/O operations related to global variables and routines.
@@ -906,33 +902,6 @@ class Processor:
         try:
             subroutine_found = False
             self.out_module = self.out_module_fortran(subroutine_name)
-            """if call_site is not None:
-                assert isinstance(call_site, (F23.Call_Stmt, F23.Assignment_Stmt)), \
-                        f"call_site must be F23.Call_Stmt or F23.Assignment_Stmt, got {type(call_site)}"
-                parent_node = call_site.parent
-                assert hasattr(parent_node, 'content') and isinstance(parent_node.content, list), \
-                            f"parent_node {type(parent_node)} must have a mutable 'content' list"
-                idx = parent_node.content.index(call_site)
-                open_stmt = F23.Open_Stmt(f"open(unit=1363, file='{self.benchmark_dir}/{subroutine_name}/global.bin', form='unformatted', status='replace')")
-                close_stmt = F23.Close_Stmt("close(1363)")
-                    
-                new_stmts = [open_stmt] + self.write_stmt + [close_stmt]
-
-                for stmt in new_stmts:
-                    stmt.parent = parent_node
-
-                parent_node.content[idx+1:idx+1] = new_stmts
-                subroutine_found = True
-                if isinstance(call_site, F23.Call_Stmt):
-                    self.logger.info(f"Directly modified subroutine call site for '{subroutine_name}': {call_site.tostr()}")
-                else:
-                    self.logger.info(f"Directly modified function call site for '{subroutine_name}': {call_site.tostr()}")
-            
-            if not subroutine_found:
-                error_msg = f"Could not find call site for subroutine '{subroutine_name}'"
-                self.logger.error(error_msg)
-                raise ValueError(error_msg)
-            """
             assert procedure_tree is not None, "procedure_tree must be provided"
             assert isinstance(procedure_tree, (F23.Function_Subprogram, F23.Subroutine_Subprogram)),\
                         f"procedure_tree must be Function_Subprogram or Subroutine_Subprogram, got {type(procedure_tree)}"
@@ -992,27 +961,8 @@ class Processor:
                                 subnode.content.insert(ldx + 1, self.acc_declare_create_cmd)
                                 ldx += 1
                         elif isinstance(subnode, F23.Module_Subprogram_Part):
-                            for jdx, subsubnode in enumerate(subnode.content):
-                                if isinstance(subsubnode, F23.Subroutine_Subprogram):
-                                    subroutine = walk(subsubnode, F23.Name)[0].string
-                                    for kdx, subsubsubnode in enumerate(subsubnode.content):
-                                        if isinstance(subsubsubnode, F23.Execution_Part):
-                                            ldx = len(subsubsubnode.content) - 1
-                                            if subroutine == 'declaration_initialization':
-                                                for stmt in self.reads_in_decleration_routine:
-                                                    subsubsubnode.content.insert(ldx + 1, stmt)
-                                                    ldx += 1
-                                                for stmt in self.add_to_routin:
-                                                    subsubsubnode.content.insert(ldx + 1, stmt)
-                                                    ldx += 1
-                                                for stmt in self.reads_in_read_routine:
-                                                    subsubsubnode.content.insert(ldx + 1, stmt)
-                                                    ldx += 1
-                                                subsubsubnode.content.insert(ldx + 1,F23.Close_Stmt(f"close(1363)"))
-                                                ldx += 1
-                                                if self.acc_declare_create:
-                                                    subsubsubnode.content.insert(ldx + 1, self.acc_update_device_cmd)
-                                                    ldx += 1
+                            for custom_subroutine_tree in custom_subroutine_trees:
+                                node.content.insert(idx + 1, custom_subroutine_tree)
             self.logger.info("Successfully updated the global module")
             self.write_fortran_code_to_file(self.out_module, file_path)
         except Exception as e:
@@ -1022,14 +972,12 @@ class Processor:
     def update_main_program(
             self,
             custom_dec_inout,
-            custom_subroutine_trees,
             call_stmts,
             var_modif,
             file_path,
             subroutine_name,
             dummy_args,
             call_site=None,
-            childs_subroutine_tree=None,
             openacc=False,
             dummy_add_decl=None,
             error_flag=None,
@@ -1089,10 +1037,13 @@ class Processor:
             custom_module_name = walk(walk(self.out_module,F23.Module_Stmt), F23.Name)[0].string
             custom_subroutines_names = [name.string for name in walk(walk(self.out_module,F23.Subroutine_Stmt),F23.Name)]
             initialization_part = self.initialization_statement(custom_dec_inout)
+            global_read_routine = self.generate_global_read_routine(subroutine_name)
+            #node.content.insert(idx + 1, global_read_routine)
+
             if self.dummy_list:
                 self.logger.info("Need to build an initialization for IN/INOUT dummy args.")
                 specification_part_dummy = self.remove_intent_and_save(self.dummy_list)
-                block_tree = self.generate_read_routine(specification_part_dummy, initialization_part, subroutine_name)
+                block_tree = self.generate_dummy_read_routine(specification_part_dummy, initialization_part, subroutine_name)
 
             if dummy_add_decl is not None:
                 custom_dec_inout.append(dummy_add_decl)
@@ -1279,11 +1230,7 @@ class Processor:
                         elif isinstance(subnode, F23.Internal_Subprogram_Part):
                             if self.dummy_list:
                                 node.content.insert(idx + 1, block_tree)
-                            for custom_subroutine_tree in custom_subroutine_trees:
-                                node.content.insert(idx + 1, custom_subroutine_tree)
-                            if childs_subroutine_tree is not None:
-                                for child_subroutine in childs_subroutine_tree:
-                                    node.content.insert(idx + 1, child_subroutine)
+                            node.content.insert(idx + 1, global_read_routine)
             self.logger.info("Successfully updated the main program")
             self.write_fortran_code_to_file(self.out_main, file_path)
         except Exception as e:
@@ -1379,35 +1326,47 @@ class Processor:
             self.logger.error("An error occurred in creating a Call_Stmt object: %s", e)
             raise
 
-    def generate_read_routine(self, specification_part, initialization_part, subroutine_name):
+    def generate_global_read_routine(self, subroutine_name):
+
+        try:
+            # Create the base subroutine using initiate_empty_routine
+            subroutine_node = self.initiate_empty_routine(
+                    subroutine_name=subroutine_name,
+                    bin_filename="global.bin",
+                    routine_name="declaration_initialization"
+                    )
+
+            # Now modify the subroutine using your existing logic
+            if hasattr(subroutine_node, "content"):
+                for kdx, subsubsubnode in enumerate(subroutine_node.content):
+                    if isinstance(subsubsubnode, F23.Execution_Part):
+                        ldx = len(subsubsubnode.content) - 1
+
+                        for stmt in self.reads_in_decleration_routine:
+                            subsubsubnode.content.insert(ldx + 1, stmt)
+                            ldx += 1
+
+                        for stmt in self.add_to_routin:
+                            subsubsubnode.content.insert(ldx + 1, stmt)
+                            ldx += 1
+
+                        for stmt in self.reads_in_read_routine:
+                            subsubsubnode.content.insert(ldx + 1, stmt)
+                            ldx += 1
+                        subsubsubnode.content.insert(ldx + 1, F23.Close_Stmt("close(1363)"))
+                        ldx += 1
+
+                        if self.acc_declare_create:
+                            subsubsubnode.content.insert(ldx + 1, self.acc_update_device_cmd)
+                            ldx += 1
+
+            return subroutine_node
+        except Exception as e:
+            self.logger.error(f"Failed to generate global module routine, Error: {e}")
+            raise
+
+    def generate_dummy_read_routine(self, specification_part, initialization_part, subroutine_name):
         """
-        Generates a complete Fortran subroutine that reads input data from file
-        and initializes dummy variables.
-
-        This method creates a new subroutine based on a template, inserts dummy
-        argument declarations and initialization `READ` statements, and finalizes
-        the subroutine with a `CLOSE` statement for the file unit.
-
-        Parameters:
-            specification_part (list):
-                A list of `F23.Type_Declaration_Stmt` nodes that declare dummy variables
-                and their types, shapes, etc.
-
-            initialization_part (list):
-                A list of `F23.Read_Stmt` nodes used to read input values from a binary file
-                into the declared dummy arguments.
-
-            subroutine_name (str):
-                Name of the generated subroutine, used to customize the header.
-
-        Returns:
-            Fparser2Node:
-                An updated Fortran subroutine block (`Fparser2Node`) with appropriate declarations,
-                dummy argument interface, and input reading logic inserted.
-
-        Raises:
-            Exception:
-                If any error occurs during construction of the subroutine block, it is logged and raised.
         """
         try:
             block = self.initiate_empty_routine(subroutine_name)
@@ -1440,7 +1399,7 @@ class Processor:
                     idc += 1
                 return block
         except Exception as e:
-            self.logger.error(f"Failed to generate read routine, Error: {e}")
+            self.logger.error(f"Failed to generate dummy read routine, Error: {e}")
             raise
 
     def initialization_statement(self, items):
@@ -1659,32 +1618,6 @@ class Processor:
         This method assumes that `self.is_constant_initialization(init_node)` is available
         in the containing class to check whether a variable is initialized with a literal value.
         """
-        #try:
-        #    queue = deque(input_list)
-        #    left_list = []
-        #    middle_list = []
-        #    right_list = []
-        #    while queue:
-        #        element = queue.popleft()
-        #        attr_spec = [case.string for case in walk(element, F23.Attr_Spec)]
-        #        array = walk(element, F23.Explicit_Shape_Spec)
-        #        if 'PARAMETER' in attr_spec and not array:
-        #            initialization = walk(walk(element, F23.Initialization), F23.Name)
-        #            if initialization:
-        #                left_list.append(element)    ###insert(0, element)
-        #            else:
-        #                left_list.insert(0, element) ###append(element)
-        #        elif 'ALLOCATABLE' in attr_spec or array:
-        #            right_list.append(element)
-        #        else:
-        #            middle_list.append(element)
-        #    combined_list = left_list + middle_list + right_list
-        #    self.logger.info(f"Processing complete. PARAMETER elements sent to the left.")
-        #    return list(combined_list)
-        #except Exception as e:
-        #    self.logger.error(f"An error occurred while processing the queue: {e}")
-        #    raise
-
         try:
             queue = deque(input_list)
 
@@ -2027,7 +1960,7 @@ if __name__ == "__main__":
             module_tree = self.processor.out_module_fortran("test_sub")
             self.assertIsInstance(module_tree.children[1], F23.Module)
             self.assertIn("module_global", module_tree.tostr())
-            self.assertIn("declaration_initialization", module_tree.tostr())
+            #self.assertIn("declaration_initialization", module_tree.tostr())
 
         def test_check_point(self):
             # Test creating check point for real scalar
@@ -2084,13 +2017,13 @@ if __name__ == "__main__":
             self.assertIsInstance(call_stmt, F23.Call_Stmt)
             self.assertEqual(call_stmt.tostr(), F23.Call_Stmt("CALL test(a)").tostr())
 
-        def test_generate_read_routine(self):
+        def test_generate_dummy_read_routine(self):
             # Test generating read routine
             decl = "integer :: a"
             parsed_decl = self.processor.parse_fortran_statement(decl)
             init = self.processor.initialization_statement([parsed_decl.children[0]])
             
-            routine = self.processor.generate_read_routine([parsed_decl.children[0]], init, "test_sub")
+            routine = self.processor.generate_dummy_read_routine([parsed_decl.children[0]], init, "test_sub")
             self.assertIsInstance(routine, F23.Subroutine_Subprogram)
             self.assertIn("READ(1363", routine.tostr())
             self.assertIn("dummy.bin", routine.tostr())

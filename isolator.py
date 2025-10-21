@@ -198,7 +198,8 @@ class Isolator:
                 cls.dec_global[child_procedure], 
                 file_path,
                 child_procedure,
-                procedure_tree
+                procedure_tree,
+                sub_trees
                 )
 
         arg_list = ', '.join([name for name in cls.dummy_arg_list[child_procedure]])
@@ -215,14 +216,12 @@ class Isolator:
 
         self.processor.update_main_program(
                 custom_dec_inout=cls.var_dummy[child_procedure],
-                custom_subroutine_trees=sub_trees,
                 call_stmts=call_stmts,
                 var_modif=cls.var_modif_info[child_procedure],
                 file_path=file_path,
                 subroutine_name=child_procedure,
                 dummy_args=cls.dummy_arg_list[child_procedure],
                 call_site=call_statements[0],
-                childs_subroutine_tree=None,
                 openacc=self.openacc,
                 dummy_add_decl=None,
                 error_flag=None,
