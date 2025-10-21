@@ -152,16 +152,13 @@ class Navigator:
                 for child in names:
                     if child.string == self.variable_name_sc:
                         stmts = child.parent.parent.parent
-                        #name = stmts.parent.parent
-                        #morr = walk(name, F23.Name)[0].string
-                        current = stmts
-                        while current is not None and not isinstance(current, (F23.Subroutine_Subprogram, F23.Function_Subprogram, F23.Module)):
-                            current = getattr(current, "parent", None)
-                        morr = walk(current, F23.Name)[0].string
                         any_allocate = walk(self.var_declaration, F23.Allocate_Stmt)
                         any_declarat = walk(self.var_declaration, F23.Type_Declaration_Stmt)
-                        if (isinstance(stmts, F23.Type_Declaration_Stmt) and not any_declarat) or \
-                                (isinstance(stmts, F23.Allocate_Stmt) and not any_allocate):
+                        if (isinstance(stmts, F23.Type_Declaration_Stmt) and not any_declarat) or (isinstance(stmts, F23.Allocate_Stmt) and not any_allocate):
+                            current = stmts
+                            while current is not None and not isinstance(current, (F23.Subroutine_Subprogram, F23.Function_Subprogram, F23.Module)):
+                                current = getattr(current, "parent", None)
+                            morr = walk(current, F23.Name)[0].string
                             if isinstance(stmts, F23.Type_Declaration_Stmt) and len(walk(stmts, F23.Entity_Decl)) > 1:
                                 for decleration in self.processor.separate_entity_declarations(stmts):
                                     entity_decls = walk(decleration, F23.Entity_Decl)
@@ -182,9 +179,7 @@ class Navigator:
                                         break
                             else:
                                 stmt = stmts
-                            #any_additional 
                             self.var_initial = walk(walk(stmt, F23.Initialization), F23.Name)
-                            #self.var_initial = [nadi.string for nadi in any_additional]
                             self.var_declaration.append(stmt)
                             self.processor.logger.info(
                                     f"'{self.variable_name_sc}' is found in '{morr}' of the module '{module_name}'"
@@ -195,8 +190,7 @@ class Navigator:
                             self.processor.logger.warning("The containing directory is: %s", self.module_dir_sc)
                             function_name = child
                             function_subprogram = child.parent.parent
-                            #function_module = child.get_root()
-                            self.var_declaration.extend([function_name,function_subprogram, module_name]) ###, function_module, self.module_dir_sc])
+                            self.var_declaration.extend([function_name,function_subprogram, module_name])
 
             if self.var_declaration:
                 self.return_key_sc = True

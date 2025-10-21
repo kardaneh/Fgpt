@@ -26,7 +26,7 @@ class Extractor:
             self.actual_arg_spec_list = defaultdict(list)
             self.external_subroutines = set()
             self.call_subroutines = defaultdict(list)
-            self.call_within_sub = defaultdict(lambda: defaultdict(list)) ##defaultdict(set)
+            self.call_within_sub = defaultdict(lambda: defaultdict(list))
             self.loop_dict = defaultdict(set)
             self.loop_vect = defaultdict(lambda: None)
             self.exclude = {'kjpindex', 'nslm', 'nstm', 'nvm', 'nsnow', 'nice', 'DIM', 'dim', 'MASK', 'next_calc_loop'}
@@ -40,10 +40,11 @@ class Extractor:
             self.var_modif_info = defaultdict(lambda: defaultdict(list))
             self.general_usage_dict = defaultdict()
             self.parsed_modules = defaultdict()
-            self.var_global = defaultdict(list) #defaultdict(set)
+            self.var_global = defaultdict(list)
             self.var_dummy = defaultdict(list)
             self.var_local = defaultdict(list)
             self.var_modif = defaultdict(set)
+            self.var_in_local = defaultdict(set)
             self.var_local_names = defaultdict(set)
             self.var_declared = defaultdict(set)
             self.module_global_stock = {}
@@ -316,8 +317,9 @@ class Extractor:
                                             module_subroutines_avail.add(sub_name)
                         
                     else:
+                        continue
                         # call to ioipsl, xios are allowed, so, instead of call_name, subroutine_key is added!
-                        self.subroutine_keys_ncl.add(subroutine_key)
+                        #self.subroutine_keys_ncl.add(subroutine_key) 
 
                     # Extract and store actual arguments from call
                     if actual_arg_spec_list is not None:
@@ -336,10 +338,6 @@ class Extractor:
 
         # Identify external subroutines (called but not defined in module)
         self.external_subroutines.update(self.allowed_external_subroutines)
-        #self.external_subroutines = {
-        #        item for item in self.actual_arg_spec_list.keys()
-        #        if item not in self.dummy_arg_list.keys()
-        #        }
 
     def extract_function_dummy_args(self, function_tree):
         """
@@ -374,118 +372,164 @@ class Extractor:
         
         self.subroutines[function_key] = function_tree
 
-    def find_function_actual_args(self, function_name):
+
+    def _process_intent_assignment_statement(self, child, child_parent, dummy_arg_list, usage):
         """
-        Find actual arguments passed to function calls in the extractor's module tree.
-
-        Parameters
-        ----------
-        function_name : str
-            Name of the function to search for
-
-        Returns
-        -------
-        dict
-            Dictionary mapping call locations to actual argument lists.
-            Each key is a string representation of the call statement/assignment,
-            and each value is a dictionary with:
-            - 'location': Information about where the call occurs
-            - 'actual_arguments': List of actual argument names
-
         """
-    
-        actual_args_map = {}
+        lhs_expr = child.items[0]
+        rhs_expr = child.items[-1]
 
-        # Search for function calls in assignments (Part_Ref nodes)
-        assignments = walk(self.module_tree, F23.Assignment_Stmt)
+        # Find all variable names in this assignment statement
+        for name in walk(child, F23.Name):
+            var_name = name.tostr()
 
-        for assign in assignments:
-            part_refs = walk(assign, F23.Part_Ref)
+            # Compute read/write once
+            is_write = any(var_name == node.tostr() for node in walk(lhs_expr, F23.Name))
+            is_read = any(var_name == node.tostr() for node in walk(rhs_expr, F23.Name))
 
-            for part in part_refs:
-                part_name = part.children[0]  # Name node
+            # Only process if this is a dummy argument
+            if var_name in dummy_arg_list:
 
-                if part_name.string == function_name:
+                # CONDITIONAL CONTEXT TRACKING
+                # Check if we're inside an IF construct AND we already recorded a first use
+                # AND that first use was in the same IF construct
+                if isinstance(child_parent, F23.If_Construct):
 
-                    # Extract actual arguments
-                    section_subscripts = part.children[1]
-                    if section_subscripts is not None:
-                        # Extract argument names
-                        actual_args = [arg.tostr() for arg in section_subscripts.children]
+                    # Get the index of current child within the IF construct
+                    current_index = child_parent.children.index(child)
 
-                    self.actual_arg_spec_list[function_name].append(actual_args)
-                    self.call_subroutines[function_name].append(part)
+                    # Find all branch boundary indices (IF, ELSEIF, ELSE)
+                    branch_boundaries = []
+                    for i, stmt in enumerate(child_parent.children):
+                        if isinstance(stmt, (F23.If_Then_Stmt, F23.Else_If_Stmt, F23.Else_Stmt)):
+                            branch_boundaries.append(i)
+                    
+                    # Determine which branch the current statement is in
+                    current_branch = 0
+                    for boundary_index in sorted(branch_boundaries):
+                        if current_index > boundary_index:
+                            current_branch += 1
+                        else:
+                            break
 
-    def extract_names(self, subroutine_key):
+                    # RESET first_use_update for this variable at the start
+                    usage[var_name]['first_use_update'] = False
+
+                    # Check if we should allow update
+                    if usage[var_name]['first_use_assign'] is not None and usage[var_name]['first_use_assign'].parent == child_parent:
+                        first_use_index = child_parent.children.index(usage[var_name]['first_use_assign'])
+
+                        # Determine which branch the first use was in
+                        first_use_branch = 0
+                        for boundary_index in sorted(branch_boundaries):
+                            if first_use_index > boundary_index:
+                                first_use_branch += 1
+                            else:
+                                break
+
+                        # Only update if we're in a DIFFERENT branch than the first use
+                        if current_branch != first_use_branch:
+                            usage[var_name]['first_use_update'] = True
+
+
+                # UPDATE FIRST USE ASSIGNMENT
+                # If this is the first time we see this variable OR we're in update mode
+                #if is_write:
+                if usage[var_name]['first_use_assign'] is None or usage[var_name]['first_use_update']:
+                        # Record this statement as the (current) first use
+                        usage[var_name]['first_use_assign'] = child
+
+                # CHECK IF VARIABLE IS IN ARRAY SUBSCRIPT (read-only context)
+                if isinstance(name.parent, F23.Section_Subscript_List):
+                    # Array subscripts are always read-only usage
+                    if usage[var_name]['intent'] is None:
+                        usage[var_name]['intent'] = 'IN'
+                else:
+                    # CHECK LEFT-HAND SIDE USAGE (WRITE)
+                    if is_write:
+                        if usage[var_name]['intent'] is None:
+                            # First usage is write → INTENT(OUT)
+                            usage[var_name]['intent'] = 'OUT'
+                        elif usage[var_name]['intent'] == 'IN':
+                            # Was read-only, now being written → INTENT(INOUT)
+                            usage[var_name]['intent'] = 'INOUT'
+
+                    # CHECK RIGHT-HAND SIDE USAGE (READ)
+                    if is_read:
+                        if usage[var_name]['intent'] is None:
+                            # First usage is read → INTENT(IN)
+                            usage[var_name]['intent'] = 'IN'
+                        # safer for inout than checking out
+                        elif usage[var_name]['intent'] == 'OUT': #and usage[var_name]['first_use_assign'] == child:
+                            # Special case: reading and writing in SAME first use statement → INTENT(INOUT)
+                            usage[var_name]['intent'] = 'INOUT'
+
+
+    def _process_intent_read_only_statement(self, child, child_parent, dummy_arg_list, usage):
         """
-        Extracts the names of the local variables using the var_local attribute based on the given subroutine key argument. 
-        The var_local attribute contains a list of Type_Declaration_Stmt from which extraction of the variables names is done. 
-
-        params
-        ------
-        - subroutine_key (str):  
-        
-        return
-        ------
-        - None 
         """
-        for item in self.var_local[subroutine_key]:
-            for entity in walk(item, F23.Entity_Decl):
-                for child in entity.children:
-                    if isinstance(child, F23.Name):
-                        self.var_local_names[subroutine_key].add(child.tostr())
-        #return self.var_local_names[subroutine_key]
+        for name in walk(child, F23.Name):
+            var_name = name.tostr()
+            if var_name in dummy_arg_list:
+                # Conditional context tracking
+                if isinstance(child_parent, F23.If_Construct) and \
+                        usage[var_name]['first_use_assign'] is not None and \
+                        usage[var_name]['first_use_assign'].parent == child_parent:
+                    usage[var_name]['first_use_update'] = True
+
+                # Update first_use_assign
+                if usage[var_name]['first_use_assign'] is None or usage[var_name]['first_use_update']:
+                    usage[var_name]['first_use_assign'] = child
+
+                # All variables in DO statements are read-only
+                if usage[var_name]['intent'] is None:
+                    usage[var_name]['intent'] = 'IN'
+
+    def _process_intent_call_statement(self, child, child_parent, dummy_arg_list, usage, within_calls):
+        """
+        """
+        call_name = None
+        if child.children[0].tostr() not in self.allowed_external_subroutines:
+            for grandchild in child.children:
+                if grandchild is None:
+                    continue
+                if isinstance(grandchild, F23.Name):
+                    call_name = grandchild.tostr()
+                    assert call_name in within_calls, f"Error: {call_name} not found in within_calls"
+                    assert call_name in self.general_usage_dict, f"Error: {call_name} not found in self.general_usage_dict"
+                elif isinstance(grandchild, F23.Actual_Arg_Spec_List):
+                    assert call_name is not None, 'call_name is not defined yet'
+                    actual_args = [arg.tostr() for arg in grandchild.children]
+
+                    # Process by POSITION to handle duplicate arguments correctly
+                    for i, name in enumerate(grandchild.children):
+                        var_name = name.tostr()
+                        if var_name in dummy_arg_list:
+                            # Conditional context tracking
+                            if isinstance(child_parent, F23.If_Construct) and \
+                                    usage[var_name]['first_use_assign'] is not None and \
+                                    usage[var_name]['first_use_assign'].parent == child_parent:
+                                usage[var_name]['first_use_update'] = True
+
+                            # Update first_use_assign
+                            if usage[var_name]['first_use_assign'] is None or usage[var_name]['first_use_update']:
+                                usage[var_name]['first_use_assign'] = child
+
+                            # Map by POSITION: actual argument i → dummy argument i
+                            corresponding_element = self.dummy_arg_list[call_name][i]
+                            call_intent = self.general_usage_dict[call_name][corresponding_element]
+                            current_intent = usage[var_name]['intent']
+
+                            if current_intent is None:
+                                usage[var_name]['intent'] = call_intent
+                            elif current_intent == 'IN' and call_intent in {'OUT', 'INOUT'}:
+                                usage[var_name]['intent'] = 'INOUT'
+                            elif current_intent == 'OUT' and call_intent == 'INOUT':
+                                usage[var_name]['intent'] = 'INOUT'
+                            # current_intent == 'INOUT' remains 'INOUT' (implicit)
 
     def extract_intent(self, subroutine_key, subroutine_tree, within_calls=None):
         """
-        Analyze the usage of dummy arguments within a Fortran subroutine and 
-        infer their INTENT attribute (IN, OUT, or INOUT).
-
-        This function traverses the execution part of the given subroutine and 
-        tracks how each dummy argument is used:
-    
-        - If a variable is used only on the right-hand side of expressions (e.g., in conditions or RHS of assignments), 
-            it is classified as INTENT(IN).
-        - If a variable appears on the left-hand side (LHS) of an assignment, it is classified as INTENT(OUT).
-        - If a variable is both read and written (RHS and LHS), or passed to a child subroutine with a known 
-            INTENT(INOUT), it is classified as INTENT(INOUT).
-    
-        The function handles various Fortran constructs:
-            - Assignment statements
-            - Loop headers (e.g., DO loops)
-            - Conditional branches (IF-THEN, ELSEIF)
-            - WHERE and ELSEWHERE constructs
-            - Nested subroutine calls
-    
-        In the case of subroutine calls, if a dummy argument is passed to a child subroutine, the method also 
-        references the intent already extracted for the child (from `self.general_usage_dict`) to propagate 
-        intent information upward through the call hierarchy.
-
-        The results are stored in `self.general_usage_dict` under the corresponding `subroutine_key`.
-
-        Parameters:
-        -----------
-        subroutine_key : str
-            The name of the subroutine being analyzed.
-    
-        subroutine_tree : Fparser node (Subroutine_Subprogram)
-            The parsed tree representation of the subroutine.
-
-        within_calls : set[str], optional
-            Set of subroutine names called within the current subroutine. Used for validating and propagating
-            intent information when dummy arguments are passed to internal calls.
-
-        Raises:
-        -------
-        AssertionError:
-            If expected subroutine calls or argument lists are not found.
-    
-        RuntimeError:
-            If traversal encounters unexpected structures.
-
-        Returns:
-        --------
-        None (results stored in self.general_usage_dict)
         """
         dummy_arg_list = self.dummy_arg_list[subroutine_key]
         usage = {arg: {'intent': None, 'first_use_assign': None, 'first_use_update': False} for arg in dummy_arg_list}
@@ -494,113 +538,31 @@ class Extractor:
                 for child in block.content:
                     child_parent = child.parent
                     if isinstance(child, F23.Assignment_Stmt):
-                        lhs_expr = child.items[0].tostr()
-                        rhs_expr = child.items[-1].tostr()
-                        for name in walk(child, F23.Name):
-                            var_name = name.tostr()
-                            pattern = r'\b' + re.escape(var_name) + r'\b'
-                            if var_name in dummy_arg_list:
-
-                                if isinstance(child_parent, F23.If_Construct) and \
-                                        usage[var_name]['first_use_assign'] is not None and \
-                                        usage[var_name]['first_use_assign'].parent == child_parent:
-                                    usage[var_name]['first_use_update'] = True
-
-                                if usage[var_name]['first_use_assign'] is None or usage[var_name]['first_use_update']:
-                                    usage[var_name]['first_use_assign'] = child
-
-                                if isinstance(name.parent, F23.Section_Subscript_List):
-                                    if usage[var_name]['intent'] is None:
-                                        usage[var_name]['intent'] = 'IN'
-                                else:
-                                    if re.search(pattern, lhs_expr):
-                                        if usage[var_name]['intent'] is None:
-                                            usage[var_name]['intent'] = 'OUT'
-                                        elif usage[var_name]['intent'] == 'IN':
-                                            usage[var_name]['intent'] = 'INOUT'
-
-                                    if re.search(pattern, rhs_expr):
-                                        if usage[var_name]['intent'] is None:
-                                            usage[var_name]['intent'] = 'IN'
-                                        elif usage[var_name]['intent'] == 'OUT' and usage[var_name]['first_use_assign'] == child:
-                                            usage[var_name]['intent'] = 'INOUT'
-
-                    elif isinstance(child, F23.Nonlabel_Do_Stmt):
-                        for name in walk(child, F23.Name):
-                            var_name = name.tostr()
-                            if var_name in dummy_arg_list:
-                                if isinstance(child_parent, F23.If_Construct) and \
-                                        usage[var_name]['first_use_assign'] is not None and \
-                                        usage[var_name]['first_use_assign'].parent == child_parent:
-                                    usage[var_name]['first_use_update'] = True
-                                if usage[var_name]['first_use_assign'] is None or usage[var_name]['first_use_update']:
-                                    usage[var_name]['first_use_assign'] = child
-                                if usage[var_name]['intent'] is None:
-                                    usage[var_name]['intent'] = 'IN'
-
-                    elif isinstance(child, (F23.If_Then_Stmt, F23.Else_If_Stmt)):
-                        for name in walk(child, F23.Name):
-                            var_name = name.tostr()
-                            if var_name in dummy_arg_list:
-                                if isinstance(child_parent, F23.If_Construct) and \
-                                        usage[var_name]['first_use_assign'] is not None and \
-                                        usage[var_name]['first_use_assign'].parent == child_parent:
-                                    usage[var_name]['first_use_update'] = True
-                                if usage[var_name]['first_use_assign'] is None or usage[var_name]['first_use_update']:
-                                    usage[var_name]['first_use_assign'] = child
-                                if usage[var_name]['intent'] is None:
-                                    usage[var_name]['intent'] = 'IN'
-
-                    elif isinstance(child, (F23.Where_Construct_Stmt, F23.Masked_Elsewhere_Stmt)):
-                        for name in walk(child, F23.Name):
-                            var_name = name.tostr()
-                            if var_name in dummy_arg_list:
-                                if isinstance(child_parent, F23.If_Construct) and \
-                                        usage[var_name]['first_use_assign'] is not None and \
-                                        usage[var_name]['first_use_assign'].parent == child_parent:
-                                    usage[var_name]['first_use_update'] = True
-                                if usage[var_name]['first_use_assign'] is None or usage[var_name]['first_use_update']:
-                                    usage[var_name]['first_use_assign'] = child
-                                if usage[var_name]['intent'] is None:
-                                    usage[var_name]['intent'] = 'IN'
+                        self._process_intent_assignment_statement(child, child_parent, dummy_arg_list, usage)
+                    elif isinstance(child, (
+                        F23.Nonlabel_Do_Stmt,
+                        F23.If_Then_Stmt, 
+                        F23.Else_If_Stmt,
+                        F23.Where_Construct_Stmt, 
+                        F23.Masked_Elsewhere_Stmt,
+                        F23.Select_Case_Stmt, 
+                        F23.Case_Stmt
+                        )
+                        ):
+                        self._process_intent_read_only_statement(child, child_parent, dummy_arg_list, usage)
 
                     elif isinstance(child, F23.Call_Stmt):
-                        call_name = None
-                        if child.children[0].tostr() not in self.allowed_external_subroutines:
-                            for grandchild in child.children:
-                                if grandchild is None:
-                                    continue
-                                if isinstance(grandchild, F23.Name):
-                                    call_name = grandchild.tostr()
-                                    assert call_name in within_calls, f"Error: {call_name} not found in within_calls"
-                                    assert call_name in self.general_usage_dict, f"Error: {call_name} not found in self.general_usage_dict"
-                                elif isinstance(grandchild, F23.Actual_Arg_Spec_List):
-                                    assert call_name is not None, 'call_name is not defined yet'
-                                    actual_arg = [arg.tostr() for arg in grandchild.children]
-                                    for name in grandchild.children:
-                                        if name.tostr() in dummy_arg_list:
-                                            var_name = name.tostr()
-                                            if isinstance(child_parent, F23.If_Construct) and \
-                                                    usage[var_name]['first_use_assign'] is not None and \
-                                                    usage[var_name]['first_use_assign'].parent == child_parent:
-                                                usage[var_name]['first_use_update'] = True
-                                            if usage[var_name]['first_use_assign'] is None or usage[var_name]['first_use_update']:
-                                                usage[var_name]['first_use_assign'] = child
-                                            current_intent = usage[var_name]['intent']
-                                            corresponding_element = self.dummy_arg_list[call_name][actual_arg.index(var_name)]
-                                            #call_intent = self.general_usage_dict[call_name][var_name]
-                                            call_intent = self.general_usage_dict[call_name][corresponding_element]
-                                            if current_intent is None:
-                                                usage[var_name]['intent'] = call_intent
-                                            elif current_intent == 'IN' and call_intent in {'OUT', 'INOUT'}:
-                                                usage[var_name]['intent'] ='INOUT'
-                                            elif current_intent == 'OUT' and call_intent == 'INOUT':
-                                                usage[var_name]['intent'] == 'INOUT'
+                        self._process_intent_call_statement(child, child_parent, dummy_arg_list, usage, within_calls)
+                    # ToDo, pointer assosiation, etc  
                     else:
                         traverse_block(child)
         execution_part = walk(subroutine_tree, F23.Execution_Part)[0]
         traverse_block(execution_part)
         self.general_usage_dict[subroutine_key] = {var: props['intent'] for var, props in usage.items()}
+        self.processor.logger.info(f"Induced INTENT for subroutine '{subroutine_key}':")
+        for var, props in usage.items():
+            intent = props['intent'] if props['intent'] is not None else 'UNKNOWN'
+            self.processor.logger.info(f"  '{var}': '{intent}'")
 
     @staticmethod
     def add_intent(block, intent):
@@ -660,9 +622,6 @@ class Extractor:
         return   F23.Type_Declaration_Stmt(
                 f'{intrinsic_type_spec},{attributes_str}::{entity_decl_list}'
                 )
-        #F23.Type_Declaration_Stmt(
-        #f'{intrinsic_type_spec},dimension({explicit_shape_spec_list}),intent({intent})::{entity_decl_list}'
-        #)
 
     def clean_subroutine(self, subroutine_key, subroutine_tree):
         """
@@ -708,72 +667,74 @@ class Extractor:
                     child = block.content[idc]
                     if isinstance(child, F23.Type_Declaration_Stmt):
                         intent = walk(child, F23.Intent_Spec)
+                        entity_decls = walk(child, F23.Entity_Decl)
                         if intent:
                             intent_spec = intent[0].tostr()
-                        if len(walk(child, F23.Entity_Decl)) > 1:
+                        if len(entity_decls) > 1:
+                            self.processor.logger.warning(
+                                    f"Expected exactly one Entity_Decl but found {len(entity_decls)}. "
+                                    f"Found: {[decl.tostr() for decl in entity_decls]}. Breaking ...  "
+                                    )
                             for stmt in self.processor.separate_entity_declarations(child):
                                 stmt.parent = block
                                 entity_decls = walk(stmt, F23.Entity_Decl)
-                                assert len(entity_decls) == 1,\
-                                        "walk(declaration_stmt, F23.Entity_Decl), but got a different number."
+                                assert len(entity_decls) == 1, \
+                                        f"walk(declaration_stmt, F23.Entity_Decl) should return exactly one, but got {len(entity_decls)}"
                                 name = entity_decls[0].tostr()
                                 if intent:
                                     intent_spec_exp = self.general_usage_dict[subroutine_key][name]
                                     if intent_spec_exp is None:
-                                        self.processor.logger.warning("Name %s is not used %s."%(name, stmt.tostr()))
+                                        self.processor.logger.warning(f"Name '{name}' is not used. Declaration: {stmt.tostr()}")
                                     else:
                                         if intent_spec_exp != intent_spec:
                                             self.processor.logger.warning("The intent is incorrect. Correction block")
-                                            self.processor.logger.warning("Name:%s, Expected:%s, Found: %s"%(name, intent_spec_exp, intent_spec))
+                                            self.processor.logger.warning(f"Name: '{name}', Expected: '{intent_spec_exp}', Found: '{intent_spec}'")
                                             obj_org = F23.Intent_Attr_Spec('INTENT(%s)'%intent_spec)
                                             obj_mod = F23.Intent_Attr_Spec('INTENT(%s)'%intent_spec_exp)
-                                            self.processor.logger.info("Original Declaration Statement: %s"%(stmt.tostr()))
+                                            self.processor.logger.info(f"Original Declaration Statement: {stmt.tostr()}")
                                             child_string = stmt.tostr().replace(obj_org.tostr(), obj_mod.tostr())
                                             stmt = F23.Type_Declaration_Stmt(child_string)
-                                            self.processor.logger.info('Modified Declaration Statement: %s'%child_string)
+                                            self.processor.logger.info(f'Modified Declaration Statement: {child_string}')
                                 else:
                                     if name in self.dummy_arg_list[subroutine_key]:
-                                        self.processor.logger.warning("Name %s is a dummy argument without intent.", name)
-                                        self.processor.logger.warning("Original Declaration Statement: %s", stmt.tostr())
+                                        self.processor.logger.warning(f"Name '{name}' is a dummy argument without intent.")
+                                        self.processor.logger.warning(f"Original Declaration Statement: {stmt.tostr()}")
                                         intent_spec_exp = self.general_usage_dict[subroutine_key][name]
                                         if intent_spec_exp is not None:
-                                            self.processor.logger.warning("The expected intent is: %s", intent_spec_exp)
+                                            self.processor.logger.warning(f"The expected intent is: {intent_spec_exp}")
                                             stmt = self.add_intent(stmt, intent_spec_exp)
-                                            self.processor.logger.info("Modified Declaration Statement: %s", stmt.tostr())
+                                            self.processor.logger.info(f"Modified Declaration Statement: {stmt.tostr()}")
                                         else:
-                                            self.processor.logger.warning("Name %s is not used. Declaration: %s", name, stmt.tostr())
+                                            self.processor.logger.warning(f"Name {name} is not used. Declaration: {stmt.tostr()}")
                                 block.content.insert(idc + 1, stmt)
                             del block.content[idc]
                         else:
-                            entity_decls = walk(child, F23.Entity_Decl)
-                            assert len(entity_decls) == 1,\
-                                    "walk(declaration_stmt, F23.Entity_Decl), but got a different number."
                             name = entity_decls[0].children[0].tostr()
                             if intent:
                                 intent_spec_exp = self.general_usage_dict[subroutine_key][name]
                                 if intent_spec_exp is None:
-                                    self.processor.logger.warning("Warning: Name %s is not used %s.", name, child.tostr())
+                                    self.processor.logger.warning(f"Name '{name}' is not used. Declaration: {child.tostr()}")
                                 else:
                                     if intent_spec_exp != intent_spec:
-                                        self.processor.logger.warning("Incorrect intent for %s. Expected: %s, Found: %s. Correct it!",
-                                                name, intent_spec_exp, intent_spec)
+                                        self.processor.logger.warning("The intent is incorrect. Correction block")
+                                        self.processor.logger.warning(f"Name '{name}', Expected: '{intent_spec_exp}', Found: '{intent_spec}'")
                                         obj_org = F23.Intent_Attr_Spec('INTENT(%s)'%intent_spec)
                                         obj_mod = F23.Intent_Attr_Spec('INTENT(%s)'%intent_spec_exp)
-                                        self.processor.logger.warning("Original Declaration Statement: %s", child.tostr())
+                                        self.processor.logger.warning(f"Original Declaration Statement: {child.tostr()}")
                                         child_string = child.tostr().replace(obj_org.tostr(), obj_mod.tostr())
                                         block.content[idc] = F23.Type_Declaration_Stmt(child_string)
-                                        self.processor.logger.info("Modified Declaration Statement: %s", child_string)
+                                        self.processor.logger.warning(f"Modified Declaration Statement: {child_string}")
                             else:
                                 if name in self.dummy_arg_list[subroutine_key]:
-                                    self.processor.logger.warning("Name %s is a dummy argument without intent.", name)
-                                    self.processor.logger.warning("Original Declaration Statement: %s", child.tostr())
+                                    self.processor.logger.warning(f"Name '{name}' is a dummy argument without intent.")
+                                    self.processor.logger.warning(f"Original Declaration Statement: {child.tostr()}")
                                     intent_spec_exp = self.general_usage_dict[subroutine_key][name]
                                     if intent_spec_exp is not None:
-                                        self.processor.logger.warning("Its expected intent is: %s", intent_spec_exp)
+                                        self.processor.logger.warning("Its expected intent is: '{intent_spec_exp}'")
                                         block.content[idc] = self.add_intent(child, intent_spec_exp)
-                                        self.processor.logger.info("Modified Declaration Statement: %s", block.content[idc].tostr())
+                                        self.processor.logger.warning("Modified Declaration Statement: {block.content[idc].tostr()}")
                                     else:
-                                        self.processor.logger.warning("Name %s is not used %s.", name, child.tostr())
+                                        self.processor.logger.warning(f"Name '{name}' is not used in declaration: {child.tostr()}")
                     else:
                         traverse_subroutine(child)
                     idc += 1
@@ -781,67 +742,50 @@ class Extractor:
 
     def find_variables(self, subroutine_tree, subroutine_key, parent_subroutine_key=None):
         """
-        Analyzes a subroutine or function's declarations and execution to extract and categorize variables.
-
-        This method performs a full scan of a subroutine's abstract syntax tree to identify:
-            - **Declared** vs **Used** variables.
-            - **Dummy arguments** (with or without `INTENT`).
-            - **Local variables** (non-dummy and declared within the subroutine).
-            - **Global variables** (used but not declared in the subroutine).
-            - **Modified variables** (i.e., appearing on the LHS of an assignment).
-            - **Array shape dependencies** (variables that define array bounds).
-            - Handles implicit and intrinsic shape declarations, and replaces them with explicit forms when possible.
-
-        The analysis is stored internally in various class attributes:
-            - `self.var_dummy[subroutine_key]` — List of dummy arguments.
-            - `self.var_local[subroutine_key]` — List of local variables.
-            - `self.var_global[subroutine_key]` — Set of global variables (used but undeclared).
-            - `self.var_declared[subroutine_key]` — Set of explicitly declared variable names.
-            - `self.var_modif[subroutine_key]` — Set of modified variable names.
-            - `self.imp_shape[subroutine_key]` — Dictionary of array variables with implicitly shaped declarations.
-    
-        If any dummy argument is found without an `INTENT`, an error is raised (for strict isolation handling).
-
-        Parameters
-        ----------
-        subroutine_tree : Fortran2003.Subroutine_Subprogram or Function_Subprogram
-            Parsed Fortran AST of the subroutine or function to be analyzed.
-
-        subroutine_key : str
-            Name of the subroutine (or function) being analyzed.
-
-        parent_subroutine_key : str, optional
-            Required when analyzing a function, used to retrieve array shape info from its caller.
-
-        Raises
-        ------
-        ValueError
-            If a dummy argument is declared without an `INTENT` or intrinsic shape handling is not implemented
-            for some specific cases.
-
-        Notes
-        -----
-        - This method relies on `Shaper` to resolve implicit or intrinsic shapes into explicit ones.
-        - Multiple variable declarations in one line are separated for clarity and safety.
-        - Warnings are printed for intrinsic names or implicit shapes found during traversal.
-        - `self.exclude` is used to filter out known indices or ignored variables from global list.
-
-        Returns
-        -------
-        None (modifies internal state of the Extractor instance)
         """
 
-        var_in_local = set()
         shapes = {}
         self.var_dummy[subroutine_key].clear()
         self.var_local[subroutine_key].clear()
 
-        declared, used = walk(subroutine_tree, F23.Specification_Part), walk(subroutine_tree, F23.Execution_Part)
-        self.var_declared[subroutine_key] = {name.tostr() for name in  walk(declared, F23.Entity_Decl)}
-        names_declared, names_used = walk(declared, F23.Name), walk(used, F23.Name)
+        specification_part = None
+        execution_part = None
+
+        # Walk through the function_tree content to find parts
+        for idx, item in enumerate(subroutine_tree.content):
+            if isinstance(item, F23.Specification_Part):
+                specification_part = item
+            elif isinstance(item, F23.Execution_Part):
+                execution_part = item
+        # Check that both parts were found and have content
+        if specification_part is None:
+            raise ValueError("Specification_Part not found in function_tree")
+        if execution_part is None:
+            raise ValueError("Execution_Part not found in function_tree")
+        if not hasattr(specification_part, 'content'):
+            raise AttributeError("Specification_Part has no 'content' attribute")
+        if not hasattr(execution_part, 'content'):
+            raise AttributeError("Execution_Part has no 'content' attribute")
+
+        stmt_list = specification_part.content
+        idx = 0
+        while idx < len(stmt_list):
+            stmt = stmt_list[idx]
+            if isinstance(stmt, F23.Type_Declaration_Stmt):
+                entity_decls = walk(stmt, F23.Entity_Decl)
+                if len(entity_decls) > 1:
+                    new_stmts = self.processor.separate_entity_declarations(stmt)
+                    for new_stmt in new_stmts:
+                        new_stmt.parent = specification_part
+                    stmt_list[idx:idx+1] = new_stmts
+                    idx += len(new_stmts)-1
+                    continue
+            idx += 1
+
+        self.var_declared[subroutine_key] = {name.tostr() for name in  walk(specification_part, F23.Entity_Decl)}
+        names_declared, names_used = walk(specification_part, F23.Name), walk(execution_part, F23.Name)
 
         declared_names_str = {name.string for name in names_declared }
-        #var_used = {name.string for name in names_used}
         
         seen = {}
         for name in names_used:
@@ -853,12 +797,10 @@ class Extractor:
 
         self.var_global[subroutine_key] = list(seen.values()) #var_used - var_declared
 
-        for declaration_stmt in walk(declared, F23.Type_Declaration_Stmt):
-            if len(walk(declaration_stmt, F23.Entity_Decl)) > 1:
-                node_list = self.processor.separate_entity_declarations(declaration_stmt)
-            else:
-                node_list = [declaration_stmt]
-            for node in node_list:
+        for node in specification_part.children:
+            if isinstance(node, F23.Type_Declaration_Stmt):
+                assert len(walk(node, F23.Entity_Decl)) == 1,\
+                        "walk(declaration_stmt, F23.Entity_Decl), but got a different number."
                 implicit_shape = walk(node, F23.Assumed_Shape_Spec)
                 intrinsic_name = walk(node, F23.Intrinsic_Name)
                 if implicit_shape:
@@ -895,16 +837,11 @@ class Extractor:
                     else:
                         raise ValueError(f"intrinsic_name found in {type(subroutine_tree).__name__} declarations! "
                                 f"This case is not implemented yet!")
-                intent = walk(node, F23.Intent_Spec)
+                
                 entity_decls = walk(node, F23.Entity_Decl)
                 assert len(entity_decls) == 1,\
                         "walk(declaration_stmt, F23.Entity_Decl), but got a different number."
                 name = entity_decls[0].tostr()
-                """for explicit_shape_spec in walk(node, F23.Explicit_Shape_Spec):
-                    for dim in explicit_shape_spec.children:
-                        if isinstance(dim, F23.Name):
-                            shapes.add(dim.tostr())
-                """
                 for shape_spec in walk(node, F23.Explicit_Shape_Spec):
                     for dim in walk(shape_spec, F23.Name):
                         dim_str = dim.tostr()
@@ -913,16 +850,10 @@ class Extractor:
                                 dim_str not in self.exclude
                                 ):
                             shapes[dim_str] = dim
-                if intent:
-                    intent_spec = intent[0].tostr()
+                if name in self.dummy_arg_list[subroutine_key]:
                     if name not in self.exclude:
                         self.var_dummy[subroutine_key].append(node)
-                        if F23.Intent_Attr_Spec('INTENT(IN)') in walk(node, F23.Intent_Attr_Spec):
-                            var_in_local.add(name)
                 else:
-                    if name in self.dummy_arg_list[subroutine_key]:
-                        raise ValueError(f"Variable '{name.string}' in subroutine '{subroutine_key}' "
-                                f"at statement '{node.tostr()}' is a dummy argument without intent.")
                     if (
                             name == subroutine_key 
                             or (
@@ -933,7 +864,6 @@ class Extractor:
                         new_decl = self.add_intent(node, "out")
                         self.var_dummy[subroutine_key].append(new_decl)
                     else:
-                        var_in_local.add(name)
                         self.var_local[subroutine_key].append(node)
 
         self.var_dummy[subroutine_key].sort(key=lambda node: node.children[-1].tostr().lower())
@@ -942,23 +872,175 @@ class Extractor:
                 dim_node for dim_str, dim_node in seen.items()
                 if dim_str not in existing_names
                 )
-        #self.var_global[subroutine_key] -= self.exclude
-        #shapes -= self.exclude
-        #self.var_global[subroutine_key].update(shapes)
 
-
-        for stmt in walk(subroutine_tree, F23.Execution_Part):
-            for assign_stmt in walk(stmt, F23.Assignment_Stmt):
-                lhs = assign_stmt.items[0]
-                if isinstance (lhs, F23.Name):
-                    if lhs.tostr() not in var_in_local:
-                        self.var_modif[subroutine_key].add(lhs.tostr())
-                elif isinstance(lhs, F23.Part_Ref):
-                    if lhs.children[0].tostr() not in var_in_local:
-                        self.var_modif[subroutine_key].add(lhs.children[0].tostr())
-                else:
-                    raise ValueError(f"Unexpected assignment left-hand side type: {type(lhs)} in statement: {assign_stmt.tostr()}")
+        for item in self.var_local[subroutine_key]:
+            for entity in walk(item, F23.Entity_Decl):
+                for child in entity.children:
+                    if isinstance(child, F23.Name):
+                        self.var_local_names[subroutine_key].add(child.tostr())
     
+    def extract_local_in_variables(self, subroutine_key, subroutine_tree):
+        """
+        """
+        try:
+            # Initialize the set for this subroutine if it doesn't exist
+            if subroutine_key not in self.var_in_local:
+                self.var_in_local[subroutine_key] = set()
+            
+            # Walk through all declaration statements in the subroutine
+            for node in walk(subroutine_tree, F23.Type_Declaration_Stmt):
+                try:
+                    # Get the variable name from Entity_Decl - should be exactly one
+                    entity_decls = walk(node, F23.Entity_Decl)
+                    assert len(entity_decls) == 1, \
+                        f"In extract_local_variables: walk(node, F23.Entity_Decl)=1, but got {len(entity_decls)}."
+                        
+                    name = entity_decls[0].children[0].tostr()
+                    
+                    # Check intent specifications
+                    intent_specs = walk(node, F23.Intent_Attr_Spec)
+                    
+                    if intent_specs:
+                        # Variable has intent specification
+                        if F23.Intent_Attr_Spec('INTENT(IN)') in intent_specs:
+                            if name not in self.exclude:
+                                self.var_in_local[subroutine_key].add(name)
+                        # For INTENT(OUT) or INTENT(INOUT), don't add to var_in_local
+                        # as they can be modified
+                    else:
+                        # check the function result
+                        if (
+                                name == subroutine_key
+                                or (
+                                    subroutine_key in self.func_result
+                                    and name == self.func_result[subroutine_key]
+                                    )
+                                ):
+                            continue
+                        else:
+                            # No intent specification - this is a local variable
+                            self.var_in_local[subroutine_key].add(name)
+                            
+                except Exception as e:
+                    self.processor.logger.error(f"Error processing declaration statement: {node.tostr()}")
+                    raise
+                    
+        except Exception as e:
+            self.processor.logger.error(f"Error extracting local variables for '{subroutine_key}': {e}")
+            raise
+
+    def extract_modified_variables(self, subroutine_key, subroutine_tree):
+        """
+        """
+        try:
+            # Initialize the set for this subroutine if it doesn't exist
+            if subroutine_key not in self.var_modif:
+                self.var_modif[subroutine_key] = set()
+
+            var_in_local = self.var_in_local[subroutine_key]
+            dec_global = self.dec_global[subroutine_key]
+            var_dummy_list = self.var_dummy[subroutine_key]
+
+            # Walk through all assignment statements in the subroutine
+            for assign_stmt in walk(subroutine_tree, F23.Assignment_Stmt):
+                try:
+                    lhs = assign_stmt.items[0]
+
+                    if isinstance(lhs, F23.Name):
+                        # Simple variable assignment: var = value
+                        var_name = lhs.tostr()
+                        if var_name not in var_in_local:
+                            self.var_modif[subroutine_key].add(var_name)
+
+                    elif isinstance(lhs, F23.Part_Ref):
+                        # Array or function reference: arr(i) = value or func() = value
+                        base_var_name = lhs.children[0].tostr()
+                        if base_var_name not in var_in_local:
+                            self.var_modif[subroutine_key].add(base_var_name)
+
+                    else:
+                        raise ValueError(
+                            f"Unexpected assignment left-hand side type: {type(lhs)} "
+                            f"in statement: {assign_stmt.tostr()}"
+                        )
+                except Exception as e:
+                    self.processor.logger.error(f"Error processing assignment statement: {assign_stmt.tostr()}")
+                    raise
+
+            # Process global declarations for modified variables info
+            for key in dec_global:
+                for item in dec_global[key]:
+                    try:
+                        if isinstance(item, F23.Type_Declaration_Stmt):
+                            var_type = item.children[0].children[0]
+                            entity_decls = walk(item, F23.Entity_Decl)
+                            assert len(entity_decls) == 1, \
+                                f"In extract_modified_variables: walk(item, F23.Entity_Decl)=1, but got {len(entity_decls)}."
+                            entity_decl = entity_decls[0].children[0].tostr()
+
+                            is_var_modified = entity_decl in self.var_modif[subroutine_key]
+
+                            if is_var_modified:
+                                self.var_modif_info[subroutine_key][entity_decl].append(var_type)
+
+                            # Handle explicit shape specifications
+                            if walk(item, F23.Explicit_Shape_Spec):
+                                if is_var_modified:
+                                    self.var_modif_info[subroutine_key][entity_decl].append('DIMENSION')
+
+                            # Handle ALLOCATABLE arrays
+                            attr_spec = walk(item, F23.Attr_Spec)
+                            if F23.Attr_Spec('ALLOCATABLE') in attr_spec:
+                                try:
+                                    declaration_stmt = self.processor.combine_allocate_declaration(dec_global[key])
+                                    assert isinstance(declaration_stmt, F23.Type_Declaration_Stmt), \
+                                        f"Item is not of type F23.Type_Declaration_Stmt!"
+                                    assert walk(declaration_stmt, F23.Explicit_Shape_Spec), \
+                                        "In extract_modified_variables: failed to combine_allocate_declaration!"
+
+                                    if is_var_modified:
+                                        self.var_modif_info[subroutine_key][entity_decl].append('DIMENSION')
+                                except Exception as e:
+                                    self.processor.logger.error(f"Error processing ALLOCATABLE declaration for {entity_decl}")
+                                    raise
+
+                    except Exception as e:
+                        self.processor.logger.error(f"Error processing global declaration item: {item}")
+                        raise
+
+            # Process dummy arguments for var_modif_info
+            for item in var_dummy_list:
+                try:
+                    assert isinstance(item, F23.Type_Declaration_Stmt), f"Item is not of type F23.Type_Declaration_Stmt!"
+                    var_type = item.children[0].children[0]
+                    entity_decls = walk(item, F23.Entity_Decl)
+                    assert len(entity_decls) == 1, \
+                        f"In extract_modified_variables: walk(item, F23.Entity_Decl)=1, but got {len(entity_decls)}."
+                    entity_decl = entity_decls[0].tostr()
+
+                    is_var_modified = entity_decl in self.var_modif[subroutine_key]
+
+                    if is_var_modified:
+                        self.var_modif_info[subroutine_key][entity_decl].append(var_type)
+                        if walk(item, F23.Explicit_Shape_Spec):
+                            self.var_modif_info[subroutine_key][entity_decl].append('DIMENSION')
+                except Exception as e:
+                    self.processor.logger.error(f"Error processing dummy argument item: {item}")
+                    raise
+
+            # Sort the var_modif_info for consistency
+            if subroutine_key in self.var_modif_info:
+                try:
+                    sorted_inner = sorted(self.var_modif_info[subroutine_key].items())
+                    self.var_modif_info[subroutine_key] = defaultdict(list, sorted_inner)
+                except Exception as e:
+                    self.processor.logger.error(f"Error sorting var_modif_info for '{subroutine_key}': {e}")
+                    raise
+
+        except Exception as e:
+            self.processor.logger.error(f"Error extracting modified variables for '{subroutine_key}': {e}")
+            raise
+
     def find_global_variables(self, module_dir, module_tree, var_global, subroutine_key):
         """
         Recursively searches for the declarations of global variables and external procedures
@@ -1022,7 +1104,6 @@ class Extractor:
                 self.dec_global[subroutine_key][declaration] = cached_data
                 #any_initialization
                 var_initial = walk(walk(cached_data, F23.Initialization), F23.Name)
-                #var_initial = [nadi.string for nadi in any_initialization]
                 if var_initial:
                     self.processor.logger.warning("Attention: there are additional variables to search: %s", var_initial)
                     self.processor.logger.warning("In the directory: %s", module_dir)
@@ -1038,9 +1119,9 @@ class Extractor:
                     self.processor.logger.info("✅ Variable found!")
                     declaration_data = list(self.finder.var_declaration)
                     if walk(declaration_data, F23.Function_Subprogram):
-                        function_name = declaration_data[0]  # F23.Name
-                        function_subprogram = declaration_data[1]  # F23.Function_Subprogram
-                        module_name = declaration_data[2]  # module name string
+                        function_name = declaration_data[0] 
+                        function_subprogram = declaration_data[1]
+                        module_name = declaration_data[2]
                         assert module_name in self.module_path, \
                                 f"Module '{module_name}' not found in module_path. Available modules: {list(self.module_path.keys())}"
                         current_module_path = self.module_path[module_name]
@@ -1080,8 +1161,9 @@ class Extractor:
                                 f"Expected type 'F23.Name', but got '{type(values[0]).__name__}' instead."
                                 )
                         self.subroutines[function_name.tostr()] = function_subprogram
+                        self.extract_function_dummy_args(function_subprogram)
 
-                    self.dec_global[subroutine_key][declaration] = declaration_data #[item for item in self.finder.var_declaration]
+                    self.dec_global[subroutine_key][declaration] = declaration_data
                     self.module_global_stock[declaration] = declaration_data
                 else:
                     self.processor.logger.error(f"Variable '{declaration}' is not found in any child modules.")
@@ -1098,119 +1180,96 @@ class Extractor:
                 if self.finder.var_declaration:
                     self.processor.logger.info("✅ Procedure found!")
                     declaration_data = list(self.finder.var_declaration)
-                    self.dec_global[subroutine_key][declaration] = declaration_data #[item for item in self.finder.var_declaration]
+                    self.dec_global[subroutine_key][declaration] = declaration_data
                     self.module_global_stock[declaration] = declaration_data
                 else:
                     self.processor.logger.error(f"Procedure '{declaration}' is not found in any child modules.")
                     raise
 
-    def extract_array_info(self, dec_global, var_dummy_list, subroutine_key):
+    def extract_all_array_info(self, dec_global, var_dummy_list, subroutine_key):
         """
-        Extracts detailed dimensional information for arrays used within a given subroutine, 
-        and stores this information in `self.all_array_info`.
-
-        The method processes:
-            Global variable declarations (from other modules)
-            Dummy argument declarations (with potential shape info)
-            Local variable declarations
-        and normalizes array-related declarations to extract shape dimensions such as:
-            Lower and upper bounds
-            Dimensionality (rank)
-    
-        It also tracks whether a variable has been modified and annotates it with additional 
-        properties like `DIMENSION` or type information (e.g., REAL, INTEGER, etc.) 
-        in `self.var_modif_info`.
-
-        Parameters
-        ----------
-        dec_global : dict
-            Dictionary of external/global declarations used in the subroutine, typically obtained 
-            from imported modules. Keys are module names; values are lists of `Type_Declaration_Stmt`.
-    
-        var_dummy_list : list
-            List of dummy argument declaration statements (`Type_Declaration_Stmt`) for the current subroutine.
-    
-        subroutine_key : str
-            Identifier (name) for the current subroutine being analyzed.
-
-        Populates
-        ---------
-        - self.all_array_info[subroutine_key]: dict
-            Stores detailed dimension info for each array variable in the subroutine.
-        - self.var_modif_info[subroutine_key]: defaultdict
-            Annotates modified variables with associated types and whether they're arrays.
-
-        Notes
-        -----
-        - The method combines `ALLOCATE` statements and declaration statements for `ALLOCATABLE` arrays.
-        - It skips scalars and focuses only on variables with `Explicit_Shape_Spec`.
-        - Dimensions are normalized into a list of dicts containing start and end bounds.
-        - If dimensions are improperly formatted or too many colon-separated parts are found, it raises an error.
         """
-        normalized_items = []
-        for key in dec_global:
-            for item in dec_global[key]:
-                is_var_modified = False
-                if isinstance(item, F23.Type_Declaration_Stmt):
-                    var_type = item.children[0].children[0]
+        try:
+            normalized_arrays = []
+            normalized_scalars = []
+
+            # Process global declarations
+            for key in dec_global:
+                for item in dec_global[key]:
+                    try:
+                        if isinstance(item, F23.Type_Declaration_Stmt):
+                            entity_decls = walk(item, F23.Entity_Decl)
+                            assert len(entity_decls) == 1, \
+                                f"In extract_all_array_info: walk(item, F23.Entity_Decl)=1, but got {len(entity_decls)}."
+
+                            if walk(item, F23.Explicit_Shape_Spec):
+                                normalized_arrays.append(item)
+                            else:
+                                normalized_scalars.append(item)
+
+                            # Handle ALLOCATABLE arrays
+                            attr_spec = walk(item, F23.Attr_Spec)
+                            if F23.Attr_Spec('ALLOCATABLE') in attr_spec:
+                                declaration_stmt = self.processor.combine_allocate_declaration(dec_global[key])
+                                assert isinstance(declaration_stmt, F23.Type_Declaration_Stmt), \
+                                    f"Item is not of type F23.Type_Declaration_Stmt!"
+                                assert walk(declaration_stmt, F23.Explicit_Shape_Spec), \
+                                    "In extract_all_array_info: failed to combine_allocate_declaration!"
+                                normalized_arrays.append(declaration_stmt)
+                    except Exception as e:
+                        self.processor.logger.error(f"Error processing global declaration in extract_all_array_info: {item}")
+                        raise
+
+            # Process dummy arguments
+            for item in var_dummy_list:
+                try:
+                    assert isinstance(item, F23.Type_Declaration_Stmt), f"Item is not of type F23.Type_Declaration_Stmt!"
                     entity_decls = walk(item, F23.Entity_Decl)
-                    assert len(entity_decls) == 1,\
-                            "In extract_array_info: walk(item, F23.Entity_Decl)=1, but got a different number."
-                    entity_decl = entity_decls[0].children[0].tostr()
-                    if entity_decl in self.var_modif[subroutine_key]:
-                        is_var_modified = True
-                        self.var_modif_info[subroutine_key][entity_decl].append(var_type)
-                    attr_spec = walk(item, F23.Attr_Spec)
+                    assert len(entity_decls) == 1, \
+                        f"In extract_all_array_info: walk(item, F23.Entity_Decl)=1, but got {len(entity_decls)}."
+
                     if walk(item, F23.Explicit_Shape_Spec):
-                        normalized_items.append(item)
-                        if is_var_modified:
-                            self.var_modif_info[subroutine_key][entity_decl].append('DIMENSION')
-                    if F23.Attr_Spec('ALLOCATABLE') in attr_spec:
-                        declaration_stmt = self.processor.combine_allocate_declaration(dec_global[key])
-                        assert isinstance(declaration_stmt, F23.Type_Declaration_Stmt), f"Item is not of type F23.Type_Declaration_Stmt!"
-                        assert walk(declaration_stmt, F23.Explicit_Shape_Spec), "In extract_array_info: failed to combine_allocate_declaration!"
-                        normalized_items.append(declaration_stmt)
-                        if is_var_modified:
-                            self.var_modif_info[subroutine_key][entity_decl].append('DIMENSION')
-
-        for item in var_dummy_list:
-            is_var_modified = False
-            assert isinstance(item, F23.Type_Declaration_Stmt), f"Item is not of type F23.Type_Declaration_Stmt!"
-            var_type = item.children[0].children[0]
-            entity_decls = walk(item, F23.Entity_Decl)
-            assert len(entity_decls) == 1,\
-                    "In extract_array_info: walk(item, F23.Entity_Decl)=1, but got a different number."
-            entity_decl = entity_decls[0].tostr()
-            if entity_decl in self.var_modif[subroutine_key]:
-                is_var_modified = True
-                self.var_modif_info[subroutine_key][entity_decl].append(var_type)
-            if walk(item, F23.Explicit_Shape_Spec):
-                normalized_items.append(item)
-                if is_var_modified:
-                    self.var_modif_info[subroutine_key][entity_decl].append('DIMENSION')
-        for item in self.var_local[subroutine_key]:
-            assert isinstance(item, F23.Type_Declaration_Stmt), f"Item is not of type F23.Type_Declaration_Stmt!"
-            if walk(item, F23.Explicit_Shape_Spec):
-                normalized_items.append(item)
-
-        for item in normalized_items:
-            current_var_info = []
-            array_name = walk(item, F23.Entity_Decl)[0].children[0].tostr()
-            for dim in walk(item, F23.Explicit_Shape_Spec):
-                start_end = [part.strip() for part in dim.tostr().split(':')]
-                lse = len(start_end)
-                if lse == 1:
-                    current_var_info.append({'dim_str': '1', 'dim_end': start_end[0]})
-                elif lse == 2:
-                    current_var_info.append({'dim_str': start_end[0], 'dim_end': start_end[1]})
-                else:
-                    self.processor.logger.error("dimension control error!")
+                        normalized_arrays.append(item)
+                    else:
+                        normalized_scalars.append(item)
+                except Exception as e:
+                    self.processor.logger.error(f"Error processing dummy argument in extract_all_array_info: {item}")
                     raise
-            self.all_array_info[subroutine_key][array_name] = [part for part in current_var_info]
-        
-        for key in self.var_modif_info:
-            sorted_inner = sorted(self.var_modif_info[key].items())
-            self.var_modif_info[key] = defaultdict(list,sorted_inner)
+
+            # Process local variables
+            for item in self.var_local[subroutine_key]:
+                try:
+                    assert isinstance(item, F23.Type_Declaration_Stmt), f"Item is not of type F23.Type_Declaration_Stmt!"
+                    if walk(item, F23.Explicit_Shape_Spec):
+                        normalized_arrays.append(item)
+                    else:
+                        normalized_scalars.append(item)
+                except Exception as e:
+                    self.processor.logger.error(f"Error processing local variable in extract_all_array_info: {item}")
+                    raise
+
+            # Extract dimension information
+            for item in normalized_arrays:
+                try:
+                    current_var_info = []
+                    array_name = walk(item, F23.Entity_Decl)[0].children[0].tostr()
+                    for dim in walk(item, F23.Explicit_Shape_Spec):
+                        start_end = [part.strip() for part in dim.tostr().split(':')]
+                        lse = len(start_end)
+                        if lse == 1:
+                            current_var_info.append({'dim_str': '1', 'dim_end': start_end[0]})
+                        elif lse == 2:
+                            current_var_info.append({'dim_str': start_end[0], 'dim_end': start_end[1]})
+                        else:
+                            raise ValueError(f"Invalid dimension format: {dim.tostr()}")
+                    self.all_array_info[subroutine_key][array_name] = [part for part in current_var_info]
+                except Exception as e:
+                    self.processor.logger.error(f"Error processing array dimension info for item: {item}")
+                    raise
+
+        except Exception as e:
+            self.processor.logger.error(f"Error in extract_all_array_info for '{subroutine_key}': {e}")
+            raise
 
     def process_declaration_variables(self, items, subroutine_key):
         """
@@ -1259,8 +1318,6 @@ class Extractor:
                 shape = walk(walk(item, F23.Allocate_Shape_Spec), F23.Name) if alo_stmt \
                         else walk(walk(item, F23.Explicit_Shape_Spec), F23.Name)
                 if shape:
-                    #self.shapes_variables[subroutine_key].update(name.string for name in shape if name.string not in self.exclude)
-                    #valid_shape_names = []
                     seen = {n.string for n in self.shapes_variables[subroutine_key]}
                     for name in shape:
                         if (name is not None and
@@ -1270,19 +1327,14 @@ class Extractor:
                                 name.tostr() not in self.exclude and 
                                 name.tostr() not in seen
                                 ):
-                            #valid_shape_names.append(name.string)
                             self.shapes_variables[subroutine_key].append(name)
                             seen.add(name.string)
-                    #if valid_shape_names:
-                    #    self.processor.logger.debug(f"Added shape variables: {valid_shape_names}")
-                    #    self.shapes_variables[subroutine_key].update(valid_shape_names)
                 else:
                     assert dec_stmt, 'The scalar must be a Type_Declaration_Stmt!'
                     array = walk(item, F23.Dimension_Attr_Spec)
                     if not array:
                         seen = {n.string for n in self.scalar_variables[subroutine_key]}
                         names = walk(walk(item, F23.Entity_Decl), F23.Name)
-                        #valid_scalar_names = []
                         for name in names:
                             if (name is not None and
                                     name.tostr() is not None and
@@ -1293,14 +1345,8 @@ class Extractor:
                                     ):
                                 self.scalar_variables[subroutine_key].append(name)
                                 seen.add(name.string)
-                                #valid_scalar_names.append(name.string)
-                        #if valid_scalar_names:
-                        #    self.scalar_variables[subroutine_key].update(valid_scalar_names)
-                        #    self.processor.logger.debug(f"Added scalar variables: {valid_scalar_names}")
-                        #if name[0].string not in self.exclude:
-                        #    self.scalar_variables[subroutine_key].add(name[0].string)
 
-if __name__ == "__main__":
+'''if __name__ == "__main__":
     import unittest
     import tempfile
     import shutil
@@ -1546,3 +1592,4 @@ if __name__ == "__main__":
             self.assertEqual(self.simple_extractor.shapes_variables[sub_key], [F23.Name("n")])
         
     unittest.main()
+'''
