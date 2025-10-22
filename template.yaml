@@ -3,6 +3,7 @@ Python_templates:
         name: "Python_global_normal_template"
         template: | 
             import numpy as np
+            import logging
             from scipy.io import FortranFile
             import os
             
@@ -26,8 +27,9 @@ Python_templates:
         name: "Python_global_class_template"
         template: |
             import numpy as np
-            import os
+            import logging
             from scipy.io import FortranFile
+            import os
             
             class Global_module:
                 def __init__(self):

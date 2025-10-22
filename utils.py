@@ -2,7 +2,7 @@ import os
 import ast
 import logging
 import operator
-from typing import Generator,Dict,List
+from typing import Generator,Dict,List,Set
 from collections import defaultdict, deque
 
 # We will use the nodeTransformer https://docs.python.org/3/library/ast.html#ast.NodeTransformer to create a general purpose
@@ -18,8 +18,8 @@ class ReplaceGlobals(ast.NodeTransformer):
         for _ , instances in self.cls_info.items():
             for inst_key, value in instances.items():
                 cls_attr = value.get("attributes", [])
-                other_object_instances = value.get("instances",[])
-                
+                other_object_instances = value.get("instances",{})
+
                 if name in cls_attr:
                     return ast.Attribute(
                         value=ast.Name(id=inst_key, ctx=ast.Load()),
@@ -37,7 +37,6 @@ class ReplaceGlobals(ast.NodeTransformer):
                                 attr=name,
                                 ctx=ast.Load()
                             )
-                    
         return None
 
     def visit_Name(self, node):
@@ -70,7 +69,6 @@ class ReplaceGlobals(ast.NodeTransformer):
                                 attr=name,
                                 ctx=ast.Load()
                             )
-
         return node
 
     def visit_List(self, node):
@@ -91,35 +89,69 @@ class ReplaceGlobals(ast.NodeTransformer):
                         node.targets[i].value = replacement
         return node
 
-    def visit_Expr(self, node):
-        if isinstance(node.value, ast.Call) and isinstance(node.value.func, ast.Name):
-            method_name = node.value.func.id
-
+    def visit_Call(self,node):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            method_name = node.func.id
+            # First the method name and then check the args 
             for _ , instances in self.cls_info.items():
                 for inst_key, value in instances.items():
                     methods = value.get('methods',[])
                     other_object_instances = value.get("instances",[])
                     if method_name in methods:
-                        node.value.func = ast.Attribute(
+                        node.func = ast.Attribute(
                                             value=ast.Name(id=inst_key, ctx=ast.Load()),
                                             attr=method_name,
                                             ctx=ast.Load()
                                         )
+                        new_args = []
+                        for arg in node.args:
+                            new_arg = self.visit(arg)
+                            new_args.append(new_arg)
+                        node.args = new_args
+
                         return node
+                    
                     elif other_object_instances:# This is to handle the cases on which we have other classes intialized inside the class itself 
                         # and require to be attributed to the intialized class 
                         for key in list(other_object_instances.keys()):
                             
                             other_object_attributes = other_object_instances[key].get('methods')
                             if method_name in other_object_attributes:
-                                node.value.func =  ast.Attribute(
+                                node.func =  ast.Attribute(
                                     value=other_object_instances[key]['class_name'],
                                     attr=method_name,
                                     ctx=ast.Load()
                                 )
+                                new_args = []
+                                for arg in node.args:
+                                    new_arg = self.visit(arg)
+                                    new_args.append(new_arg)
+                                node.args = new_args
                             return node 
-        return node
+            # Among the args check if we have any attributes that might come the clss or the composed classes 
 
+        elif (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name) and node.func.value.id == "logging"):
+            for arg in node.args:
+                if isinstance(arg, ast.JoinedStr):
+                    new_values = []
+                    for value in arg.values:
+                        new_value = self.visit(value)  # This will now call visit_FormattedValue
+                        new_values.append(new_value)
+                    arg.values = new_values
+
+            return node
+        
+        return self.generic_visit(node)
+
+    def visit_Expr(self, node):
+        # print(ast.dump(node,indent=4))
+        node.value = self.visit(node.value)
+        return node
+    
+    def visit_FormattedValue(self, node):
+        node.value = self.visit(node.value)
+        return node
+        
     def visit_For(self,node):
         node = self.generic_visit(node)
         if isinstance(node,ast.For):
@@ -226,15 +258,17 @@ class ReplaceGlobals(ast.NodeTransformer):
 
         return node
 
- # SemanticIndexAdjuster
-class AdjustIndices(ast.NodeTransformer):
-    def __init__(self,conv_vars,attributes:Dict,global_attributes:Dict,**kwargs):
-        self.CONV_VARS = conv_vars # This corresponds to the conventional loop variables such as ji,jst,jl etc... 
-        self.attribute_info = attributes
-        self.global_attributes = global_attributes.get("attributes", {})
-        self.instances_global_attributes = global_attributes.get("instances", {})
-        self.adjusted_vars = set()
 
+# This class acts like a semantic index adjuster to ensure that the indices present inside array, elemetns sents as arguments and scalars are corrected 
+# to ensure that the python 
+# SemanticIndexAdjuster
+class AdjustIndices(ast.NodeTransformer):
+    def __init__(self,conv_vars,array_info:Dict,cls_attributes:Dict,**kwargs):
+        self.CONV_VARS = conv_vars # This corresponds to the conventional loop variables such as ji,jst,jl etc... 
+        self.array_info = array_info
+        self.cls_attributes = cls_attributes.get("attributes", {}) # Attributes of the class (arrays, sclaras)
+        self.instances_global_attributes = cls_attributes.get("instances", {}) # Attributes of probably other object class if present inside teh parent class 
+        self.adjusted_vars = kwargs.get("adjusted_vars",set())
         self.exclude_index = kwargs.get("exclude_index")
 
     def visit_Subscript(self, node):
@@ -252,8 +286,8 @@ class AdjustIndices(ast.NodeTransformer):
         # don't require changes, as they're already adapted for Python. However, if an array has a non-default
         # lower bound (not starting at 1), the corresponding loop variable must be corrected to
         # account for the offset between FORTRAN and Python indexing, thus recovering to the original Fortran index 
-        if arr_name and arr_name in self.attribute_info:
-            dims_info = self.attribute_info[arr_name]
+        if arr_name and arr_name in self.array_info:
+            dims_info = self.array_info[arr_name]
             if isinstance(node.slice, ast.Tuple):
                 new_elts = []
                 for i, elt in enumerate(node.slice.elts):
@@ -270,7 +304,7 @@ class AdjustIndices(ast.NodeTransformer):
                     else:
                         # resolve via global attributes or the perhaps either in one of the composition classes if such instance is present
                         resolved_str = ""
-                        dimension = self.global_attributes.get(dim_info_str)
+                        dimension = self.cls_attributes.get(dim_info_str)
 
                         if dimension is not None:
                             resolved_str = str(dimension[0])
@@ -305,7 +339,7 @@ class AdjustIndices(ast.NodeTransformer):
                 # Case 2: dim_str is a variable (needs global_attributes lookup)
                 else:
                     resolved_str = ""
-                    dimension = self.global_attributes.get(dim_info_str)
+                    dimension = self.cls_attributes.get(dim_info_str)
 
                     if dimension is not None:
                         resolved_str = str(dimension[0])
@@ -326,12 +360,12 @@ class AdjustIndices(ast.NodeTransformer):
                         raise KeyError(f"Could not resolve dimension info for: {dim_info_str}")
                     
         else:
-            # fallback: adjust everything if we don’t know the array
+            # fallback: adjust everything if we don’t know the array: which mostly means that it's a functions
             if isinstance(node.slice, ast.Tuple):
                 node.slice.elts = [self._adjust_index(elt) for elt in node.slice.elts]
             else:
                 node.slice = self._adjust_index(node.slice)
-    
+
         return node
 
     def visit_Assign(self, node):
@@ -343,18 +377,99 @@ class AdjustIndices(ast.NodeTransformer):
         node.targets = new_targets
         # This is to handle targets that are conventional variables that are used as indices inside the arrays but who get
         # their values assigned and doesn't come from for loops ex :jsl = value, but also target values which has compare in them this is to ensure that the mask type arrays don't get substracted
+        # This is also true for variables that have be assigned loop variables makeing it as a indirect reference to it. This could be either that of Name, Attribute with name or Array
         if isinstance(node.targets[0], (ast.Name,ast.Attribute)):
             name = node.targets[0].id if isinstance(node.targets[0],ast.Name) else node.targets[0].attr
             if name in self.CONV_VARS: # THIS IS to modify in the case of CONV_vars ARE in the left hand side 
                 node.value = self._adjust_assignment_rhs(node.value)
             # Check if the right hand assigement is that of conv vars 
-            if isinstance(node.value, (ast.Name,ast.Attribute)): # This is just to ensure that the in the case elements of conv_vars get's reassigned to another variable thus doesn't require modification 
-                value_name = node.value.id if isinstance(node.value, ast.Name) else node.value.attr # RHS 
-                if value_name in self.CONV_VARS:
-                    self.adjusted_vars.add(name)
-            elif isinstance(node.value, ast.Compare):
+            elif name in self.adjusted_vars: # This is just to ensure that the in the case elements of conv_vars get's reassigned to another variable thus doesn't require modification 
+                # but their 
+                node.value = self._adjust_index(node.value)
+            
+            elif isinstance(node.value, ast.Compare) or name == 'mask': # This is to retrieve all the mask type of elements 
                 self.adjusted_vars.add(name)
+        
+        elif isinstance(node.targets[0], ast.Subscript):
+            if isinstance(node.targets[0].value,(ast.Name, ast.Attribute)):
+                name = node.targets[0].value.id if isinstance(node.targets[0].value,ast.Name) else node.targets[0].value.attr
+                if name in self.adjusted_vars:
+                    node.value = self._adjust_index(node.value)
+        
+        return node
 
+    def visit_For(self, node):
+        self.generic_visit(node)
+
+        if not isinstance(node.iter, ast.Call) or not hasattr(node.iter, 'args'):
+            return node  
+
+        new_args = []
+        for arg in node.iter.args:
+            new_arg = self._process_arg(arg, node)
+            if new_arg:
+                new_args.append(new_arg)
+
+        node.iter.args = new_args
+        return node
+
+    def _process_arg(self, arg, node):
+        """Handles transformation logic for each argument in node.iter.args"""
+        if isinstance(arg, ast.BinOp):
+            left, right = arg.left, arg.right
+
+            if isinstance(left, ast.Name) and left.id in self.adjusted_vars:
+                return self._handle_adjusted_left(arg, node)
+
+            elif isinstance(left, ast.Subscript) and isinstance(left.value, (ast.Name, ast.Attribute)):
+                return self._handle_adjusted_left(arg, node)
+            
+            elif isinstance(left, ast.Name) and left.id not in self.adjusted_vars:
+                return arg
+
+            # Case 4: Right is an adjusted variable
+            elif isinstance(right, ast.Name) and right.id in self.adjusted_vars:
+                raise NotImplementedError("Not implemented yet for adjusted right-hand variable in visit_For.")
+
+            else:
+                return arg  
+        return arg
+
+    def _handle_adjusted_left(self, binop_node, parent_node):
+        """Handles cases where left is an adjusted variable or subscript"""
+        right = binop_node.right
+
+        if isinstance(right, ast.Constant) and right.value == 1:
+            return binop_node.left
+        else:
+            return ast.BinOp(
+                left=parent_node,
+                op=ast.Add(),
+                right=ast.Constant(value=1)
+            )
+
+    def visit_If(self, node):
+        self.generic_visit(node)
+        if isinstance(node.test, ast.Compare):
+            self._handle_compare(node.test)
+        return node
+
+    def _handle_compare(self,node):
+        # In the comparator, what we are trying to mostly doing is to check if the variables or loop variables might need to be modified
+        # FOr example if a loop variables is direclty being compared to Constant, Name, etc.. and since these loop variables are already modified to the python range
+        # Which is also called INDIRECT REFERENCE
+
+        if isinstance(node.left, ast.Name) and (node.left.id in self.CONV_VARS or node.left.id in self.adjusted_vars):
+            for i in range(len(node.comparators)):
+                # NEed to handle the case where the nodes compare themselves but perhaps with a certain index +, for example : loc == loc + 1
+                node.comparators[i] = self._adjust_index(node.comparators[i])
+        elif isinstance(node.left,ast.Subscript):
+            if isinstance(node.left.value, ast.Name) and (node.left.value.id in self.CONV_VARS or node.left.value.id in self.adjusted_vars):
+                for i in range(len(node.comparators)):
+                    if isinstance(node.comparators[i], ast.Subscript) and node.comparators[i].value not in self.adjusted_vars:
+                        continue
+                    else:
+                        node.comparators[i] = self._adjust_index(node.comparators[i])
         return node
 
     def visit_Call(self,node):
@@ -368,7 +483,7 @@ class AdjustIndices(ast.NodeTransformer):
                     subscript_node = next(iter(subscript_nodes))
                     arr_name = subscript_node.value.id if isinstance(subscript_node.value, ast.Name) else subscript_node.value.attr
                     
-                    dim_info = self.attribute_info[arr_name]
+                    dim_info = self.array_info[arr_name]
                     if dim_info and len(dim_info) == 1:
                         if dim_info[0]['dim_str'] != "0": # If the lower bound is 0 this doesnt' require the creation of BinOp
     
@@ -410,41 +525,55 @@ class AdjustIndices(ast.NodeTransformer):
         # Fortran arrays can have arbitrary lower bounds (0..n, 1..n, -3..n) and since python arrays always start at 0. When converting Fortran code to Python,
         # we adjust variable references by applying an offset so that Python accesses
         # the same array elements and produces the same values as the original Fortran code, despite the difference in array lower bounds.
-        if isinstance(node, ast.Name) and node.id in self.CONV_VARS:
+        if isinstance(node, ast.Name) and (node.id in self.CONV_VARS or node.id in self.adjusted_vars):
             node = ast.BinOp(left = node, op = ast.Add(), right = ast.Constant(value=offset))
             
-        elif isinstance(node, ast.BinOp) and isinstance(node.left, ast.Name) and node.left.id in self.CONV_VARS:
+        elif isinstance(node, ast.BinOp): # THis is to handle cases when the 
             left = node.left
             right = node.right
             op = node.op
-                
-            if isinstance(right, ast.Constant):
+
+            is_valid_left = False
+
+            # Case 1: left is a Name
+            if isinstance(left, ast.Name):
+                if left.id in self.CONV_VARS or left.id in self.adjusted_vars:
+                    is_valid_left = True
+
+            # Case 2: left is a Subscript of a Name (A[i]) and A is in adjusted_vars
+            elif isinstance(left, ast.Subscript):
+                if isinstance(left.value, ast.Name) and left.value.id in self.adjusted_vars:
+                    is_valid_left = True
+
+            if is_valid_left and isinstance(right, ast.Constant):
                 original_value = right.value
-                
-                # i - N
+
                 if isinstance(op, ast.Sub):
-                    new_value = original_value - offset  # i - N - offset
+                    new_value = original_value - offset
                     if new_value == 0:
-                        node = left  # i - N + N -> i
-                    else:
-                        node =  ast.BinOp(
-                                    left=left,
-                                    op=ast.Sub(),
-                                    right=ast.Constant(value=new_value)
-                                )
-                
-                # i + N
-                elif isinstance(op, ast.Add):
-                    new_value = original_value + offset  # i + N + offset
-                    if new_value == 0:
-                        node = left  # i + N - N -> i
+                        node = left
                     else:
                         node = ast.BinOp(
-                                    left=left,
-                                    op=ast.Add(),
-                                    right=ast.Constant(value=new_value)
-                                )
-                                    
+                            left=left,
+                            op=ast.Sub(),
+                            right=ast.Constant(value=new_value)
+                        )
+
+                elif isinstance(op, ast.Add):
+                    new_value = original_value + offset
+                    if new_value == 0:
+                        node = left
+                    else:
+                        node = ast.BinOp(
+                            left=left,
+                            op=ast.Add(),
+                            right=ast.Constant(value=new_value)
+                        )
+
+        elif isinstance(node, ast.Call):
+            if not self._check_internal_call_element(node):
+                node = ast.BinOp(left = node, op = ast.Add(), right = ast.Constant(value=offset))
+
         return node
 
     def _adjust_index(self, index_node):
@@ -474,15 +603,53 @@ class AdjustIndices(ast.NodeTransformer):
                     # return self._subtract_one(index_node)
                     
             elif isinstance(index_node, ast.Call):
-                return ast.BinOp(
-                    left = index_node,
-                    op = ast.Sub(),
-                    right = ast.Constant(value=1)
-                )
-    
+                # Need to check if the usually int() internal elemnt is not that of the adjusted vars or that of the excluded_index 
+                if self._check_internal_call_element(index_node):
+                    return ast.BinOp(
+                        left = index_node,
+                        op = ast.Sub(),
+                        right = ast.Constant(value=1)
+                    )
+                else:
+                    return index_node
+
+            elif isinstance(index_node,ast.Slice):
+                if index_node.lower is None and index_node.upper is None:
+                    return index_node
+
+                # Recursively adjust lower and upper if they exist
+                new_lower = self._adjust_index(index_node.lower) if index_node.lower else None
+                new_upper = self._adjust_index(index_node.upper) if index_node.upper else None
+                new_step = self._adjust_index(index_node.step) if index_node.step else None
+
+                return ast.Slice(lower=new_lower, upper=new_upper, step=new_step)
+
             return index_node
         except Exception as e:
             raise RuntimeError(f"_adjust_index failed for node={ast.dump(index_node,indent=4)}") from e
+
+    def _check_internal_call_element(self, node):
+        """
+        Checks whether the node is a call to int(some_var), and that
+        some_var is NOT in adjusted_vars or excluded_index.
+
+        Returns True if it's safe to apply transformation.
+        """
+        # Check if the node is a call, and function called is `int`
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == 'int':
+            # Ensure there is exactly one argument
+            if len(node.args) == 1:
+                arg = node.args[0]
+
+                if isinstance(arg, ast.Subscript) and isinstance(arg.value, ast.Name):
+                    var_name = arg.value.id
+                    if var_name not in self.adjusted_vars and ((not self.exclude_index) or (var_name not in self.exclude_index)):
+                        return True
+                else:
+                    raise ValueError(f'arg is not that of Subscript but of : {type(node)}')
+            else:
+                raise ValueError(f'Number of args inside the int() > 1')
+        return False
 
     # This is for right hand side assignement handling 
     def _adjust_assignment_rhs(self, rhs):
@@ -567,11 +734,11 @@ def identify_replace_all(ast_list: list, cls_info: dict):
     try:
         transformer = ReplaceGlobals(cls_info)
         for i, node in enumerate(ast_list):
+            # print(ast.dump(node,indent=4))
             ast_list[i] = transformer.visit(node)
     except Exception as e:
         logging.error(f'Error in identify_replace_all: {e}')
         raise 
-
 
 def ast_walk(node, node_type: ast.AST) -> Generator:
     """
@@ -609,14 +776,53 @@ def find_folder(root_dir, target_folder):
             return os.path.join(dirpath, target_folder)
     return None
 
-def safe_eval_expr(node):
+def find_used_globals(node, common_attributes):
+    used_globals = set()
+
+    def visit(n):
+        if isinstance(n, ast.Name):
+            if n.id in common_attributes:
+                used_globals.add(n.id)
+        # Recursively visit all child nodes
+        for child in ast.iter_child_nodes(n):
+            visit(child)
+
+    visit(node)
+    return used_globals
+
+def attach_instance(node, instance_name='self'):
+    if isinstance(node, ast.Name):
+        return ast.Attribute(
+            value=ast.Name(id=instance_name, ctx=ast.Load()),
+            attr=node.id,
+            ctx=ast.Load()
+        )
+    
+    for field, value in ast.iter_fields(node):
+        if isinstance(value, list):
+            new_list = []
+            for item in value:
+                if isinstance(item, ast.AST):
+                    new_list.append(attach_instance(item, instance_name))
+                else:
+                    new_list.append(item)
+            setattr(node, field, new_list)
+        elif isinstance(value, ast.AST):
+            setattr(node, field, attach_instance(value, instance_name))
+    
+    return node
+
+def safe_eval_expr(node, attributes=None):
+    if attributes is None:
+        attributes = {}
+
     if isinstance(node, ast.Constant):
         return node.value
+
     elif isinstance(node, ast.BinOp):
-        left = safe_eval_expr(node.left)
-        right = safe_eval_expr(node.right)
-        
-        # Supported operators
+        left = safe_eval_expr(node.left, attributes)
+        right = safe_eval_expr(node.right, attributes)
+
         ops = {
             ast.Add: operator.add,
             ast.Sub: operator.sub,
@@ -632,45 +838,41 @@ def safe_eval_expr(node):
             return ops[op_type](left, right)
         else:
             raise NotImplementedError(f"Operator {op_type} not supported.")
+
+    elif isinstance(node, ast.Name):
+        var_name = node.id
+        if var_name in attributes:
+            return attributes[var_name][0]  # Get the actual value
+        else:
+            raise NameError(f"Variable '{var_name}' not found in attributes.")
+    elif isinstance(node,ast.Attribute):
+        if isinstance(node.attr, str):
+            return attributes[node.attr][0]
     else:
         raise NotImplementedError(f"Unsupported AST node type: {type(node)}")
 
-def update_dict(primary_dict, secondary_dict):
+
+def update_methods(module_dict, function_defs):
     """
-    Automatically update the `instances` section of the primary_dict by scanning
-    for composed classes (composition) and fetching their attributes and methods
-    from the secondary_dict.
+    Update the 'methods' dictionary in a module-like dictionary structure,
+    regardless of the instance name (e.g., 'self', 'this').
+
+    Args:
+        module_dict (dict): Dictionary containing the module and its components.
+        function_defs (list): List of ast.FunctionDef nodes to add.
     """
-
-    for _, classes in primary_dict.items():
-        for _, class_content in classes.items():
-            primary_attrs = class_content.get("attributes", {})
-            instances = class_content.get("instances", {})
-
-            # For each instance in the primary class, check if it's a composed class
-            for instance_name, instance_data in instances.items():
-                # Now we must find the class definition of this instance in the secondary_dict
-                for _, secondary_classes in secondary_dict.items():
-                    if instance_name in secondary_classes:
-                        composed_class = secondary_classes[instance_name]
-                        secondary_attrs = composed_class.get("attributes", {})
-                        secondary_methods = composed_class.get("methods", {})
-
-                        # Prepare instance sub-structure # composition type
-                        instance_attrs = instance_data.setdefault("attributes", {})
-                        instance_methods = instance_data.setdefault("methods", {})
-
-                        # Add attributes only if not already present in class-level attributes
-                        for attr_name, attr_val in secondary_attrs.items():
-                            if attr_name not in primary_attrs:
-                                instance_attrs.setdefault(attr_name, attr_val)
-
-                        # Add methods only if not already present in class-level methods
-                        for method_name, method_val in secondary_methods.items():
-                            instance_methods.setdefault(method_name, method_val)
-
-    return primary_dict
-
+    # Loop over the top-level module(s)
+    for _, module_content in module_dict.items():
+        # Search for the inner dict that contains 'methods'
+        for _, instance_val in module_content.items():
+            if isinstance(instance_val, dict) and 'methods' in instance_val:
+                methods_dict = instance_val['methods']
+                for func_def in function_defs:
+                    if isinstance(func_def, ast.FunctionDef):
+                        methods_dict[func_def.name] = func_def
+                # Ensure the dict is updated
+                instance_val['methods'] = methods_dict
+                break 
 
 def collect_dependencies(node):
     """Collect all variable names this value depends on."""
@@ -737,3 +939,63 @@ def order_assignments(assign_nodes:List, diff:List) -> List:
             result.append(v)
 
     return result
+
+def search_convar_dependencies(conv_vars: List[str], node: ast.AST) -> Set[str]:
+    """
+    Retrieves conventional variables (loop_dict) that are affected by or derived from other variables.
+    Returns a set of variable names that depend on the conventional variables.
+    """
+    adjusted_vars = set()
+
+    for child in ast.walk(node):
+        if isinstance(child, ast.Assign):
+            value = child.value
+            if _find_conv_vars_in_expr(value, conv_vars):
+                for target in child.targets:
+                    if isinstance(target, ast.Name):
+                        adjusted_vars.add(target.id)
+                    elif isinstance(target, ast.Attribute):
+                        adjusted_vars.add(target.attr)
+                    elif isinstance(target, ast.Subscript):
+                        # Handles cases like x[i] = ...
+                        if isinstance(target.value, ast.Name):
+                            adjusted_vars.add(target.value.id)
+
+    return adjusted_vars
+
+
+def adjust_loop_variables(expr_node,loop_variables):
+    for node in ast_walk(expr_node,ast.Name):
+        loop_var = loop_variables.get(node.id)
+        if loop_var and node.id != loop_var:
+            node.id = loop_var
+
+def _find_conv_vars_in_expr(child: ast.AST, conv_vars: List[str]) -> bool:
+    """
+    Recursively checks if any variable in conv_vars is used in the expression node.
+    """
+    if isinstance(child, ast.Name) and child.id in conv_vars:
+        return True
+    elif isinstance(child, ast.Attribute):
+        if isinstance(child.value, ast.Name) and child.value.id in conv_vars:
+            return True
+        if child.attr in conv_vars:
+            return True
+    elif isinstance(child, ast.BinOp):
+        name = None
+        if isinstance(child.left, (ast.Name, ast.Attribute)):
+            name = child.left.id if isinstance(child.left, ast.Name) else child.left.attr
+        elif isinstance(child.right, (ast.Name, ast.Attribute)):
+            name = child.right.id if isinstance(child.right, ast.Name) else child.right.attr
+
+        if name in conv_vars:
+            return True
+    elif isinstance(child, ast.Compare):
+        # Check all parts of the comparison
+        if isinstance(child.left, ast.Name) and child.left.id in conv_vars:
+            return True
+        for comparator in child.comparators:
+            if isinstance(comparator, ast.Name) and comparator.id in conv_vars:
+                return True
+
+    return False
