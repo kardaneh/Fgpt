@@ -22,7 +22,9 @@ class Executive:
         target_module_dir = os.path.join(os.getcwd(), target_module.split('.')[0])
         
         print(f"Executing compilation for {target_module} in directory {target_module_dir}")
-        Processor().compile_and_run(os.getcwd(), target_module_dir, mode)
+        for subdir in os.listdir(target_module_dir):
+            subdir_path = os.path.join(target_module_dir, subdir)
+            Processor().compile_and_run(os.getcwd(), subdir_path, mode)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Execute the specified Fortran module.")

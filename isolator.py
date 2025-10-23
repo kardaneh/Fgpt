@@ -143,7 +143,12 @@ class Isolator:
                 var for var in cls.shapes_variables[child_procedure]
                 if var.string not in scalar_names and var.string not in global_names
                 ]
-        
+
+        shape_to_read = [
+                var for var in cls.shapes_variables[child_procedure]
+                if var.string in scalar_names and var.string not in global_names
+                ]
+        print(shape_to_read, '---------------')
         if shape_to_search:
             cls.find_global_variables(self.module_dir_sp, self.module_tree_cp, shape_to_search, child_procedure)
             cls.var_global[child_procedure].extend(shape_to_search)
@@ -193,10 +198,10 @@ class Isolator:
         for sub_name in self.collect_all_subroutines(cls, child_procedure):
             sub_trees.append(self.working_subroutines[sub_name])
 
-        file_path = os.path.join(subroutine_dir, self.module_global_file)
+        #file_path = os.path.join(subroutine_dir, self.module_global_file)
         self.processor.update_global_module(
                 cls.dec_global[child_procedure], 
-                file_path,
+                subroutine_dir,
                 child_procedure,
                 procedure_tree,
                 sub_trees
@@ -211,14 +216,14 @@ class Isolator:
         else:
             raise ValueError(f"Unsupported procedure type: {procedure_type}")
         
-        file_path = os.path.join(subroutine_dir, self.main_program_file)
+        #file_path = os.path.join(subroutine_dir, self.main_program_file)
         call_stmts = [call_stmt_org]
 
         self.processor.update_main_program(
                 custom_dec_inout=cls.var_dummy[child_procedure],
                 call_stmts=call_stmts,
                 var_modif=cls.var_modif_info[child_procedure],
-                file_path=file_path,
+                subroutine_dir=subroutine_dir,
                 subroutine_name=child_procedure,
                 dummy_args=cls.dummy_arg_list[child_procedure],
                 call_site=call_statements[0],
@@ -228,7 +233,7 @@ class Isolator:
                 acc_data_copyin=None
                 )
 
-        error_status = self.processor.compile_and_run(os.getcwd(), self.target_module_dir)
+        error_status = self.processor.compile_and_run(os.getcwd(), subroutine_dir)
         assert error_status == 0, "Error: Compilation failed or main_program not generated."
 
         write_module_tree = procedure_tree.get_root()
@@ -253,27 +258,24 @@ class Isolator:
     def process_subroutines(self):
         cls = Extractor(self.module_dir_sp, self.module_tree_cp)
         cls.find_subroutines()
-        cls.extract_loop_indices()
-
 
         # Process each parent subroutine and its children
         grand_parent_procedure = "hydrol_main"
-        parent_procedure = "explicitsnow_main"
-        #children = ['explicitsnow_melt_refrz'] #cls.call_within_sub[parent_procedure]
-        #self.processor.logger.info(f"Processing parent subroutine: '{parent_procedure}' with {len(children)} children")
+        parent_procedure = "albedo_surface_main"
+        children = ['multilevel_matrix'] #cls.call_within_sub[parent_procedure]
+        self.processor.logger.info(f"Processing parent subroutine: '{parent_procedure}' with {len(children)} children")
         # Process each child subroutine of this parent
-        #for child_procedure in children:
-        #    self.processor.logger.info(f"  Isolating child subroutine: '{child_procedure}' (called from '{parent_procedure}')")
-        #    try:
+        for child_procedure in children:
+            self.processor.logger.info(f"  Isolating child subroutine: '{child_procedure}' (called from '{parent_procedure}')")
+            try:
                # Pass both parent and child to access the specific call sites
-        #        self.isolate_procedure(cls, parent_procedure, child_procedure)
-        #        self.processor.logger.info(f"  Successfully isolated child subroutine: '{child_procedure}'")
-        #    except Exception as e:
-        #        self.processor.logger.error(f"  Failed to isolate child schild_procedureubroutine '{child_procedure}': {e}")
-        #        raise
-
-        for parent_procedure in ['hydrol_alma', 'hydrol_vegupd','hydrol_canop','hydrol_flood', 'hydrol_hydraulic_arch_tuzet_calc', 'hydrol_soil', 'explicitsnow_main']:
-            self.isolate_procedure(cls, grand_parent_procedure, parent_procedure)
+                self.isolate_procedure(cls, parent_procedure, child_procedure)
+                self.processor.logger.info(f"  Successfully isolated child subroutine: '{child_procedure}'")
+            except Exception as e:
+                self.processor.logger.error(f"  Failed to isolate child schild_procedureubroutine '{child_procedure}': {e}")
+                raise
+        #for parent_procedure in ['hydrol_alma', 'hydrol_vegupd','hydrol_canop','hydrol_flood', 'hydrol_hydraulic_arch_tuzet_calc', 'hydrol_soil', 'explicitsnow_main']:
+        #    self.isolate_procedure(cls, grand_parent_procedure, parent_procedure)
         
     def run(self):
         self.create_target_directory()
@@ -281,8 +283,8 @@ class Isolator:
 
 if __name__ == "__main__":
     rest_of_path = "modipsl_truck_opt/modeles/ORCHIDEE/src_sechiba/"
-    target_modules = ["hydrol", "explicitsnow"]
-    target_module =  target_modules[0]
+    target_modules = ["hydrol", "explicitsnow", "albedo_surface"]
+    target_module =  target_modules[2]
     work = os.getenv("works")
     openacc = False
     isolator = Isolator(rest_of_path, target_module, work, openacc)

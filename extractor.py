@@ -27,7 +27,7 @@ class Extractor:
             self.external_subroutines = set()
             self.call_subroutines = defaultdict(list)
             self.call_within_sub = defaultdict(lambda: defaultdict(list))
-            self.loop_dict = defaultdict(set)
+            self.loop_dict = defaultdict(lambda: defaultdict(set)) #defaultdict(set)
             self.loop_vect = defaultdict(lambda: None)
             self.exclude = {'kjpindex', 'nslm', 'nstm', 'nvm', 'nsnow', 'nice', 'DIM', 'dim', 'MASK', 'next_calc_loop'}
             self.cases_to_exclude = ['clear', 'finalize', 'init', 'initialize', 'read', 'write']
@@ -54,37 +54,6 @@ class Extractor:
         except Exception as e:
             self.processor.logger.error("Error in __init__: %s", str(e))
             raise
-
-    def extract_loop_indices(self):
-        """
-        Extract loop indices and their associated loop bounds from all non-labeled DO loops in the module.
-
-        This method traverses the parsed Fortran module tree to find all DO loops without labels. For each loop, 
-        it parses the loop control statement to identify the loop index variable and the loop's end bound. It skips 
-        loops that involve complex expressions (such as logical OR operands or part references).
-
-        The extracted loop indices are stored in a dictionary (`self.loop_dict`), where each key is a loop end bound 
-        and the corresponding value is a set of loop index variables that iterate up to that bound.
-
-        This information is useful for analyzing loop structures, dependencies, and vectorization opportunities 
-        within the module's subroutines.
-        """
-        try:
-            for loop in walk(self.module_tree, F23.Nonlabel_Do_Stmt):
-                if walk(loop, F23.Or_Operand) or walk(loop, F23.Part_Ref):
-                    continue
-                line_parts = loop.tostr().split('=')
-                loop_index = line_parts[0].split()[-1]
-                start_end_stride_values = line_parts[1].split(',')
-                loop_start = start_end_stride_values[0].strip()
-                loop_end = start_end_stride_values[1].strip()
-                if loop_end:
-                    self.loop_dict[loop_end].add(loop_index)
-
-        except Exception as e:
-            self.processor.logger.error(f"Error in extract_loop_indices: {str(e)}")
-            raise
-
 
     def extract_loop_vect(self, subroutine_key, subroutine_tree):
         """
@@ -260,6 +229,26 @@ class Extractor:
 
             # Validate subroutine key extraction
             assert subroutine_key is not None, f"Unexpected type {subroutine_key} encountered in children."
+
+            for loop in walk(sub, F23.Nonlabel_Do_Stmt):
+                if len(loop.children) < 2 or loop.children[1] is None:
+                    continue
+
+                if walk(loop, F23.Or_Operand) or walk(loop, F23.Part_Ref):
+                    continue
+
+                loop_control = loop.children[1]
+
+                # The structure is: (None, (loop_var, [start, end, stride]), None)
+                if (len(loop_control.children) >= 2 and isinstance(loop_control.children[1], tuple) and len(loop_control.children[1]) >= 2):
+                    loop_var_tuple = loop_control.children[1]
+                    loop_index = loop_var_tuple[0].tostr()  # The loop variable (e.g., 'j')
+                    bounds_list = loop_var_tuple[1]         # The bounds [start, end, stride]
+                    # Check if we have at least start and end bounds
+                    if len(bounds_list) >= 2 and bounds_list[1] is not None:
+                        loop_end = bounds_list[1].tostr()   # The end bound (e.g., 'm')
+                        if loop_end:
+                            self.loop_dict[subroutine_key][loop_end].add(loop_index)
 
             # Filter out subroutines with excluded naming patterns
             check = all(case not in subroutine_key for case in self.cases_to_exclude)
@@ -559,10 +548,10 @@ class Extractor:
         execution_part = walk(subroutine_tree, F23.Execution_Part)[0]
         traverse_block(execution_part)
         self.general_usage_dict[subroutine_key] = {var: props['intent'] for var, props in usage.items()}
-        self.processor.logger.info(f"Induced INTENT for subroutine '{subroutine_key}':")
-        for var, props in usage.items():
-            intent = props['intent'] if props['intent'] is not None else 'UNKNOWN'
-            self.processor.logger.info(f"  '{var}': '{intent}'")
+        #self.processor.logger.info(f"Induced INTENT for subroutine '{subroutine_key}':")
+        #for var, props in usage.items():
+        #    intent = props['intent'] if props['intent'] is not None else 'UNKNOWN'
+        #    self.processor.logger.info(f"  '{var}': '{intent}'")
 
     @staticmethod
     def add_intent(block, intent):
@@ -797,43 +786,41 @@ class Extractor:
 
         self.var_global[subroutine_key] = list(seen.values()) #var_used - var_declared
 
-        for node in specification_part.children:
+        for idx, node in enumerate(specification_part.children):
             if isinstance(node, F23.Type_Declaration_Stmt):
                 assert len(walk(node, F23.Entity_Decl)) == 1,\
                         "walk(declaration_stmt, F23.Entity_Decl), but got a different number."
                 implicit_shape = walk(node, F23.Assumed_Shape_Spec)
                 intrinsic_name = walk(node, F23.Intrinsic_Name)
                 if implicit_shape:
-                    self.processor.logger.warning("Warning: Implicit shape detected in the declaration!")
-                    self.processor.logger.warning("Node: %s", node)
-
+                    self.processor.logger.warning(f"Implicit shape detected in the declaration {node}")
                     if isinstance(subroutine_tree, F23.Subroutine_Subprogram):
                         shape_finder = Shaper(self.module_dir, self.parsed_modules, self.module_path,\
                                 self.dummy_arg_list, self.actual_arg_spec_list, \
                                 self.call_subroutines)
-                        nodes = shape_finder.shaper_subroutine(node, subroutine_key)
-                        self.processor.logger.info("found: %s", nodes)
-                        node = self.processor.map_declaration(node, explicit_dec=nodes, dimensions=None)
+                        explicit_node = shape_finder.shaper_subroutine(node, subroutine_key)
+                        self.processor.logger.info(f"An explicit similar declaration is found: {explicit_node}")
+                        node = self.processor.map_declaration(node, explicit_dec=explicit_node, dimensions=None)
                         entity_decl = walk(node, F23.Entity_Decl)[0].tostr()
                         if entity_decl not in self.imp_shape[subroutine_key]:
                             self.imp_shape[subroutine_key][entity_decl] = node
+                        specification_part.children[idx] = node
+
                     elif isinstance(subroutine_tree, F23.Function_Subprogram):
                         assert parent_subroutine_key is not None, "Error: 'parent_subroutine_key' must not be None."
                         shape_finder = Shaper(self.module_dir, self.parsed_modules, self.module_path, self.dummy_arg_list)
-                        nodes = shape_finder.shaper_function(node, subroutine_tree, subroutine_key, self.all_array_info[parent_subroutine_key])
-                        self.processor.logger.info("found: %s", nodes)
-                        node = nodes
+                        node = shape_finder.shaper_function(node, subroutine_tree, subroutine_key, self.all_array_info[parent_subroutine_key])
+                        self.processor.logger.info(f"An explicit similar declaration is found: {node}")
                         entity_decl = walk(node, F23.Entity_Decl)[0].tostr()
                         if entity_decl not in self.imp_shape[subroutine_key]:
                             self.imp_shape[subroutine_key][entity_decl] = node
                 if intrinsic_name:
-                    self.processor.logger.warning("Warning: Intrinsic name detected in the declaration!")
-                    self.processor.logger.warning("Node: %s", node)
+                    self.processor.logger.warning(f"Intrinsic name detected in the declaration {node}")
                     if isinstance(subroutine_tree, F23.Function_Subprogram):
                         shape_finder = Shaper(self.module_dir, self.parsed_modules, self.module_path, self.dummy_arg_list)
-                        nodes = shape_finder.shaper_intrinsic_size(node)
-                        self.processor.logger.info("found: %s", nodes)
-                        node = nodes
+                        node = shape_finder.shaper_intrinsic_size(node)
+                        self.processor.logger.info(f"An explicit similar declaration is found: {node}")
+                        #node = nodes
                     else:
                         raise ValueError(f"intrinsic_name found in {type(subroutine_tree).__name__} declarations! "
                                 f"This case is not implemented yet!")

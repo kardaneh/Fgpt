@@ -15,7 +15,7 @@ ORCHIDEE_LIBDIR = -L$(WORK)/modipsl_truck_opt/modeles/ORCHIDEE/lib -lorchidee
 
 FFLAGS = $(IOIPSL_INCDIR) $(XIOS_INCDIR) $(ORCHIDEE_INCDIR) $(NETCDF_INCDIR)
 LDFLAGS = $(ORCHIDEE_LIBDIR) $(IOIPSL_LIBDIR) $(XIOS_LIBDIR) $(NETCDF_LIBDIR)
-FFLAGS_COMMON = -Wall -g -O0 -Kieee -Ktrap=fp -Mbounds
+FFLAGS_COMMON = -Wall -g -O0 -Kieee -Ktrap=fp -Mbounds -traceback
 FFLAGS_CPU = $(FFLAGS_COMMON) -r8 -i4
 FFLAGS_GPU = $(FFLAGS_COMMON) -r8 -i4 -Minfo=acc -ta=tesla:ccall,cc80 -acc=noautopar
 	
@@ -30,8 +30,19 @@ OBJ_DIR = obj
 MOD_DIR = mod
 
 SRC_DIR = $(SUBDIR_PATH)
-MODULE_SRC = $(wildcard $(SRC_DIR)/*.f90)
+
+MODULE_SRC = $(wildcard $(SRC_DIR)/module_*.f90)
+MAIN_SRC = $(wildcard $(SRC_DIR)/main_*.f90)
+OTHER_SRC = $(filter-out $(MODULE_SRC) $(MAIN_SRC), $(wildcard $(SRC_DIR)/*.f90))
+
 MODULE_OBJ = $(patsubst $(SRC_DIR)/%,$(OBJ_DIR)/%,$(MODULE_SRC:.f90=.o))
+MAIN_OBJ = $(patsubst $(SRC_DIR)/%,$(OBJ_DIR)/%,$(MAIN_SRC:.f90=.o))
+OTHER_OBJ = $(patsubst $(SRC_DIR)/%,$(OBJ_DIR)/%,$(OTHER_SRC:.f90=.o))
+
+#MODULE_SRC = $(wildcard $(SRC_DIR)/*.f90)
+#MODULE_OBJ = $(patsubst $(SRC_DIR)/%,$(OBJ_DIR)/%,$(MODULE_SRC:.f90=.o))
+
+ALL_OBJ = $(MODULE_OBJ) $(OTHER_OBJ) $(MAIN_OBJ)
 
 EXECUTABLE = $(notdir $(CURDIR))
 COMPILER_REPORT = $(SRC_DIR)/$(EXECUTABLE).txt
@@ -39,7 +50,7 @@ COMPILER_REPORT = $(SRC_DIR)/$(EXECUTABLE).txt
 .PHONY: all clean
 all: clean $(EXECUTABLE)
 
-$(EXECUTABLE): $(MODULE_OBJ)
+$(EXECUTABLE): $(ALL_OBJ)
 	$(FC_NVIDIA) $(FFLAGS_NVIDIA) $^ $(LDFLAGS) -o $@ >> $(COMPILER_REPORT) 2>&1
 
 $(OBJ_DIR)/%.o: $(SRC_DIR)/%.f90

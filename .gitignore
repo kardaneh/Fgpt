@@ -170,6 +170,9 @@ hydrol/*
 explicitsnow/*
 !explicitsnow/.gitkeep
 
+albedo_surface/*
+!albedo_surface/.gitkeep
+
 python-venv/*
 !python-venv/.gitkeep
 
