@@ -589,6 +589,48 @@ class Processor:
             self.logger.error(f"Failed to combine allocate and declaration, Error: {e}")
             raise
 
+    def break_allocatable_declaration(self, declaration_stmt):
+
+        try:
+            result = {}
+            # Extract type and attributes
+            if walk(declaration_stmt, F23.Intrinsic_Type_Spec):
+                type_and_attributes = walk(declaration_stmt, F23.Intrinsic_Type_Spec)[0].tostr()
+            else:
+                raise ValueError("Variable type is not present!")
+
+            # Extract variable name
+            for entity_decl in walk(declaration_stmt, F23.Entity_Decl):
+                array_name = entity_decl.children[0].tostr()
+
+                # Extract dimensions from explicit shape specification
+                dimensions = []
+                if walk(declaration_stmt, F23.Explicit_Shape_Spec_List):
+                    explicit_shape_list = walk(declaration_stmt, F23.Explicit_Shape_Spec_List)[0]
+                    for dim in explicit_shape_list.children:
+                        dimensions.append(dim.tostr())
+                    rank = len(dimensions)
+
+                    # Create allocatable declaration with rank specification using colons
+                    colons = ', '.join([':'] * rank)
+                    allocatable_decl_str = f"{type_and_attributes}, ALLOCATABLE, DIMENSION({colons}) :: {array_name}"
+                    self.logger.info(f"Allocatable declaration: {allocatable_decl_str}")
+                    allocatable_decl = F23.Type_Declaration_Stmt(allocatable_decl_str)
+
+                    # Create allocate statement with dimensions
+                    dim_str = ', '.join(dimensions)
+                    allocate_stmt_str = f"ALLOCATE({array_name}({dim_str}))"
+                    self.logger.info(f"Allocate statement: {allocate_stmt_str}")
+                    allocate_stmt = F23.Allocate_Stmt(allocate_stmt_str)
+                    result[array_name] = [allocatable_decl, allocate_stmt]
+                else:
+                     result[array_name] = [declaration_stmt]
+
+            return result
+        except Exception as e:
+            self.logger.error(f"Failed to break declaration into allocatable, Error: {e}")
+            raise
+
     def remove_intent_and_save(self, type_declaration_stmts):
         """
         Removes specific Fortran attributes such as INTENT, SAVE, and PUBLIC 
@@ -679,7 +721,7 @@ class Processor:
         global modules.
         """
         code = f"""
-        module module_global
+        module module_global_{subroutine_name}
         implicit none
         integer, parameter :: i_std = 4
         integer, parameter :: r_std = 8
@@ -693,7 +735,7 @@ class Processor:
         integer(kind = i_std)            :: ic0, ic
         real(kind = r_std)               :: icr, start_time, stop_time
         contains
-        end module module_global
+        end module module_global_{subroutine_name}
         """
         try:
             reader = FortranStringReader(code, ignore_comments=False)
@@ -869,7 +911,7 @@ class Processor:
             self.logger.error(f"Failed to write code to file: {file_path}, Error: {e}")
             raise
 
-    def update_global_module(self, input_dict, file_path, subroutine_name, procedure_tree, custom_subroutine_trees):
+    def update_global_module(self, input_dict, subroutine_dir, subroutine_name, procedure_tree, custom_subroutine_trees):
         """
         Update the global Fortran module by injecting declarations, use statements,
         and I/O operations related to global variables and routines.
@@ -901,6 +943,7 @@ class Processor:
         """
         try:
             subroutine_found = False
+            file_path = os.path.join(subroutine_dir, f"module_global_{subroutine_name}.f90")
             self.out_module = self.out_module_fortran(subroutine_name)
             assert procedure_tree is not None, "procedure_tree must be provided"
             assert isinstance(procedure_tree, (F23.Function_Subprogram, F23.Subroutine_Subprogram)),\
@@ -974,7 +1017,7 @@ class Processor:
             custom_dec_inout,
             call_stmts,
             var_modif,
-            file_path,
+            subroutine_dir,
             subroutine_name,
             dummy_args,
             call_site=None,
@@ -1033,6 +1076,7 @@ class Processor:
               and writes it to the provided file path.
         """
         try:
+            file_path = os.path.join(subroutine_dir, f"main_{subroutine_name}.f90")
             self.out_main = self.out_main_fortran()
             custom_module_name = walk(walk(self.out_module,F23.Module_Stmt), F23.Name)[0].string
             custom_subroutines_names = [name.string for name in walk(walk(self.out_module,F23.Subroutine_Stmt),F23.Name)]
@@ -1657,65 +1701,38 @@ class Processor:
             self.logger.error(f"Error in process_queue: {e}")
             raise
 
-    def compile_and_run(self, base_dir, modules_dir, mode="CPU"):
+    def compile_and_run(self, base_dir, target_dir, mode="CPU"):
         """
-        Compiles and runs all generated subroutines in their respective directories.
-
-        This method searches through subdirectories inside the given `modules_dir` path, 
-        sets up the environment variables needed for compilation, and invokes `make` 
-        using the provided Makefile. If the required binary input files (`dummy.bin` 
-        and `global.bin`) exist in the benchmark directory, it proceeds to execute 
-        the compiled subroutine binary.
-
-        Parameters:
-            base_dir (str): 
-                The root directory containing the Makefile and benchmark structure.
-
-            modules_dir (str): 
-                The directory (relative to `base_dir`) where each subroutine's 
-                compiled files and sources reside.
-
-            mode (str, optional): 
-                Compilation mode, typically "CPU" or "GPU". Defaults to "CPU".
-
-        Returns:
-            int:
-                - Returns 0 if all subroutines were successfully compiled and executed.
-                - Returns 1 if any compilation or execution step failed.
-
-        Side Effects:
-            - Changes the current working directory (`os.chdir`).
-            - Sets environment variables `SUBDIR_PATH` and `MODE`.
-            - Executes shell commands via `os.system`.
-            - Prints colored status messages to the terminal.
         """
-        target_module_dir_path = os.path.join(base_dir, modules_dir)
-        for subdir in os.listdir(target_module_dir_path):
-            subdir_path = os.path.join(target_module_dir_path, subdir)
-            if os.path.isdir(subdir_path):
-                self.logger.info(f"Compiling and running in {subdir_path}...")
-                os.environ["SUBDIR_PATH"] = subdir_path
-                os.environ["MODE"] = mode
-                os.chdir(subdir_path)
-                os.system("make clean -f {}".format(os.path.join(base_dir, "Makefile")))
-                os.system("make -f {}".format(os.path.join(base_dir, "Makefile")))
-                if os.path.exists(subdir):
-                    self.logger.info("Compilation process completed!")
-                    dummy_bin = os.path.join(self.benchmark_dir, subdir, "dummy.bin")
-                    global_bin = os.path.join(self.benchmark_dir, subdir, "global.bin")
-                    if os.path.exists(dummy_bin) and os.path.exists(global_bin):
-                        self.logger.info("Benchmark files exist. Now running the unit tests ...")
-                        os.system("./{}".format(subdir))
-                        self.logger.info(f"Execution completed in {subdir_path}")
-                    else:
-                         if not os.path.exists(dummy_bin):
-                             self.logger.warning(f"Missing file: {dummy_bin}")
-                         if not os.path.exists(global_bin):
-                             self.logger.warning(f"Missing file: {global_bin}")
-                         self.logger.warning("Benchmark files do not exist yet. Run the modified main code and then python executive.py")
-                else:
-                    self.logger.error("Compilation failed or main_program not generated.")
-                    return 1
+        
+        if not os.path.isdir(target_dir):
+            self.logger.error(f"Target directory does not exist: {target_dir}")
+            return 1
+        
+        self.logger.info(f"Compiling and running in {target_dir}...")
+        executable_name = os.path.basename(target_dir.rstrip('/'))
+
+        os.environ["SUBDIR_PATH"] = target_dir
+        os.environ["MODE"] = mode
+        os.chdir(target_dir)
+
+        os.system("make clean -f {}".format(os.path.join(base_dir, "Makefile")))
+        compile_result = os.system("make -f {}".format(os.path.join(base_dir, "Makefile")))
+        if compile_result == 0 and os.path.exists(executable_name):
+            self.logger.info("Compilation process completed!")
+            dummy_bin = os.path.join(self.benchmark_dir, executable_name, "dummy.bin")
+            global_bin = os.path.join(self.benchmark_dir, executable_name, "global.bin")
+            if os.path.exists(dummy_bin) and  os.path.exists(global_bin):
+                self.logger.info("Benchmark files exist. Now running the unit tests ...")
+                os.system("./{}".format(executable_name))
+                self.logger.info(f"Execution completed in {target_dir}")
+            else:
+                if not os.path.exists(dummy_bin) and not os.path.exists(global_bin):
+                    self.logger.warning(f"Missing files: {dummy_bin} and  {global_bin}")
+                self.logger.warning("Benchmark files do not exist yet. Run the modified main code and then python executive.py")
+        else:
+            self.logger.error("Compilation failed or main_program not generated.")
+            return 1
         os.chdir(base_dir)
         return 0
 
@@ -2088,7 +2105,7 @@ if __name__ == "__main__":
             with open(test_file, "w") as f:
                 f.write("program test\ninteger :: a\nend program test")
                 
-            result = self.processor.compile_and_run(self.test_dir, "./compile_test")
+            result = self.processor.compile_and_run(original_cwd, test_dir)
             self.assertEqual(result, 0)
             os.chdir(original_cwd)
             shutil.rmtree(test_dir)
