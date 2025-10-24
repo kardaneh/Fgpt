@@ -726,6 +726,7 @@ class Processor:
         integer, parameter :: i_std = 4
         integer, parameter :: r_std = 8
         integer(kind = i_std), parameter :: nice = 8
+        integer(kind = i_std), parameter :: ncirc = 3
         integer(kind = i_std), parameter :: nsnow=3
         integer(kind = i_std), parameter :: nslm=11
         integer(kind = i_std), parameter :: nvm = 15

@@ -1,6 +1,7 @@
 import os
 from collections import deque
 from processor import Processor
+from logger import Logger
 from fparser.two.utils import walk
 from fparser.two import Fortran2003 as F23
 import unittest
@@ -119,6 +120,8 @@ class Navigator:
         self.parsed_modules = parsed_modules
         self.module_path = module_path
         self.processor = Processor()
+        #self.logger = Logger(Module_name="Navigator")
+        #self.logger.show_header()
 
     def find_variable_in_module(self):
         """
