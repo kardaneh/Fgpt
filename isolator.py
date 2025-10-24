@@ -261,21 +261,21 @@ class Isolator:
 
         # Process each parent subroutine and its children
         grand_parent_procedure = "hydrol_main"
-        parent_procedure = "albedo_surface_main"
-        children = ['multilevel_matrix'] #cls.call_within_sub[parent_procedure]
-        self.processor.logger.info(f"Processing parent subroutine: '{parent_procedure}' with {len(children)} children")
+        #parent_procedure = "albedo_surface_main"
+        #children = ['multilevel_matrix'] #cls.call_within_sub[parent_procedure]
+        #self.processor.logger.info(f"Processing parent subroutine: '{parent_procedure}' with {len(children)} children")
         # Process each child subroutine of this parent
-        for child_procedure in children:
-            self.processor.logger.info(f"  Isolating child subroutine: '{child_procedure}' (called from '{parent_procedure}')")
-            try:
+        #for child_procedure in children:
+        #    self.processor.logger.info(f"  Isolating child subroutine: '{child_procedure}' (called from '{parent_procedure}')")
+        #    try:
                # Pass both parent and child to access the specific call sites
-                self.isolate_procedure(cls, parent_procedure, child_procedure)
-                self.processor.logger.info(f"  Successfully isolated child subroutine: '{child_procedure}'")
-            except Exception as e:
-                self.processor.logger.error(f"  Failed to isolate child schild_procedureubroutine '{child_procedure}': {e}")
-                raise
-        #for parent_procedure in ['hydrol_alma', 'hydrol_vegupd','hydrol_canop','hydrol_flood', 'hydrol_hydraulic_arch_tuzet_calc', 'hydrol_soil', 'explicitsnow_main']:
-        #    self.isolate_procedure(cls, grand_parent_procedure, parent_procedure)
+        #        self.isolate_procedure(cls, parent_procedure, child_procedure)
+        #        self.processor.logger.info(f"  Successfully isolated child subroutine: '{child_procedure}'")
+        #    except Exception as e:
+        #        self.processor.logger.error(f"  Failed to isolate child schild_procedureubroutine '{child_procedure}': {e}")
+        #        raise
+        for parent_procedure in ['hydrol_alma', 'hydrol_vegupd','hydrol_canop','hydrol_flood', 'hydrol_hydraulic_arch_tuzet_calc', 'hydrol_soil', 'explicitsnow_main']:
+            self.isolate_procedure(cls, grand_parent_procedure, parent_procedure)
         
     def run(self):
         self.create_target_directory()
@@ -284,7 +284,7 @@ class Isolator:
 if __name__ == "__main__":
     rest_of_path = "modipsl_truck_opt/modeles/ORCHIDEE/src_sechiba/"
     target_modules = ["hydrol", "explicitsnow", "albedo_surface"]
-    target_module =  target_modules[2]
+    target_module =  target_modules[0]
     work = os.getenv("works")
     openacc = False
     isolator = Isolator(rest_of_path, target_module, work, openacc)
