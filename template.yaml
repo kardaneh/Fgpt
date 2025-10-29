@@ -5,8 +5,10 @@ Python_templates:
             import numpy as np
             import logging
             from scipy.io import FortranFile
-            import os
-            
+            import time
+            import functools
+
+            nice = np.int32(8)
             nsnow = np.int32(3)
             nslm = np.int32(11)
             nvm = np.int32(15)
@@ -29,11 +31,13 @@ Python_templates:
             import numpy as np
             import logging
             from scipy.io import FortranFile
-            import os
+            import time
+            import functools
             
             class Global_module:
                 def __init__(self):
-                    
+
+                    self.nice = np.int32(8)
                     self.nsnow = np.int32(3)
                     self.nslm = np.int32(11)
                     self.nvm = np.int32(15)
@@ -54,8 +58,6 @@ Python_templates:
         name: "Python_main_template"
         template: |
             import os
-            import time
-            import functools
             import numpy as np
             import logging
             from scipy.io import FortranFile
