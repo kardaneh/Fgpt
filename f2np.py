@@ -7,7 +7,6 @@ from typing import List, Dict, Optional,Union
 import re
 import ast
 import copy
-import logging
 import itertools
 from utils import ast_walk,adjust_loop_variables
 from logger import Logger
@@ -206,8 +205,14 @@ class F2NP:
                 elif isinstance(current_parent, list): # This for the case of ELSE statemnt in which the control_stack will contain the 
                     # orelse list 
                     current_parent.append(stmt)
+                
                 else:
                     raise RuntimeError("Expected parent with 'body' attribute for nested control block")
+                
+            elif current_parent is not None and isinstance(current_parent, dict):
+                    if_chain = current_parent['if_chain']
+                    if hasattr(if_chain, 'body') and isinstance(if_chain.body, list):
+                        if_chain.body.append(stmt)
             else:
                 control_stack.append(stmt)
         except Exception:
@@ -260,7 +265,8 @@ class F2NP:
             module_stack = []
             
         if counters is None:
-            counters = {'do': 0, 'if': 0, 'elif':0, 'ifwhere':0, 'elifwhere':0}
+            counters = {'do': 0, 'if': 0, 'elif':0, 'ifwhere':0, 'elifwhere':0, 'case': 0}
+
         if hasattr(block, "content"):
             idx = 0
             while idx < len(block.content):
@@ -301,7 +307,7 @@ class F2NP:
                     elif isinstance(child,F23.Assignment_Stmt):
                         stmt = self.handle_assignment(child)
                         # print(counters, ast.unparse(ast.fix_missing_locations(stmt)))
-                        if counters["if"] == 0 and counters["do"] == 0: # We don't need to check for the counters['elif'] since the if the `if` counters is empty then elif is also empty 
+                        if counters["if"] == 0 and counters["do"] == 0 and counters['case'] == 0: # We don't need to check for the counters['elif'] since the if the `if` counters is empty then elif is also empty 
                             # since elif can't exist without the other. 
                             # control_stack.append(stmt)
                             if counters['ifwhere'] > 0 or counters["elifwhere"] > 0:
@@ -440,7 +446,7 @@ class F2NP:
                         stmt = self.handle_call_stmt(child)
                         if stmt is None:
                             raise ValueError(f'Call statement is None due to prior error')
-                        if counters["do"] == 0 and counters["if"] == 0:
+                        if counters["do"] == 0 and counters["if"] == 0 and counters['case'] == 0:
                             if not isinstance(stmt,ast.Pass):
                                 module_stack.append(stmt)
                         else:
@@ -599,11 +605,88 @@ class F2NP:
                         else:
                             self.append_to_current_parent(stmt, control_stack)
 
+                    elif isinstance(child, F23.Select_Case_Stmt):
+                        switch_expr = self.handle_expr(child.children[0]) 
+                        case_stack = {
+                            'type': 'select_case',
+                            'switch_expr': switch_expr, 
+                            'if_chain': None}
+                        control_stack.append(case_stack)
+                        counters['case'] = counters.get('case', 0) + 1
+                    
+                    elif isinstance(child, F23.Case_Stmt):
+                        # Each CASE (...) or CASE DEFAULT
+                        select_info = next(
+                            (s for s in reversed(control_stack) if isinstance(s, dict) and s.get('type') == 'select_case'),
+                            None
+                        )
+                        if not select_info:
+                            raise RuntimeError("CASE statement found without an enclosing SELECT CASE")
+
+                        switch_expr = select_info['switch_expr']
+
+                        # Extract the selector (which can be None for DEFAULT)
+                        selector_node = child.children[0] 
+                        # This may have Case_Value_Range_List or None
+                        value_list = getattr(selector_node, 'children', [None])[0]
+
+                        if value_list is None:
+                            # CASE DEFAULT
+                            prev_if = select_info['if_chain']
+                            if prev_if is None:
+                                raise RuntimeError("CASE DEFAULT without any preceding CASE")
+                            # Default → orelse list of the last if
+                            prev_if.orelse = []
+                            control_stack.append(prev_if.orelse)
+                        else:
+                            # Extract value from Case_Value_Range_List
+                            case_value_node = walk(selector_node, F23.Name)[0]
+                            case_value = self.handle_expr(case_value_node)
+
+                            case_if = ast.If(
+                                test=ast.Compare(
+                                    left=switch_expr,
+                                    ops=[ast.Eq()],
+                                    comparators=[case_value]
+                                ),
+                                body=[],
+                                orelse=[]
+                            )
+
+                            if select_info['if_chain'] is None:
+                                # First CASE — attach to module or enclosing control
+                                select_info['if_chain'] = case_if
+                                if counters["do"] == 0 and counters["if"] == 0:
+                                    module_stack.append(case_if)
+                                else:
+                                    self.append_to_current_parent(case_if, control_stack)
+                            else:
+                                # Subsequent CASE — attach to orelse of previous one
+                                prev_if = select_info['if_chain']
+                                while prev_if.orelse and isinstance(prev_if.orelse[0], ast.If):
+                                    prev_if = prev_if.orelse[0]
+                                prev_if.orelse = [case_if]
+                                select_info['if_chain'] = case_if
+
+                            # # Push this CASE to stack (so body statements append correctly)
+                            # control_stack.append(case_if)
+                    
+                    elif isinstance(child, F23.End_Select_Stmt):
+                        if counters.get('case', 0) > 0:
+                            counters['case'] -= 1
+
+                        while control_stack and not (isinstance(control_stack[-1], dict) and control_stack[-1].get('type') == 'select_case'):
+                            control_stack.pop()
+                        if control_stack and isinstance(control_stack[-1], dict):
+                            control_stack.pop()
+
+                    elif isinstance(child, F23.Return_Stmt):
+                        pass 
                     else:   
                         self.recursive_ast(child, ast_mode=ast_mode, control_stack=control_stack,counters=counters,module_stack=module_stack)
                 
-                except Exception:
-                    self.logger.exception(f"Exception in recursive block at index {idx}, block type: {type(child).__name__}")
+                except Exception as e:
+                    self.logger.exception(f"Exception in recursive block at index {idx}, block type: {type(child).__name__}", e)
                     raise 
                     
                 idx += 1
@@ -1357,23 +1440,40 @@ class F2NP:
                         
                     # FInd the intrinsic arguments, as such it would allow us to retrieve the the actual arguments inside the intrinsic parameter
                     intrinsic_args = walk(intrinsic_function_reference,F23.Actual_Arg_Spec_List)[0]
-                    # print(intrinsic_args.children)
                     args = []
                     keywords = []
                     # Since we do this,it will recuresively call the handle_expr
                     # onto the elements inside the intrinsic function in question : max(mc[ji, jsl, ins] - mcr[ji,], zero), which will get transformed and
                     # onto a binary operation 
-                    for arg in intrinsic_args.children:
-                        if isinstance(arg,F23.Actual_Arg_Spec): # THis is meant to retrieve the keywords(argument of instrinsic function) other than the variable
-                            
-                            keywords.append(self.handle_expr(arg))
+                    for iarg, arg in enumerate(intrinsic_args.children):
+                        if func_name == "np.sum":
+                            if isinstance(arg,F23.Actual_Arg_Spec): # THis is meant to work for the SUM since they might or might have DIM as argument 
+                                keywords.append(self.handle_expr(arg))
+                            elif not isinstance(arg, F23.Actual_Arg_Spec) and iarg > 0: # THis is the case where it might not have the DIM as argument 
+                                expr = self.handle_expr(arg)
+                                if isinstance(arg, F23.Int_Literal_Constant):
+                                    adjusted_value = str(int(expr.value) - 1)
+                                    expr = F23.Int_Literal_Constant(adjusted_value, None)
+                                else:
+                                    expr = F23.Level_2_Expr((expr,'-','1'))
+                                
+                                expr = self.handle_expr(expr)
+                                keywords.append(ast.keyword(arg='axis',value = expr))
+
+                            else:
+                                args.append(self.handle_expr(arg))
                         else:
-                            args.append(self.handle_expr(arg))
+                            if isinstance(arg,F23.Actual_Arg_Spec): # THis is meant to retrieve the keywords(argument of instrinsic function) other than the variable
+                                keywords.append(self.handle_expr(arg))
+                            else:
+                                args.append(self.handle_expr(arg))
+
                     intrinsic_func = ast.Call(
                         func=func,  
                         args=args,
                         keywords=keywords
                     )  
+                    
                     
                 return intrinsic_func
             except Exception:
@@ -1754,7 +1854,24 @@ class F2NP:
                     lhs_node, eq_sign, rhs_node = stmt.children
                     # Handle left side of the assignement
                     if isinstance(lhs_node, F23.Name):
-                        lhs_ast = ast.Name(id=lhs_node.string,ctx = ast.Store())
+                        # In some cases, we observed that arrays are assigned like this : a = TRUE within a function locally in this case
+                        # Python will create a new local variables with the same name thus could pose a problem further down the code that might use the actual variable 
+                        elem_found = None
+                        for key,value in self.extractor.all_array_info.items():
+                            if (lhs_node.string in value.keys()) and isinstance(rhs_node, (F23.Name,F23.Logical_Literal_Constant,F23.Real_Literal_Constant, F23.Int_Literal_Constant)):
+                                elem_found = self.extractor.all_array_info[key][lhs_node.string]
+                        
+                        if elem_found:
+                            if len(elem_found) == 1:
+                                nb_slices = ast.Slice()
+                            elif len(elem_found) > 1:
+                                nb_slices = ast.Tuple(elts=[ast.Slice() for _ in range(len(elem_found))],ctx=ast.Load())
+                            lhs_ast = ast.Subscript(
+                                value=ast.Name(id=lhs_node.string,ctx = ast.Store()),
+                                slice=nb_slices
+                            )
+                        else:
+                            lhs_ast = ast.Name(id=lhs_node.string,ctx = ast.Store())
                     elif isinstance(lhs_node,F23.Part_Ref):
                         lhs_ast = self.handle_expr(lhs_node)
                         if lhs_ast is None:
@@ -1774,7 +1891,6 @@ class F2NP:
                         left_name = lhs_ast.id
                         right_name = rhs_ast.id
                     # Check if name exists in any of the keys from all_array_info
-                    
                     for key,value in self.extractor.all_array_info.items():
                         if (left_name in value.keys()) and (right_name in value.keys()):
                             dim_found = self.extractor.all_array_info[key][left_name]
@@ -1793,15 +1909,6 @@ class F2NP:
                             value = lhs_ast,
                             slice=arg
                         )
-                        # rhs_ast = ast.Call(
-                        #     func=ast.Attribute(
-                        #         value=rhs_ast,
-                        #         attr='copy',
-                        #         ctx=ast.Load()
-                        #     ),
-                        #     args=[],
-                        #     keywords=[]
-                        # )
                         pass
 
                     ast_stmt = ast.Assign(
@@ -2069,7 +2176,7 @@ class F2NP:
             )
 
         else:
-            raise NotImplementedError(f"Unsupported node type: {type(expr_node)}")
+            raise NotImplementedError(f"Unsupported node type: {type(expr_node)}, for node:{expr_node}")
         
     def apply_mask_to_rhs(self, node):
         """
