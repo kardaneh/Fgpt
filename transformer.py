@@ -1,4 +1,5 @@
-from typing import Dict, List,Literal,Optional,Tuple,Union
+from __future__ import annotations
+from typing import Dict, List,Literal,Optional,Tuple,Union,TYPE_CHECKING
 from fparser.two import Fortran2003 as F23
 from collections import defaultdict
 from itertools import zip_longest
@@ -12,9 +13,10 @@ import stat
 import ast
 import os
 
-from isolator import Isolator
-from processor import Processor
-from extractor import Extractor
+if TYPE_CHECKING:
+    from isolator import Isolator
+    from extractor import Extractor
+
 from f2np import F2NP
 from utils import * 
 from logger import Logger
@@ -26,10 +28,11 @@ class Transformer:
     """
 
     def __init__(self, benchmark_dir:str,
-                 isolator:Isolator,
-                 extractor:Extractor,
+                 isolator:'Isolator',
+                 extractor:'Extractor',
                  ignore_case:List[str],
-                 config_path:str
+                 config_path:str,
+                 logger:Logger = None
                 ):
         if benchmark_dir is None: # THe benchmark directory
             current_dir = os.getcwd()
@@ -46,11 +49,19 @@ class Transformer:
         self.for_loop = False                   # If we want to create with either using using a for loop for the reading binary files 
         self.global_state = False               # Allows to define if the given code template is for global or not
 
-        self.logger = Logger(Module_name="Transformer")
-        self.logger.show_header()
+        if logger is None:
+            self.logger = Logger()
+        else:
+            self.logger = logger
+        self.logger.show_header("Transformer")
         
         self.f2np = F2NP(extractor)             # Class in charge of transforming a subroutine from fortran to python
         self.f2np.ast_mode = True
+
+        # This meant to be done to ensure that we get the log events happening inside the function thus wraps the method itself upon the wrapper function
+        self.update_global_python = self.logger.log_event("Update_global_python")(self.update_global_python)
+        self.update_main_python = self.logger.log_event('Update_main_python')(self.update_main_python)
+        self.run_python_scripts = self.logger.log_event('Run python scripts')(self.run_python_scripts)
 
     ################################################################################# Helper functions #################################################################################
     @staticmethod
@@ -224,7 +235,7 @@ class Transformer:
         import_nodes,instance_nodes = None,None
         try:
             class_defs = list(ast_walk(out_module, ast.ClassDef))
-
+            # print(ast.unparse(ast.fix_missing_locations(out_module)))
             if not class_defs:
                 raise ValueError("There are no class definition are in this module")
             # Collect attributes and methods separately of a class 
@@ -282,8 +293,17 @@ class Transformer:
                                     # using cls.all_array_info to retrieve all the array info for the global elements
                                     array_info = self.extractor.all_array_info[subroutine_key].get(target.attr)
                                     if array_info is None:
-                                        raise ValueError(f'Information about the array is not present inside the cls.all_array_info for the array \
-                                                        array :{target.attr}')
+                                        # Check within all of the call_within_sub dependencies which means that these arrays are from other subroutines 
+                                        for key in self.isolator.working_subroutines.keys():
+                                            array_info = self.extractor.all_array_info[key].get(target.attr)
+                                            if array_info is not None:
+                                                self.logger.info(f'Found array_info for {target.attr} in subroutine: {key}')
+                                                break 
+
+                                    if array_info is None:
+                                        raise ValueError(
+                                            f'Information about the array is not present inside cls.all_array_info for the array: {target.attr}'
+                                        )
                                     # extract dtype from keywords
                                     dtype = None
                                     for kw in assign.value.keywords:
@@ -304,7 +324,7 @@ class Transformer:
                                             attributes[target.attr] = [
                                                     assign.value.attr,  # constant value
                                                     dtype[1] # THis is because we the self.y is usually present before the self.x thus the type of self.x is that of self.y
-                                                ]
+                                               ]
                 # Collect methods (def method(self): ...)
                 for node in class_def.body:
                     if isinstance(node, ast.FunctionDef):
@@ -321,8 +341,7 @@ class Transformer:
                         'methods': methods,
                         'instances': instances
                     }
-
-        
+            
             # Create imports
             specs = [('module_global', [class_name]) for class_name in class_members]
             # print(ast.unparse(ast.fix_missing_locations(import_nodes[0])))
@@ -367,8 +386,8 @@ class Transformer:
                 
             return cls_info, import_nodes, instance_nodes
         
-        except Exception:
-            self.logger.exception(f"An exception occurred in create_cls_info")
+        except Exception as e:
+            self.logger.exception(f"An exception occurred in create_cls_info:", e)
             return None,None,None
 
     def add_instance(self,idx:int, instance_node:ast.Assign, cls_info:Dict,functions_def:ast.FunctionDef,method_name:List[str]) -> None:
@@ -592,7 +611,7 @@ class Transformer:
             self.logger.exception(f"Exception occurred in get_timer")
             return None
     
-    def correct_function(self, function_def:ast.FunctionDef,cls_info:Dict,timer_tree:ast.AST=None,subroutine_key:str=None,main_file_info:Dict={}) -> None:
+    def correct_function(self, function_def:ast.FunctionDef,cls_info:Dict,subroutine_key:str=None,main_file_attributes:List = None) -> None:
         """
         Update a translated Python function (from Fortran) by applying argument, decorator, and return modifications.
 
@@ -601,10 +620,6 @@ class Transformer:
         1. **Argument Replacement for Global Instances**  
         Replaces any global variable names (from a global module) found in the function's arguments
         with an instance of the class that holds those attributes.
-
-        2. **Timer Decorator Insertion**  
-        If a timer decorator (`timer_tree`) is provided, it is added to the function's decorators
-        to enable execution time measurement.
 
         3. **Return Statement Insertion for Modified Output Variables**  
         - Inspects the dummy variables from the original Fortran subroutine.
@@ -628,7 +643,7 @@ class Transformer:
             Name of the subroutine/function that we will work upon
 
         main_file_info: Optional[dict]
-            Main file infor is a dict contating information on the functions/subroutines that are present in the file that is not in class 
+            Main file infor is a dict contating information on the functions/subroutines that are present in the file that is not in class as well as attributes 
         
         Returns
         -------
@@ -685,74 +700,65 @@ class Transformer:
                         if func_name not in self.extractor.call_within_sub[subroutine_key]:
                             continue
                         method = cls_info[module_name][instance_name]['methods'].get(func_name)
-                        if not method:
-                            method = main_file_info.get(func_name)
-                            method_main_source = True
-                            if not method:
-                                continue
                         
                         i = call_indices[func_name] # since by default all the elements are at 0 
                         call_indices[func_name] += 1  # increment for next time when we encounter the function itself
+                        i = min(i, len(self.extractor.call_subroutines.get(func_name, [])) - 1) # # Clamp i so it doesn’t exceed available subroutine entries
                         indexes = []
+                        # print(ast.unparse(ast.fix_missing_locations(method)))
                         for arg in method.args.args:
                             if arg.arg in self.extractor.dummy_arg_list[func_name]:
                                 index = self.extractor.dummy_arg_list[func_name].index(arg.arg)
                                 indexes.append(index)
-                        if not method_main_source:
-                            try:
+
+                        try:
+                            actual_args_list = None
+                            part_ref = None
+                            if walk(self.extractor.call_subroutines[func_name],F23.Call_Stmt):
                                 actual_args_list = walk(self.extractor.call_subroutines[func_name], F23.Actual_Arg_Spec_List) # Subroutines 
-                                if actual_args_list:
-                                    args = [
-                                        self.f2np.handle_expr(actual_args_list[i].children[idx])
-                                        for idx in indexes
-                                    ]
-                                else:
-                                    # Fall back to another parsing route which usually means we are in the case of Functions 
-                                    part_ref = walk(self.extractor.call_subroutines[func_name][i], F23.Part_Ref)
-                                    actual_args_list = walk(part_ref, F23.Section_Subscript_List)[0]
-                                    args = [
-                                        self.f2np.handle_expr(actual_args_list.children[idx])
-                                        for idx in indexes
-                                    ]
-
-                                node.args = args
-
-                            except (IndexError, KeyError) as e:
-                                self.logger.log_error(f"Error mapping arguments for expr to '{func_name}' at index {i}:", e)
-                        else:
-                            missing_args = []
-                            # The arguments can either be that of call stmt with their actual arguments which is the case for the subroutines 
-                            # but for the functions it's quiet dirrent due to the fact that the function is treated as a part ref thus requires some extra step 
-                            # to differentiate between the function itself and that of it's argument 
-                            actual_args_list = walk(self.extractor.call_subroutines[func_name][i], F23.Actual_Arg_Spec_List)
-
-                            if not actual_args_list:
-                                part_refs = walk(self.extractor.call_subroutines[func_name][i], F23.Part_Ref)
-                                if part_refs:
-                                    section_subscripts = walk(part_refs[0], F23.Section_Subscript_List)
-                                    if section_subscripts:
-                                        actual_args_list = section_subscripts[0]
-                                    else:
-                                        actual_args_list = None
-                                else:
-                                    actual_args_list = None
-
                             if actual_args_list:
-                                for method_arg, call_arg in zip_longest(method.args.args, actual_args_list.children):
-                                    if call_arg is None:
-                                        # Argument missing at call site, use default or placeholder from method definition
-                                        missing_args.append(self.f2np.handle_expr(method_arg))
+                                args = [
+                                    self.f2np.handle_expr(actual_args_list[i].children[idx])
+                                    for idx in indexes
+                                ]
+                            else:
+                                # Fall back to another parsing route which usually means we are in the case of Functions 
+                                # Functions in most cases, seems to appear as either Part ref or just as an assign statement like that of def in Python
+                                if isinstance(self.extractor.call_subroutines[func_name][i], F23.Part_Ref): 
+                                    part_ref = walk(self.extractor.call_subroutines[func_name][i], F23.Part_Ref)
+                                else:
+                                    if isinstance(self.extractor.call_subroutines[func_name][i],F23.Assignment_Stmt):
+                                        _,_,func = self.extractor.call_subroutines[func_name][i].children
+                                        part_ref = walk(func,F23.Part_Ref)
                                 
-                                # Only add missing args (presumably others already handled elsewhere)
-                                node.args.extend(missing_args)
+                                if part_ref:
+                                    actual_args_list = walk(part_ref, F23.Section_Subscript_List)[0]
+                                assert len(actual_args_list.children) == len(indexes), f"The actual arguments for the funciton and that of the dummy arg list of function: {func_name} should match"
+                                args = []
+                                for idx in indexes:
+                                    if idx < len(actual_args_list.children):
+                                        args.append(self.f2np.handle_expr(actual_args_list.children[idx]))
+                                    else:
+                                        self.logger.warning(
+                                            f"Skipping missing actual argument at index {idx} for {func_name}: "
+                                            f"{len(actual_args_list.children)} actual args found."
+                                        )
+                            node.args = args
+
+                        except (IndexError, KeyError) as e:
+                            self.logger.log_error(f"Error mapping arguments for expr to '{func_name}' at index {i}:", e)
                             
                 scalar_variables = set()
                 func_name = function_def.name 
                 method = cls_info[module_name][instance_name]['methods'].get(func_name)
                 if not method:
                     continue
+                scalars = [elem.string for elem in self.extractor.scalar_variables[func_name]]
+                # These 'main_file_attributes' corresponds to the scalars that are sent as arguments from the main file 
+                # where in the case of the children isolation these arguments need to be modified since their values comes directly from the values that are read directly and enusre that we
+                # keep only the elements that are not necessary to be changed.
                 for arg in method.args.args:
-                    if arg.arg in self.extractor.scalar_variables[func_name]:
+                    if arg.arg in scalars and arg.arg not in main_file_attributes:
                         scalar_variables.add(arg.arg)
 
                 # Return list: we need to verify if the function def requires a return stmt since the function defintion has been converted from 
@@ -785,16 +791,23 @@ class Transformer:
             # Thus ins and nslm makes it go out of bounds since python use zero based indexation,
             # First retrieve all the loop variables within the for loop usually present in cls.loop_dict si that we don't modify them
             cons_var = set()
-            for values in self.extractor.loop_dict.values():
-                value = sorted(values)
-                if len(value)>1:
-                    cons_var.add(value[0])
-                    cons_var.add(value[1])
-                else:
-                    cons_var.add(value[0])
-            
-            # This is to add the timer decorator in the case we need to measure the execution time of the function
-            function_def.decorator_list = [ast.Name(id=next(ast_walk(timer_tree,ast.FunctionDef)).name,ctx=ast.Load())] if timer_tree else []
+            loop_dict_values = self.extractor.loop_dict.get(subroutine_key,{})
+            if loop_dict_values: 
+                for values in loop_dict_values.values():
+                    value = sorted(values)
+                    if len(value)>1:
+                        cons_var.add(value[0])
+                        cons_var.add(value[1])
+                    else:
+                        cons_var.add(value[0])
+                # Sometimes the loop dict doesn't go onto enough depth that it leaves out some for loop target vairables due to the fact that loop dict only 
+                # looks upon the end loop range(max) and is known during processing time and not runtime variables like arrays
+                # THUS WE will retrieve the rest of the loop target variables
+                for loop_var in ast_walk(function_def, ast.For):
+                    if isinstance(loop_var.target, ast.Name) and loop_var.target.id not in cons_var:
+                        cons_var.add(loop_var.target.id)
+            # cons_var.add('jsl')
+            # cons_var.add('jjj')
 
             # Now we visit each node and adjust the subscripts 
             # We need to send the all_array_info for two reasons: one being the fact that it also contains the local prsent arrays and the dimesnion info
@@ -961,9 +974,10 @@ class Transformer:
                 # ANOTHER possibility with the first condition is that if we have intent within the declarations and also a length of 2 the
                 # combine_allocate_declaration method will just remove it since and return a new formatted variable( look at the return value
                 # of the method)
+                if any(walk(decl, F23.Function_Subprogram) for decl in declarations):
+                    continue
+
                 if len(declarations) == 2:
-                    if walk(declarations,F23.Function_Subprogram):
-                        continue 
                     declarations = self.isolator.processor.combine_allocate_declaration(declarations)
                     # print(declarations)
                 else: 
@@ -971,7 +985,7 @@ class Transformer:
                     # transformation.
                     declarations = self.isolator.processor.remove_intent_and_save(declarations)
                     # print(declarations[0])
-                    
+
                 # cls.dec_global finds not only the retreives the variables but also procedures, found case: hydrol_split_soil
                 # Which means they might have use statements as well.
                 for nodes in walk(declarations, (F23.Type_Declaration_Stmt,F23.Use_Stmt)):
@@ -1040,6 +1054,7 @@ class Transformer:
                             
                             if initialization is not None:
                                 _,value = initialization.children
+
                             if 'PARAMETER' in attr_spec:
                                 if intrinsic_type_spec.children[0] in ['INTEGER', 'REAL'] and not kind_selec: 
                                     # These are only for element thats has parameters and 
@@ -1083,7 +1098,6 @@ class Transformer:
                                     value_ = None
                                     val = None
                                     if value is not None:
-
                                         if 'DIMENSION' in allocation_spec:
                                             # Parse array constructor
                                             elements = []
@@ -1135,57 +1149,76 @@ class Transformer:
 
                             elif 'DIMENSION' in allocation_spec:
                                 # dimensions_spec_list = walk(walk(nodes,F23.Dimension_Attr_Spec),F23.Explicit_Shape_Spec_List)
-                                shape = []
-                                left,right = None,None
-                                # constant_right = None
-                                arg_shape = None
-                                for dim in walk(nodes,F23.Explicit_Shape_Spec):
-                                    left,right = None,None
-                                    lb,ub = dim.children[0],dim.children[1]
-                                    if lb and ub:
-                                        right = self.f2np.handle_expr(lb)
-                                        left = self.f2np.handle_expr(ub)
-                                        
-                                        if cls_mode:
-                                            right = attach_instance(right)
-                                            left = attach_instance(left)
 
-                                        arg_shape = ast.BinOp(
-                                                left = ast.BinOp(
-                                                    left = left,
-                                                    op = ast.Sub(),
-                                                    right = right),
-                                                op = ast.Add(),
-                                                right = ast.Constant(1))
+                                if walk(value,F23.Array_Constructor):
+                                    elements = []
+                                    array_list = walk(walk(value,F23.Array_Constructor),F23.Ac_Value_List)[0]
+                                    for val in array_list.children: 
+
+                                        elements.append(self.f2np.handle_expr(val))
                                         
-                                        shape.append(arg_shape)
-                                    
-                                    elif lb:
-                                        lb_ast = self.f2np.handle_expr(lb)
-                                        if cls_mode:
-                                            lb_ast = attach_instance(lb_ast)
-                                        shape.append(lb_ast)
-                                    elif ub:
-                                        ub_ast = self.f2np.handle_expr(ub)
-                                        if cls_mode:
-                                            ub_ast = attach_instance(ub_ast)
+                                    val = ast.Call(
+                                        func=ast.Attribute(value=ast.Name(id='np', ctx=ast.Load()), attr='array', ctx=ast.Load()),
+                                        args=[ast.List(elts=elements, ctx=ast.Load())],
+                                        keywords=[ast.keyword(arg='dtype',
+                                                value=ast.Attribute(value=ast.Name(id=idx, ctx=ast.Load()), attr=attr, ctx=ast.Load()))]
+                                    )
+                                    assign = ast.Assign(
+                                        targets=[target],
+                                        value=val
+                                    )
+                                else:
+                                    shape = []
+                                    left,right = None,None
+                                    # constant_right = None
+                                    arg_shape = None
+                                    for dim in walk(nodes,F23.Explicit_Shape_Spec):
+                                        left,right = None,None
+                                        lb,ub = dim.children[0],dim.children[1]
+                                        if lb and ub:
+                                            right = self.f2np.handle_expr(lb)
+                                            left = self.f2np.handle_expr(ub)
+                                            
+                                            if cls_mode:
+                                                right = attach_instance(right)
+                                                left = attach_instance(left)
+
+                                            arg_shape = ast.BinOp(
+                                                    left = ast.BinOp(
+                                                        left = left,
+                                                        op = ast.Sub(),
+                                                        right = right),
+                                                    op = ast.Add(),
+                                                    right = ast.Constant(1))
+                                            
+                                            shape.append(arg_shape)
                                         
-                                        shape.append(ub_ast)
-                                    else:
-                                        raise ValueError(f'Both of the, lower bound:{lb}, upper bound:{ub}')
-                                # Why are we doing np.empty is due to the fact that empty doesn't intialize the arrays but keeps in memory (randomly created values) which might be really small 1e-300
-                                # to really large but also these values are not random but values what was present in the memory: https://www.reddit.com/r/learnpython/comments/wgexrf/comment/iizmx5d/?utm_source=share&utm_medium=web3x&utm_name=web3xcss&utm_term=1&utm_content=share_button
-                                # Thus using np.zeros better use case than the np.empty since this also helpful in the case we have logical arrays which means it has either zeros or one we use zeros dimensions
-                                np_call = ast.Call(  
-                                    func=ast.Attribute(value=ast.Name(id='np', ctx=ast.Load()), attr='zeros', ctx=ast.Load()),
-                                    args=[ast.Tuple(elts=shape, ctx=ast.Load())],
-                                    keywords=[ ast.keyword(arg='dtype', value = ast.Attribute(value=ast.Name(id=idx, ctx=ast.Load()), attr=attr, ctx=ast.Load()))]
-                                )
-                                    
-                                assign = ast.Assign(
-                                    targets=[target],
-                                    value=np_call
-                                )
+                                        elif lb:
+                                            lb_ast = self.f2np.handle_expr(lb)
+                                            if cls_mode:
+                                                lb_ast = attach_instance(lb_ast)
+                                            shape.append(lb_ast)
+                                        elif ub:
+                                            ub_ast = self.f2np.handle_expr(ub)
+                                            if cls_mode:
+                                                ub_ast = attach_instance(ub_ast)
+                                            
+                                            shape.append(ub_ast)
+                                        else:
+                                            raise ValueError(f'Both of the, lower bound:{lb}, upper bound:{ub}')
+                                    # Why are we doing np.empty is due to the fact that empty doesn't intialize the arrays but keeps in memory (randomly created values) which might be really small 1e-300
+                                    # to really large but also these values are not random but values what was present in the memory: https://www.reddit.com/r/learnpython/comments/wgexrf/comment/iizmx5d/?utm_source=share&utm_medium=web3x&utm_name=web3xcss&utm_term=1&utm_content=share_button
+                                    # Thus using np.zeros better use case than the np.empty since this also helpful in the case we have logical arrays which means it has either zeros or one we use zeros dimensions
+                                    np_call = ast.Call(  
+                                        func=ast.Attribute(value=ast.Name(id='np', ctx=ast.Load()), attr='zeros', ctx=ast.Load()),
+                                        args=[ast.Tuple(elts=shape, ctx=ast.Load())],
+                                        keywords=[ ast.keyword(arg='dtype', value = ast.Attribute(value=ast.Name(id=idx, ctx=ast.Load()), attr=attr, ctx=ast.Load()))]
+                                    )
+                                        
+                                    assign = ast.Assign(
+                                        targets=[target],
+                                        value=np_call
+                                    )
                                 ast_nodes.append(assign)
 
                             else: # Cases where the variable is not a PARAMETER nor ALLOCATABLE present, either just a INTEGER, LOGICAL
@@ -1788,7 +1821,6 @@ class Transformer:
         str or None
             The variable name if it is identified as a scalar or logical, otherwise `None`.
         """
-
         var = walk(dec_statement, F23.Entity_Decl)[0].string
         init_spec = any(walk(dec_statement, F23.Initialization))
         alloc_spec = any(walk(dec_statement, F23.Dimension_Attr_Spec))
@@ -2713,13 +2745,23 @@ ffile = FortranFile(path, 'r')
                     # USE THE last read_ast_list which is the for loop to check if there are any that has been read or not 
                     # if not the for loop then it will only be ffile read 
                     for_loop = read_ast_list[-1]
-                    if isinstance(for_loop,ast.For):
-                        if isinstance(for_loop.iter, ast.List) and for_loop.iter.elts == [] and not self.scalar:
-                            # iterate through the class_def and apply the removal there
+                    if isinstance(for_loop, ast.For) and isinstance(for_loop.iter, ast.List) and for_loop.iter.elts == []:
+                        if not self.scalar:
+                            # Remove entire function
                             class_def.body = [
                                 item for item in class_def.body
                                 if not (isinstance(item, ast.FunctionDef) and item.name == "declaration_initialization")
                             ]
+                        else:
+                            # Remove only empty for-loop from within the function
+                            for item in class_def.body:
+                                if isinstance(item, ast.FunctionDef) and item.name == "declaration_initialization":
+                                    item.body = [
+                                        stmt for stmt in item.body
+                                        if not (isinstance(stmt, ast.For)
+                                                and isinstance(stmt.iter, ast.List)
+                                                and stmt.iter.elts == [])
+                                    ]
                     elif isinstance(for_loop,ast.Assign):
                         if isinstance(for_loop.targets[0],ast.Name) and for_loop.targets[0].id == 'ffile':
                             class_def.body = [
@@ -2738,11 +2780,11 @@ ffile = FortranFile(path, 'r')
     
     def update_global_python(self,subroutine_key:str,cls_mode:bool=True,for_loop:bool=True) -> ast.Module:
         """
-        Update the global Python AST code through different steps as seen within the code.
+        Update the global Python AST code through different 
 
         Parameters
         ----------
-        subroutine_name : str
+        subroutine_key : str
             Name of the isolated subroutine.
         cls_mode : bool
             If the global Python code AST should be in class mode or not.
@@ -2794,48 +2836,34 @@ ffile = FortranFile(path, 'r')
             if not class_def:
                 raise ValueError(f'Global Module needs to be in class format')
 
-            cls_info, _, _ = self.create_cls_info(tree,subroutine_key = subroutine_key,self_mode=True)
+            cls_info, _, _ = self.create_cls_info(out_module=tree,subroutine_key = subroutine_key,self_mode=True)
             if not cls_info:
                 raise ValueError(f'Cls_info is None')
+            
+            # Need to add a timer for this subroutine to measure the time elapsed during the execution and since get_timer sends an AST tree for the 
+            # the decorator method present in template.yaml(@timer)
+            timer_tree = self.get_timer(subroutine_key=subroutine_key)
+            if timer_tree is None:
+                raise ValueError("Timer tree(@timer) is None")
+            class_def.body.append(timer_tree)
 
             all_child_subroutines = []
-            for subroutines in self.isolator.child_subroutine_call[subroutine_key]:
-                _,_,child_subroutine_ast = self.f2np.recursive_ast(subroutines)
-                if len(child_subroutine_ast) > 1:
-                    raise ValueError(f'The length of module stack for children AST is greater than 1:{len(child_subroutine_ast)}')
-                all_child_subroutines.append(child_subroutine_ast[-1])
+            # First if there are call statement within the parent subroutine calling upon other child subroutines then 
+            # we attack them first before working with the parent subroutine, thus we need to dive deep onto the grandchildren or even somestimes great grandchildren cases -> which is 
+            # equivalent of doing a DFS(Deep first search)
+            all_child_subroutines = self.collect_descendants_dfs(subroutine_key)
 
-            # Now we attack the functions that might be present/called inisde the subroutines or functions, to do so we will use the dec_global is none is present then we don't have any
-            for elements in self.extractor.dec_global[subroutine_key].values():
-                if len(elements) == 2 and isinstance(elements[1],F23.Function_Subprogram):
-                    function_key = elements[0].string
-                    function_tree = elements[1]
-                    _,_,function_stack = self.f2np.recursive_ast(function_tree)
-                    if len(function_stack) == 1:
-                        function_def = function_stack[0] # The list should only have one elements which should correspond to the function ast definintion itself.
-                    else:
-                        raise ValueError(f'The length of function stack is greater than 1:{len(function_stack)} for {function_key}')
-                    
-                    all_child_subroutines.append(function_def)
-            
-            subroutine_tree = self.extractor.subroutines[subroutine_key]
-
-            _,_,parent_subroutine_ast = self.f2np.recursive_ast(subroutine_tree)
-            if len(parent_subroutine_ast) > 1:
-                raise ValueError(f'The length of module stack for Parent AST is greater than 1:{len(child_subroutine_ast)}')
-            else:
-                parent_subroutine_ast = parent_subroutine_ast[-1]
-
-            class_def.body.extend(all_child_subroutines + [parent_subroutine_ast])
+            # This is to add the timer decorator in the case we need to measure the execution time of the function but only upon the parent function / top level child functions which are always
+            # present at the end of the list
+            all_child_subroutines[-1].decorator_list = [ast.Name(id=next(ast_walk(timer_tree,ast.FunctionDef)).name,ctx=ast.Load())] if timer_tree else []
+            class_def.body.extend(all_child_subroutines)
             
             # UPDATE THE CLSinfo
-            update_methods(cls_info,all_child_subroutines + [parent_subroutine_ast])
-            subroutine_to_stack_index = {func.name: idx for idx, func in enumerate(all_child_subroutines)}
+            update_methods(cls_info,all_child_subroutines)
+            subroutine_to_stack_index = {func.name: idx for idx, func in enumerate(all_child_subroutines)}  
+            main_file_attributes = [names.string for names in walk(walk(self.extractor.var_dummy[subroutine_key], F23.Entity_Decl), F23.Name)]        
+            self.process_procedures(subroutine_key = subroutine_key,subroutine_to_stack_index = subroutine_to_stack_index, module_stacks=all_child_subroutines, cls_info=cls_info,main_file_attributes=main_file_attributes)
 
-            for sub_key in self.extractor.call_within_sub[subroutine_key]:
-                # We recursively correct the children subroutines in the case if the a child becomes a parent-child subroutine by calling another subroutine or function inside
-                self.process_subroutine(subroutine_key=sub_key,subroutine_to_stack_index = subroutine_to_stack_index,module_stacks=all_child_subroutines,cls_info=cls_info)
-            
             # there exists somes instances in which the functions present no use of global attributes, thus doesn't have the self applied to them due to the logic upon which 
             # we add the self is based on their use inside the function thus in some case they don't have any but still needs to be added the self argument
             for func in all_child_subroutines:
@@ -2843,14 +2871,39 @@ ffile = FortranFile(path, 'r')
                 if 'self' not in arg_names:
                     func.args.args.insert(0, ast.arg(arg='self'))
 
-            #Now we correct the parent
-            self.correct_function(function_def=parent_subroutine_ast,cls_info=cls_info,timer_tree=None,subroutine_key=subroutine_key)
-            identify_replace_all(parent_subroutine_ast.body,cls_info)
-
             return ast.fix_missing_locations(tree) 
         except Exception as e:
-            self.logger.log_error(f"Error in update_global_python method",e)
+            self.logger.exception(f"Error in update_global_python method",e)
             return None 
+    
+    def collect_descendants_dfs(self, subroutine_key:str):
+        """
+        Returns list of AST nodes in processing order: leaves first, parent last using the DFS algorithm. 
+        """
+        visited = set()
+        order = []
+
+        def dfs(key, stack):
+            if key in visited:
+                return
+            if key in stack:
+                raise ValueError(f'Cycle detected in subroutine call graph: {" -> ".join(stack + [key])}')
+            stack.append(key)
+            # iterate called children if any
+            called = self.extractor.call_within_sub.get(key) or {}
+            for child_key in list(called.keys()): # We recursively call the call statement of internal call statement 
+                dfs(child_key, stack)
+            # Now process this node (get AST)
+            subroutines = self.isolator.working_subroutines[key]
+            _, _, ast_list = self.f2np.recursive_ast(subroutines)
+            if len(ast_list) > 1:
+                raise ValueError(f'The length of module stack for {key} AST is greater than 1:{len(ast_list)}')
+            order.append(ast_list[-1])
+            visited.add(key)
+            stack.pop()
+
+        dfs(subroutine_key, [])
+        return order
             
     ############################################################################################ Main python ############################################################################################
 
@@ -2994,10 +3047,14 @@ ffile = FortranFile(path, 'r')
 
             # add the return element, since we know that the scalars are immutable and arrays are mutables this means that the 
             # return element will only contain the return of the immutable elements.
-            if seen_names and var_list:
-                # Even if we have scalar variables, which means these are already attributes of the class 
+            if 'self' in seen_names  and var_list:
+                # There's a self context, scalars might already be stored in self
+                # So we don’t need to add a return, we just modify instance attributes
                 return read_ast
-            elif not seen_names and var_list:
+            elif seen_names and var_list or (not seen_names and var_list):
+                # Either: seen_names doesn’t contain 'self', or we’re not in a class context
+                # but we have scalars to return
+                # => add a return statement that returns only the scalar vars
                 return_node = ast.Return()
                 ret_stmts = []
                 for ret_stmt in self.scalar:
@@ -3015,8 +3072,8 @@ ffile = FortranFile(path, 'r')
             
 
             return read_ast
-        except Exception:
-            self.logger.log_error(f'Exception in prepare_read_code_for_main_template')
+        except Exception as e:
+            self.logger.exception(f'Exception in prepare_read_code_for_main_template', e)
             raise
 
     def update_main_python(self,out_module:ast.Module,subroutine_key:str):
@@ -3106,14 +3163,6 @@ ffile = FortranFile(path, 'r')
             if function_def_call_stmt is None:
                 raise ValueError(f'Function defintions call statement is None')          
             call_stmts.append(function_def_call_stmt)
-
-            # Need to add a timer for this subroutine to measure the time elapsed during the execution and since get_timer sends an AST tree for the 
-            # the decorator method present in template.yaml(@timer)
-            # timer_tree = self.get_timer(subroutine_key=subroutine_key)
-            # if timer_tree is None:
-            #     raise ValueError("Timer tree(@timer) is None")
-            
-            # function_stmts.append(timer_tree)
             
             # Try to first find if the subroutines still has the benchmark
             if os.path.exists(os.path.join(self.benchmark_dir,subroutine_key,'output.bin')):
@@ -3144,75 +3193,69 @@ ffile = FortranFile(path, 'r')
             # print(ast.unparse(ast.fix_missing_locations(out_main_template)))
             return ast.fix_missing_locations(out_main_template)
         
-        except Exception:
-            self.logger.log_error(f'Exception error in update_main_python')
+        except Exception as e:
+            self.logger.exception(f'Exception error in update_main_python', e)
             return None
     
-    def process_subroutine(self,subroutine_key, subroutine_to_stack_index,module_stacks,cls_info):
+    def process_procedures(self,subroutine_key, subroutine_to_stack_index,module_stacks,cls_info,main_file_attributes):
         # First, process all sub-subroutines if any
         for child_key in self.extractor.call_within_sub.get(subroutine_key, []):
-            self.process_subroutine(child_key, subroutine_to_stack_index,module_stacks,cls_info)  # recurse for nested calls
+            self.process_procedures(child_key, subroutine_to_stack_index,module_stacks,cls_info,main_file_attributes)  # recurse for nested calls
 
         # Then process the current subroutine
         module_stack_index = subroutine_to_stack_index[subroutine_key]
-        self.correct_function(module_stacks[module_stack_index], cls_info, None, subroutine_key)
+        self.correct_function(module_stacks[module_stack_index], cls_info, subroutine_key,main_file_attributes=main_file_attributes)
         identify_replace_all(module_stacks[module_stack_index].body,cls_info)
         
-    def compile_and_run(self, base_dir,modules_dir):
-        target_module_dir_path = os.path.join(base_dir, modules_dir)
+    def run_python_scripts(self, base_dir:str,target_dir:str, mode:Literal['CPU','GPU'] = 'CPU'):
 
-        if not os.path.isdir(target_module_dir_path):
-            self.logger.log_error(f"Target module directory '{target_module_dir_path}' not found.")
+        if not os.path.isdir(target_dir):
+            self.logger.log_error(f"Target module directory '{target_dir}' not found.")
 
-        for subdir in os.listdir(target_module_dir_path):
-            subdir_path = os.path.join(target_module_dir_path, subdir)
+        subdir_path = os.path.join(base_dir,target_dir)
+        subdir = os.path.basename(subdir_path)
+        if not os.path.isdir(subdir_path):
+            self.logger.warning(f"Skipping non-directory entry: {subdir_path}")
+            return
+        
+        self.logger.info(f"Processing module: {subdir_path}")
+        # Python file checks
+        main_file = os.path.join(subdir_path, 'main.py')
+        global_module_file = os.path.join(subdir_path, 'module_global.py')
 
-            if not os.path.isdir(subdir_path):
-                self.logger.warning(f"Skipping non-directory entry: {subdir}")
-                continue
+        missing_files = []
+        if not os.path.exists(main_file):
+            missing_files.append('main.py')
+        if not os.path.exists(global_module_file):
+            missing_files.append('module_global.py')
+        
+        if missing_files:
+            self.logger.warning(f"Missing files in '{subdir}': {', '.join(missing_files)}")
+            self.logger.info(f"Skipping '{subdir}' due to missing Python files.\n")
+            return 
+        else:
+            self.logger.info(f"Required Python files found in '{subdir}'.")
+        
+        # Binary file checks
+        benchmark_subdir = os.path.join(self.benchmark_dir, subdir)
+        dummy_bin = os.path.join(benchmark_subdir, "dummy.bin")
+        global_bin = os.path.join(benchmark_subdir, "global.bin")
+        output_bin = os.path.join(benchmark_subdir, "output.bin")
+        bin_missing = []
+        for bin_file in [dummy_bin, global_bin, output_bin]:
+            if not os.path.exists(bin_file):
+                bin_missing.append(os.path.basename(bin_file))
 
-            self.logger.info(f"Processing module: {subdir}")
-
-            # Python file checks
-            main_file = os.path.join(subdir_path, 'main.py')
-            global_module_file = os.path.join(subdir_path, 'module_global.py')
-
-            missing_files = []
-            if not os.path.exists(main_file):
-                missing_files.append('main.py')
-            if not os.path.exists(global_module_file):
-                missing_files.append('module_global.py')
-
-            if missing_files:
-                self.logger.warning(f"Missing files in '{subdir}': {', '.join(missing_files)}")
-                self.logger.info(f"Skipping '{subdir}' due to missing Python files.\n")
-                continue
-            else:
-                self.logger.info(f"Required Python files found in '{subdir}'.")
-
-            # Binary file checks
-            benchmark_subdir = os.path.join(self.benchmark_dir, subdir)
-            dummy_bin = os.path.join(benchmark_subdir, "dummy.bin")
-            global_bin = os.path.join(benchmark_subdir, "global.bin")
-            output_bin = os.path.join(benchmark_subdir, "output.bin")
-
-            bin_missing = []
-            for bin_file in [dummy_bin, global_bin, output_bin]:
-                if not os.path.exists(bin_file):
-                    bin_missing.append(os.path.basename(bin_file))
-
-            if bin_missing:
-                self.logger.warning(f"Missing binary files for '{subdir}': {', '.join(bin_missing)}")
-                self.logger.info(f"Skipping '{subdir}' due to missing binaries.\n")
-                continue
-
-            self.logger.info(f"All binary files found for '{subdir}'. Running unit tests...")
-
-            try:
-                result = subprocess.run(['python3', main_file], check=True, capture_output=True, text=True)
-                self.logger.info(f"Execution output for '{subdir}':\n{result.stdout}")
-            except subprocess.CalledProcessError as e:
-                self.logger.log_error(f"Error running main.py for '{subdir}': ", e.stderr)
-                continue
-
+        if bin_missing:
+            self.logger.warning(f"Missing binary files for '{subdir}': {', '.join(bin_missing)}")
+            self.logger.info(f"Skipping '{subdir}' due to missing binaries.\n")
+            return 
+        
+        self.logger.info(f"All binary files found for '{subdir}'. Running unit tests...")
+        try:
+            result = subprocess.run(['python3', main_file], check=True, capture_output=True, text=True)
+            self.logger.info(f"Execution output for '{subdir}':\n{result.stdout}")
+        except subprocess.CalledProcessError as e:
+            self.logger.log_error(f"Error running main.py for '{subdir}': ", e.stderr)
+            return 
         

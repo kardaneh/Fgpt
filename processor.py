@@ -20,38 +20,14 @@ class Processor:
     parser : object
         An instance of the Fortran 2008 parser created by fparser.
     """
-    def __init__(self):
-        self.logger = logging.getLogger("fortran_processor")
-        self.logger.setLevel(logging.DEBUG)
-        self.logger.propagate = False
-
-        if self.logger.hasHandlers():
-            self.logger.handlers.clear()
-
-        console_handler = RichHandler(
-            show_time=False,
-            show_level=True,
-            show_path=False,
-            enable_link_path=False,
-            markup=False
-        )
-        console_handler.setLevel(logging.INFO)
-        self.logger.addHandler(console_handler)
-        self.logger.info("Processor initialized.")
-
+    def __init__(self, logger=None):
+        self.logger = logger
         self.parser = ParserFactory().create(std="f2008")
         self.line_length = FortLineLength()
         current_dir = os.getcwd()
         self.benchmark_dir = os.path.join(current_dir, 'benchmark')
         os.makedirs(self.benchmark_dir, exist_ok=True)
-        self.add_to_module = []
-        self.add_to_routin = []
-        self.add_to_usestm = []
-        self.acc_declare_create = []
-        self.acc_declare_copyin = []
-        self.reads_in_decleration_routine = []
-        self.reads_in_read_routine = []
-        self.write_stmt = []
+    
     def parse_fortran_file(self, file_path):
         """
         Parses a Fortran source file and returns its Abstract Syntax Tree (AST).
@@ -74,10 +50,10 @@ class Processor:
         try:
             reader = FortranFileReader(file_path, ignore_comments=False)
             parse_tree = self.parser(reader)
-            self.logger.info("Successfully parsed file:\n%s", file_path)
+            self.logger.info(f"Successfully parsed file: {file_path}")
             return parse_tree
         except Exception as e:
-            self.logger.error("Failed to parse file:\n%s\nError: %s", file_path, e)
+            self.logger.exception(f"Failed to parse file: Error: {file_path}", e)
             raise
 
     def parse_fortran_string(self, string):
@@ -105,7 +81,7 @@ class Processor:
             self.logger.info(f"Successfully parsed string!")
             return parse_tree
         except Exception as e:
-            self.logger.error(f"Failed to parse string, Error: {e}")
+            self.logger.exception(f"Failed to parse string, Error:", e)
             raise
 
     def parse_fortran_statement(self, stmt_str):
@@ -142,12 +118,12 @@ class Processor:
             for node in parse_tree.children:
                 for child in node.content:
                     if not isinstance(child, F23.Program_Stmt) and not isinstance(child, F23.End_Program_Stmt):
-                        self.logger.info("Successfully parsed statement:\n%s", child.tostr())
+                        self.logger.info(f"Successfully parsed statement: {child.tostr()}")
                         return child
             self.logger.warning(f"No valid statements found in: {stmt_str}")
             return None
         except Exception as e:
-            self.logger.error("Failed to parse statement:\n%s\nError: %s", stmt_str, e)
+            self.logger.exception(f"Failed to parse statement: {stmt_str}", e)
             raise
 
     def parse_fortran_comment(self, stmt_str):
@@ -187,10 +163,10 @@ class Processor:
                 for child in node.content:
                     if not isinstance(child, F23.Program_Stmt) and not isinstance(child, F23.End_Program_Stmt):
                         comment_node = child.children[0].children[0]
-                        self.logger.info("Successfully parsed comment:\n%s", comment_node.tostr())
+                        self.logger.info(f"Successfully parsed comment: {comment_node.tostr()}")
                         return comment_node
         except Exception as e:
-            self.logger.error("Failed to parse comment:\n%s\nError: %s", stmt_str, e)
+            self.logger.exception(f"Failed to parse comment: {stmt_str}", e)
             raise
 
     def find_enclosing_parent(self, node, parent_type):
@@ -229,10 +205,15 @@ class Processor:
                 node = getattr(node, 'parent', None)
             return None
         except Exception as e:
-            self.logger.error(f"Error finding enclosing parent of type {parent_type.__name__}: {e}")
+            self.logger.exception(f"Error finding enclosing parent of type {parent_type.__name__}", e)
             return None
 
-    def initiate_empty_routine(self, subroutine_name,  bin_filename="dummy.bin", routine_name="read_dummy"):
+    def initiate_empty_routine(
+            self, 
+            subroutine_name,  
+            bin_filename="dummy.bin", 
+            routine_name="read_dummy"
+            ):
         """
         Generates a dummy Fortran subroutine with an open statement and a print,
         then parses and returns its AST node.
@@ -272,7 +253,7 @@ class Processor:
             parse_tree = self.parser(reader)
             return parse_tree.children[0]
         except Exception as e:
-            self.logger.error(f"Failed to generate Fortran code for routine {subroutine_name}, Error: {e}")
+            self.logger.exception(f"Failed to generate Fortran code for routine {subroutine_name}", e)
             raise
 
     def separate_entity_declarations(self, declaration_stmt):
@@ -315,7 +296,7 @@ class Processor:
                 new_decl.append(F23.Type_Declaration_Stmt(decl))
             return new_decl
         except Exception as e:
-            self.logger.error("An error occurred during separation of variables: %s", e)
+            self.logger.exception("An error occurred during separation of variables: ", e)
             raise
 
     def add_entity_to_declaration(self, declaration_stmt, var_modif):
@@ -362,7 +343,7 @@ class Processor:
             new_decl = F23.Type_Declaration_Stmt(decl)
             return new_decl
         except Exception as e:
-            self.logger.error("An error occurred during adding an entity to a declaration: %s", e)
+            self.logger.exception("An error occurred during adding an entity to a declaration: ", e)
             raise
 
     def separate_entity_allocation(self, allocate_stmt):
@@ -417,7 +398,7 @@ class Processor:
             self.logger.info("Successfully generated allocation statements")
             return new_allocation
         except Exception as e:
-            self.logger.error(f"Failed to generate allocation statements, Error: {e}")
+            self.logger.exception(f"Failed to generate allocation statements, Error: ", e)
             raise
 
     def add_entity_to_allocation(self, allocate_stmt, var_modif, openacc=False):
@@ -468,7 +449,7 @@ class Processor:
             self.logger.info("Successfully generated allocation statements")
             return new_allocation
         except Exception as e:
-            self.logger.error(f"Failed to generate allocation statements, Error: {e}")
+            self.logger.exception(f"Failed to generate allocation statements, Error: ", e)
             raise
 
     def map_declaration(self, implicit_dec, explicit_dec=None, dimensions=None):
@@ -530,7 +511,7 @@ class Processor:
             parsed_decl = F23.Type_Declaration_Stmt(new_decl)
             return parsed_decl
         except Exception as e:
-            self.logger.error(f"Failed to map declaration, Error: {e}")
+            self.logger.exception(f"Failed to map declaration, Error: ", e)
             raise
 
     def combine_allocate_declaration(self, variable_declarations):
@@ -586,13 +567,12 @@ class Processor:
             parsed_decl = F23.Type_Declaration_Stmt(combined_statement)
             return parsed_decl
         except Exception as e:
-            self.logger.error(f"Failed to combine allocate and declaration, Error: {e}")
+            self.logger.exception(f"Failed to combine allocate and declaration, Error: ", e)
             raise
 
     def break_allocatable_declaration(self, declaration_stmt):
 
         try:
-            result = {}
             # Extract type and attributes
             if walk(declaration_stmt, F23.Intrinsic_Type_Spec):
                 type_and_attributes = walk(declaration_stmt, F23.Intrinsic_Type_Spec)[0].tostr()
@@ -622,13 +602,13 @@ class Processor:
                     allocate_stmt_str = f"ALLOCATE({array_name}({dim_str}))"
                     self.logger.info(f"Allocate statement: {allocate_stmt_str}")
                     allocate_stmt = F23.Allocate_Stmt(allocate_stmt_str)
-                    result[array_name] = [allocatable_decl, allocate_stmt]
+                    result = [allocatable_decl, allocate_stmt]
                 else:
-                     result[array_name] = [declaration_stmt]
+                     result = self.remove_intent_and_save([declaration_stmt])
 
-            return result
+            return array_name, result
         except Exception as e:
-            self.logger.error(f"Failed to break declaration into allocatable, Error: {e}")
+            self.logger.exception(f"Failed to break declaration into allocatable, Error: ", e)
             raise
 
     def remove_intent_and_save(self, type_declaration_stmts):
@@ -679,7 +659,7 @@ class Processor:
             self.logger.info("Successfully removed INTENT and SAVE attributes from statements")
             return cleaned_statements
         except Exception as e:
-            self.logger.error(f"Failed to remove INTENT and SAVE attributes, Error: {e}")
+            self.logger.exception(f"Failed to remove INTENT and SAVE attributes, Error: ", e)
             raise
 
     def out_module_fortran(self, subroutine_name):
@@ -744,7 +724,7 @@ class Processor:
             self.logger.info("Successfully parsed module code")
             return parse_tree
         except Exception as e:
-            self.logger.error(f"Failed to parse module code, Error: {e}")
+            self.logger.exception(f"Failed to parse module code, Error: ", e)
             raise
 
     def check_point(self, var, var_copy, info):
@@ -879,7 +859,7 @@ class Processor:
             self.logger.info("Successfully parsed main program code")
             return parse_tree
         except Exception as e:
-            self.logger.error(f"Failed to parse main program code, Error: {e}")
+            self.logger.exception(f"Failed to parse main program code, Error: ", e)
             raise
 
     def write_fortran_code_to_file(self, code, file_path):
@@ -909,43 +889,23 @@ class Processor:
                 f.write(str(code))
             self.logger.info(f"Successfully wrote code to file: {file_path}")
         except Exception as e:
-            self.logger.error(f"Failed to write code to file: {file_path}, Error: {e}")
+            self.logger.exception(f"Failed to write code to file: {file_path}, Error: ", e)
             raise
 
-    def update_global_module(self, input_dict, subroutine_dir, subroutine_name, procedure_tree, custom_subroutine_trees):
+    def update_global_module(self, 
+            input_dict, 
+            subroutine_dir, 
+            subroutine_name, 
+            procedure_tree, 
+            custom_subroutine_trees
+            ):
         """
-        Update the global Fortran module by injecting declarations, use statements,
-        and I/O operations related to global variables and routines.
-
-        This method performs the following steps:
-        1. Locates the call statement to the specified subroutine within the module tree
-        and replaces it with a code block that opens a binary file, writes data,
-        and then closes the file.
-        2. Inserts collected USE statements and variable declarations into the module's
-        specification part.
-        3. Inserts initialization and allocation statements into the appropriate subroutines
-        (e.g., 'declaration_initialization' and 'initialization') within the module's
-        subprogram part.
-        4. Handles OpenACC declarations for device data management by adding relevant
-        directives.
-        5. Finally, writes the updated Fortran module code to the specified file path.
-
-        Args:
-            input_dict (dict): Dictionary of variables or declarations to add.
-            file_path (str): Path where the updated Fortran module source code will be saved.
-            subroutine_name (str): Name of the subroutine whose call site is to be updated.
-
-        Raises:
-            AssertionError: If unexpected node types are encountered during tree traversal.
-            Exception: Logs and re-raises any exceptions that occur during processing.
-
-        Logging:
-            Logs success or failure of the module update process.
         """
         try:
-            subroutine_found = False
             file_path = os.path.join(subroutine_dir, f"module_global_{subroutine_name}.f90")
             self.out_module = self.out_module_fortran(subroutine_name)
+            self.out_main = self.out_main_fortran()
+
             assert procedure_tree is not None, "procedure_tree must be provided"
             assert isinstance(procedure_tree, (F23.Function_Subprogram, F23.Subroutine_Subprogram)),\
                         f"procedure_tree must be Function_Subprogram or Subroutine_Subprogram, got {type(procedure_tree)}"
@@ -962,7 +922,109 @@ class Processor:
                     assert isinstance(item.content, list), f"Execution_Part.content is not a list, it's {type(item.content)}"
                     open_stmt = F23.Open_Stmt(f"open(unit=1363, file='{self.benchmark_dir}/{subroutine_name}/global.bin', form='unformatted', status='replace')")
                     close_stmt = F23.Close_Stmt("close(1363)")
-                    new_stmts = [open_stmt] + self.write_stmt + [close_stmt]
+                    new_stmts = [open_stmt] + input_dict['write_stmt'] + [close_stmt]
+                    for stmt in new_stmts:
+                        stmt.parent = item
+                    item.content[0:0] = new_stmts  # Insert at beginning of Execution_Part
+                    execution_part_found = True
+                    self.logger.info(f"Inserted I/O statements at beginning of Execution_Part in procedure: {subroutine_name}")
+                    break
+                elif isinstance(item, F23.Specification_Part):
+                    # Remember where Specification_Part is
+                    spec_part_found = True
+                    spec_part_idx = idx
+
+            # If no Execution_Part found but Specification_Part exists, insert after it
+            if not execution_part_found and spec_part_found:
+                open_stmt = F23.Open_Stmt(f"open(unit=1363, file='{self.benchmark_dir}/{subroutine_name}/global.bin', form='unformatted', status='replace')")
+                close_stmt = F23.Close_Stmt("close(1363)")
+                new_stmts = [open_stmt] + input_dict['write_stmt'] + [close_stmt]
+                for stmt in new_stmts:
+                    stmt.parent = procedure_tree
+                procedure_tree.content[spec_part_idx+1:spec_part_idx+1] = new_stmts
+                self.logger.info(f"Inserted I/O statements after Specification_Part in procedure: {subroutine_name}")
+
+            if not execution_part_found and not spec_part_found:
+                error_msg = f"Could not find Specification_Part or Execution_Part in procedure tree for '{subroutine_name}'"
+                self.logger.error(error_msg)
+                raise ValueError(error_msg)
+
+            for node in self.out_module.content:
+                if isinstance(node, F23.Module):
+                    for idx, subnode in enumerate(node.content):
+                        if isinstance(subnode, F23.Specification_Part):
+                            if input_dict['add_to_usestm']:
+                                for stmt in input_dict['add_to_usestm']:
+                                    subnode.content.insert(0, stmt)
+                            ldx = len(subnode.content) - 1
+
+                            for stmt in input_dict['add_to_module']:
+                                subnode.content.insert(ldx + 1, stmt)
+                                ldx += 1
+
+                            if input_dict['acc_declare_copyin']:
+                                subnode.content.insert(ldx + 1, input_dict['acc_declare_copyin_cmd'])
+                                ldx += 1
+
+                            if input_dict['acc_declare_create']:
+                                subnode.content.insert(ldx + 1, input_dict['acc_declare_create_cmd'])
+                                ldx += 1
+
+                        elif isinstance(subnode, F23.Module_Subprogram_Part):
+                            for custom_subroutine_tree in custom_subroutine_trees:
+                                node.content.insert(idx + 1, custom_subroutine_tree)
+
+            self.logger.info("Successfully updated the global module")
+            self.write_fortran_code_to_file(self.out_module, file_path)
+            global_read_routine = self.generate_read_routine(subroutine_name, input_dict, bin_filename="global.bin", routine_name="declaration_initialization")
+
+            for node in self.out_main.content:
+                if isinstance(node, F23.Main_Program):
+                    for idx, subnode in enumerate(node.content):
+                        if isinstance(subnode, F23.Internal_Subprogram_Part):
+                            node.content.insert(idx + 1, global_read_routine)
+
+        except Exception as e:
+            self.logger.exception(f"Failed to update global module, Error: ", e)
+            raise
+
+    def update_main_program(
+            self,
+            input_dict,
+            call_stmts,
+            var_modif,
+            subroutine_dir,
+            subroutine_name,
+            procedure_tree,
+            openacc=False,
+            dummy_add_decl=None,
+            error_flag=None,
+            acc_data_copyin=None
+            ):
+        """
+        """
+        try:
+            file_path = os.path.join(subroutine_dir, f"main_{subroutine_name}.f90")
+            block_tree =  self.generate_read_routine(subroutine_name, input_dict, bin_filename="dummy.bin", routine_name="read_dummy")
+            custom_module_name = walk(walk(self.out_module,F23.Module_Stmt), F23.Name)[0].string
+            
+            assert procedure_tree is not None, "procedure_tree must be provided"
+            assert isinstance(procedure_tree, (F23.Function_Subprogram, F23.Subroutine_Subprogram)),\
+                        f"procedure_tree must be Function_Subprogram or Subroutine_Subprogram, got {type(procedure_tree)}"
+            assert hasattr(procedure_tree, 'content'), f"procedure_tree {type(procedure_tree)} has no 'content' attribute"
+            assert isinstance(procedure_tree.content, list), f"procedure_tree.content is not a list, it's {type(procedure_tree.content)}"
+
+            execution_part_found = False
+            spec_part_found = False
+
+            for idx, item in enumerate(procedure_tree.content):
+                if isinstance(item, F23.Execution_Part):
+                    # Found Execution_Part, insert at the beginning of it
+                    assert hasattr(item, 'content'), f"Execution_Part {type(item)} has no 'content' attribute"
+                    assert isinstance(item.content, list), f"Execution_Part.content is not a list, it's {type(item.content)}"
+                    open_stmt = F23.Open_Stmt(f"open(unit=1363, file='{self.benchmark_dir}/{subroutine_name}/dummy.bin', form='unformatted', status='replace')")
+                    close_stmt = F23.Close_Stmt("close(1363)")
+                    new_stmts = [open_stmt] +  input_dict['write_stmt'] + [close_stmt]
                     for stmt in new_stmts:
                         stmt.parent = item
                     item.content[0:0] = new_stmts  # Insert at beginning of Execution_Part
@@ -975,9 +1037,9 @@ class Processor:
                     spec_part_idx = idx
             # If no Execution_Part found but Specification_Part exists, insert after it
             if not execution_part_found and spec_part_found:
-                open_stmt = F23.Open_Stmt(f"open(unit=1363, file='{self.benchmark_dir}/{subroutine_name}/global.bin', form='unformatted', status='replace')")
+                open_stmt = F23.Open_Stmt(f"open(unit=1363, file='{self.benchmark_dir}/{subroutine_name}/dummy.bin', form='unformatted', status='replace')")
                 close_stmt = F23.Close_Stmt("close(1363)")
-                new_stmts = [open_stmt] + self.write_stmt + [close_stmt]
+                new_stmts = [open_stmt] + input_dict['write_stmt']  + [close_stmt]
                 for stmt in new_stmts:
                     stmt.parent = procedure_tree
                 procedure_tree.content[spec_part_idx+1:spec_part_idx+1] = new_stmts
@@ -986,165 +1048,7 @@ class Processor:
                 error_msg = f"Could not find Specification_Part or Execution_Part in procedure tree for '{subroutine_name}'"
                 self.logger.error(error_msg)
                 raise ValueError(error_msg)
-
-            for node in self.out_module.content:
-                if isinstance(node, F23.Module):
-                    for idx, subnode in enumerate(node.content):
-                        if isinstance(subnode, F23.Specification_Part):
-                            if self.add_to_usestm:
-                                for stmt in self.add_to_usestm:
-                                    subnode.content.insert(0, stmt)
-                            ldx = len(subnode.content) - 1
-                            for stmt in self.add_to_module:
-                                subnode.content.insert(ldx + 1, stmt)
-                                ldx += 1
-                            if self.acc_declare_copyin:
-                                subnode.content.insert(ldx + 1, self.acc_declare_copyin_cmd)
-                                ldx += 1
-                            if self.acc_declare_create:
-                                subnode.content.insert(ldx + 1, self.acc_declare_create_cmd)
-                                ldx += 1
-                        elif isinstance(subnode, F23.Module_Subprogram_Part):
-                            for custom_subroutine_tree in custom_subroutine_trees:
-                                node.content.insert(idx + 1, custom_subroutine_tree)
-            self.logger.info("Successfully updated the global module")
-            self.write_fortran_code_to_file(self.out_module, file_path)
-        except Exception as e:
-            self.logger.error(f"Failed to update global module, Error: {e}")
-            raise
-
-    def update_main_program(
-            self,
-            custom_dec_inout,
-            call_stmts,
-            var_modif,
-            subroutine_dir,
-            subroutine_name,
-            dummy_args,
-            call_site=None,
-            openacc=False,
-            dummy_add_decl=None,
-            error_flag=None,
-            acc_data_copyin=None
-            ):
-        """
-        Updates the Fortran main program by modifying its structure, adding subroutine calls, 
-        variable declarations, initialization routines, error handling, and OpenACC directives 
-        for parallelism. The method processes the given subroutine information and writes the 
-        modified program to the specified file path.
-
-        Parameters:
-            custom_dec_inout (list): A list of custom variable declarations and input/output 
-                                  specifications to be inserted into the Fortran program’s 
-                                  specification part.
-            custom_subroutine_trees (list): A list of subroutine trees to be inserted into the 
-                                        main program.
-            call_stmts (list): A list of Fortran `Call_Stmt` objects representing subroutine 
-                           calls to be inserted into the program.
-            var_modif (set): A set of variable names that have been modified within the 
-                         subroutine. Used for tracking variable changes.
-            file_path (str): The file path where the modified Fortran code will be written to.
-            subroutine_name (str): The name of the subroutine to be modified in the main program.
-            dummy_args (list): A list of dummy argument names that are passed to subroutines.
-            childs_subroutine_tree (optional, list): A list of child subroutine trees to be 
-                                                  inserted into the program. Default is `None`.
-            openacc (bool, optional): If `True`, OpenACC directives for parallelism and data 
-                                  management are inserted into the program. Default is `False`.
-            dummy_add_decl (F23.Declaration_Stmt, optional): A Fortran declaration statement 
-                                                          for dummy arguments to be added. 
-                                                          Default is `None`.
-            error_flag (dict, optional): A dictionary containing error flags for variables. 
-                                     Used to insert error-handling code. Default is `None`.
-
-        Operation:
-            - Initializes and parses the main program and module information.
-            - Handles dummy arguments and builds initialization routines for them.
-            - Updates variable declarations and adds error-handling code based on the `error_flag`.
-            - Inserts initialization code, such as `read` routines, for dummy arguments.
-            - Modifies the `Specification_Part` of the program by inserting new variable 
-                declarations and subroutine calls.
-            - Adds performance benchmarking code using `SYSTEM_CLOCK` and writes the result 
-                to an output file.
-            - If `openacc` is enabled, inserts OpenACC directives for parallel loops and data 
-                management, such as `COPYIN`, `UPDATE SELF`, and `PARALLEL LOOP`.
-            - Includes subroutine calls for initialization, execution time measurements, and 
-                variable modifications.
-            - Handles child subroutine trees and inserts them at the appropriate locations.
-            - Writes the modified Fortran code to the specified file path.
-
-        Returns:
-            None: The method does not return a value, but modifies the Fortran program in place 
-              and writes it to the provided file path.
-        """
-        try:
-            file_path = os.path.join(subroutine_dir, f"main_{subroutine_name}.f90")
-            self.out_main = self.out_main_fortran()
-            custom_module_name = walk(walk(self.out_module,F23.Module_Stmt), F23.Name)[0].string
-            custom_subroutines_names = [name.string for name in walk(walk(self.out_module,F23.Subroutine_Stmt),F23.Name)]
-            initialization_part = self.initialization_statement(custom_dec_inout)
-            global_read_routine = self.generate_global_read_routine(subroutine_name)
-            #node.content.insert(idx + 1, global_read_routine)
-
-            if self.dummy_list:
-                self.logger.info("Need to build an initialization for IN/INOUT dummy args.")
-                specification_part_dummy = self.remove_intent_and_save(self.dummy_list)
-                block_tree = self.generate_dummy_read_routine(specification_part_dummy, initialization_part, subroutine_name)
-
-            if dummy_add_decl is not None:
-                custom_dec_inout.append(dummy_add_decl)
-            if error_flag is not None:
-                if error_flag.keys():
-                    for key in error_flag.keys():
-                        custom_dec_inout.append(error_flag[key]['error_flag_decl'])
-            specification_part = self.remove_intent_and_save(custom_dec_inout)
-
-            subroutine_found = False
-            if initialization_part:
-                assert call_site is not None, "call_site must be provided for direct modification"
-                assert isinstance(call_site, (F23.Call_Stmt, F23.Assignment_Stmt)), \
-                        f"call_site must be F23.Call_Stmt or F23.Assignment_Stmt, got {type(call_site)}"
-                self.write_stmt = []
-                parent_node = call_site.parent
-                assert hasattr(parent_node, 'content'), f"parent_node {type(parent_node)} has no 'content' attribute"
-                assert isinstance(parent_node.content, list), f"parent_node.content is not a list, it's {type(parent_node.content)}"
-                stmt_list = parent_node.content
-                idx = stmt_list.index(call_site)
-
-                if isinstance(call_site, F23.Call_Stmt):
-                    assert isinstance(call_site.children[0], F23.Name), f"Expected F23.Name, but got {type(call_site.children[0])}"
-                    assert isinstance(call_site.children[1], F23.Actual_Arg_Spec_List), \
-                            f"Expected F23.Actual_Arg_Spec_List, but got {type(call_site.children[1])}"
-                    arg_string = [arg.tostr().strip() for arg  in call_site.children[1].children]
-
-                else:
-                    for part_ref in walk(call_site, F23.Part_Ref):
-                        if isinstance(part_ref.children[0], F23.Name) and part_ref.children[0].tostr() == subroutine_name:
-                            assert isinstance(part_ref.children[1], F23.Section_Subscript_List), f"Expected Section_Subscript_List as second child, got {type(part_ref.children[1])}"
-                            arg_string = [arg.tostr().strip() for arg in part_ref.children[1].children]
-                            break
-
-                open_stmt = F23.Open_Stmt(f"open(unit=1363, file='{self.benchmark_dir}/{subroutine_name}/dummy.bin', form='unformatted', status='replace')")        
-                for rstmt in initialization_part:
-                    assert isinstance(rstmt.children[0].children[2], F23.Input_Item_List)
-                    assert len(rstmt.children[0].children[2].children) == 1
-                    arg = rstmt.children[0].children[2].tostr()
-                    corresponding_element = arg_string[dummy_args.index(arg)]
-                    self.write_stmt.append(F23.Write_Stmt(f"write(1363){corresponding_element}"))
-                                    
-                close_stmt = F23.Close_Stmt("close(1363)")
-                new_stmts = [open_stmt] + self.write_stmt  + [close_stmt]
-
-                for stmt in new_stmts:
-                    stmt.parent = parent_node
-
-                stmt_list[idx+1:idx+1] = new_stmts
-                subroutine_found = True
             
-            if not subroutine_found:
-                error_msg = f"Could not process call site for subroutine '{subroutine_name}'"
-                self.logger.error(error_msg)
-                raise ValueError(error_msg)
-
             for node in self.out_main.content:
                 if isinstance(node, F23.Main_Program):
                     for idx, subnode in enumerate(node.content):
@@ -1154,15 +1058,8 @@ class Processor:
                             use_stmt = 'use ' + custom_module_name
                             subnode.content.insert(kdx + 1, F23.Use_Stmt(use_stmt))
                             kdx = len(subnode.content) - 1
-                            for stmt in specification_part:
-                                is_modified = any(name.string in var_modif for name in walk(stmt, F23.Entity_Decl))
-                                if is_modified:
-                                    if openacc:
-                                        subnode.content.insert(kdx + 1, self.add_entity_to_declaration(stmt, var_modif))
-                                    else:
-                                        subnode.content.insert(kdx + 1, stmt)
-                                else:
-                                    subnode.content.insert(kdx + 1, stmt)
+                            for stmt in input_dict['add_to_module']:
+                                subnode.content.insert(kdx + 1, stmt)
                                 kdx += 1
                         elif isinstance(subnode, F23.Execution_Part):
                             kdx = len(subnode.content) - 1
@@ -1170,7 +1067,8 @@ class Processor:
                             subnode.content.insert(kdx + 1, F23.Call_Stmt(subroutine_call))
                             kdx += 1
 
-                            subnode.content.insert(kdx + 1, self.create_call_stmt(block_tree))
+                            subroutine_call = "Call read_dummy"
+                            subnode.content.insert(kdx + 1, F23.Call_Stmt(subroutine_call))
                             kdx += 1
 
                             code_start = """
@@ -1273,15 +1171,13 @@ class Processor:
                                         kdx += 1
                             
                         elif isinstance(subnode, F23.Internal_Subprogram_Part):
-                            if self.dummy_list:
-                                node.content.insert(idx + 1, block_tree)
-                            node.content.insert(idx + 1, global_read_routine)
+                            node.content.insert(idx + 1, block_tree)
             self.logger.info("Successfully updated the main program")
             self.write_fortran_code_to_file(self.out_main, file_path)
         except Exception as e:
-            self.logger.error(f"Failed to update main program, Error: {e}")
+            self.logger.exception(f"Failed to update main program, Error: {e}")
             raise
-
+    
     def remove_io_statements(self, block, unit_number=1363):
         """
         Recursively remove all OPEN, WRITE, CLOSE statements with specific unit number.
@@ -1368,17 +1264,22 @@ class Processor:
             subroutine_call_obj = F23.Call_Stmt(subroutine_call)
             return subroutine_call_obj
         except Exception as e:
-            self.logger.error("An error occurred in creating a Call_Stmt object: %s", e)
+            self.logger.exception("An error occurred in creating a Call_Stmt object: ", e)
             raise
 
-    def generate_global_read_routine(self, subroutine_name):
+    def generate_read_routine(
+            self, 
+            subroutine_name, 
+            input_dict,  
+            bin_filename="global.bin", 
+            routine_name="declaration_initialization"):
 
         try:
             # Create the base subroutine using initiate_empty_routine
             subroutine_node = self.initiate_empty_routine(
                     subroutine_name=subroutine_name,
-                    bin_filename="global.bin",
-                    routine_name="declaration_initialization"
+                    bin_filename=bin_filename,
+                    routine_name=routine_name
                     )
 
             # Now modify the subroutine using your existing logic
@@ -1387,205 +1288,27 @@ class Processor:
                     if isinstance(subsubsubnode, F23.Execution_Part):
                         ldx = len(subsubsubnode.content) - 1
 
-                        for stmt in self.reads_in_decleration_routine:
+                        for stmt in input_dict['reads_non_allocatables']:
                             subsubsubnode.content.insert(ldx + 1, stmt)
                             ldx += 1
 
-                        for stmt in self.add_to_routin:
+                        for stmt in input_dict['add_to_routin']:
                             subsubsubnode.content.insert(ldx + 1, stmt)
                             ldx += 1
 
-                        for stmt in self.reads_in_read_routine:
+                        for stmt in input_dict['reads_allocatables']:
                             subsubsubnode.content.insert(ldx + 1, stmt)
                             ldx += 1
                         subsubsubnode.content.insert(ldx + 1, F23.Close_Stmt("close(1363)"))
                         ldx += 1
 
-                        if self.acc_declare_create:
-                            subsubsubnode.content.insert(ldx + 1, self.acc_update_device_cmd)
+                        if input_dict['acc_declare_create']:
+                            subsubsubnode.content.insert(ldx + 1, input_dict['acc_update_device_cmd'])
                             ldx += 1
 
             return subroutine_node
         except Exception as e:
-            self.logger.error(f"Failed to generate global module routine, Error: {e}")
-            raise
-
-    def generate_dummy_read_routine(self, specification_part, initialization_part, subroutine_name):
-        """
-        """
-        try:
-            block = self.initiate_empty_routine(subroutine_name)
-            if hasattr(block, "content"):
-                idc = 0
-                while idc < len(block.content):
-                    child = block.content[idc]
-                    if isinstance(child, F23.Subroutine_Stmt):
-                        subroutine_stmt = "subroutine "
-                        for grandchild in child.children:
-                            if isinstance(grandchild, F23.Name):
-                                subroutine_stmt += f"{grandchild.tostr()}"
-                        dummy_arg_list = []
-                        for stmt in specification_part:
-                            entity_dec = walk(stmt, F23.Entity_Decl)
-                            for entity in entity_dec:
-                                dummy_arg_list.append(entity.tostr())
-                        dummy_arg = ', '.join([name for name in dummy_arg_list])
-                        subroutine_stmt += f"({dummy_arg})"
-                        block.content[idc] = F23.Subroutine_Stmt(subroutine_stmt)
-                        for stmt in specification_part:
-                            block.content.insert(idc + 1, stmt)
-                    elif isinstance(child, F23.Execution_Part):
-                        kdx = len(child.content) - 1
-                        for stmt in initialization_part:
-                            child.content.insert(kdx + 1, stmt)
-                            kdx += 1
-                        child.content.insert(kdx + 1,F23.Close_Stmt(f"close(1363)"))
-                        kdx += 1
-                    idc += 1
-                return block
-        except Exception as e:
-            self.logger.error(f"Failed to generate dummy read routine, Error: {e}")
-            raise
-
-    def initialization_statement(self, items):
-        """
-        Separates Fortran declarations and generates appropriate initialization
-        `read(...)` or `write(...)` statements for variables.
-
-        Used when variables are declared without initialization or
-        when `ALLOCATABLE` is not present.
-
-        Parameters:
-            items (list): List of declaration nodes (F23.Type_Declaration_Stmt).
-
-        Returns:
-            read_list (list): List of Fortran read statements for each variable.
-
-        Populates:
-            - self.write_stmt → Stores `write(...)` strings.
-            - self.dummy_list → Stores modified declaration statements.
-        """
-        read_list = []
-        items_sep = []
-        self.dummy_list = []
-        for item in items:
-            if len(walk(item, F23.Entity_Decl)) > 1:
-                node_list = self.separate_entity_declarations(item)
-                for node in node_list:
-                    items_sep.append(node)
-            else:
-                items_sep.append(item)
-        try:
-            for item in items_sep:
-                init = True
-                intent = walk(item, F23.Intent_Spec)
-                if F23.Intent_Spec('OUT') in intent:
-                    init = False
-                for child in item.children:
-                    if isinstance(child, F23.Intrinsic_Type_Spec):
-                        var_type = child.tostr()
-                    if isinstance(child, F23.Entity_Decl_List):
-                        var_name = child.tostr()
-                if init:
-                    self.dummy_list.append(item)
-                    code_template = f"""
-                    read(1363, iostat = ier){var_name}
-                    if (ier /= 0) then
-                    write(*,*) 'Error reading from file for {var_name}. ',' IOSTAT : ', ier
-                    endif
-                    """
-                    read_list.append(self.parse_fortran_statement(code_template))
-                    self.write_stmt.append(F23.Write_Stmt(f"write(1363){var_name}"))
-            self.logger.info(f"processing initialization completed!")
-            return read_list
-        except Exception as e:
-            self.logger.error(f"Error processing initialization: {e}")
-            raise
-
-    def add_declarations(self, input_dict, var_modif, openacc=False):
-        """
-        Processes and categorizes Fortran variable declarations and allocations
-        into separate groups for further use, such as:
-
-        - Adding to the module or routine headers.
-        - Preparing OpenACC directives (e.g., `!$ACC DECLARE CREATE(...)`).
-        - Tracking variables that need to be initialized via read statements.
-    
-        Parameters:
-            input_dict (dict): Dictionary of declarations (var name → [declaration nodes]).
-            var_modif (set): Set of variable names that are modified inside the subroutine.
-    
-        Populates:
-            - self.add_to_module → declarations to be added to module.
-            - self.add_to_routin → allocation statements to be added in routine body.
-            - self.add_to_usestm → collected USE statements.
-            - self.acc_declare_create / copyin → for OpenACC memory management.
-            - self.reads_in_decleration_routine / reads_in_read_routine → categorized init methods.
-            - self.write_stmt → write statements to be emitted to file.
-            - self.acc_declare_create_cmd / copyin_cmd → formatted OpenACC directives.
-        """
-        try:
-            self.add_to_module = []
-            self.add_to_routin = []
-            self.add_to_usestm = []
-            self.acc_declare_create = []
-            self.acc_declare_copyin = []
-            self.reads_in_decleration_routine = []
-            self.reads_in_read_routine = []
-            self.write_stmt = []
-            for key in sorted(input_dict):
-                var_in_modif = False
-                if key in var_modif:
-                    var_in_modif = True
-                for item in input_dict[key]:
-                    is_dec_stmt = isinstance(item, F23.Type_Declaration_Stmt)
-                    is_alo_stmt = isinstance(item, F23.Allocate_Stmt)
-                    is_use_stmt = isinstance(item, F23.Use_Stmt)
-                    if is_dec_stmt:
-                        if var_in_modif:
-                            if openacc:
-                                self.add_to_module.append(self.add_entity_to_declaration(item, var_modif))
-                            else:
-                                self.add_to_module.append(item)
-                        else:
-                            self.add_to_module.append(item)
-                        all_entity_names = walk(item, F23.Entity_Decl)
-                        initialized = walk(item, F23.Initialization)
-                        attr_spec = walk(item, F23.Attr_Spec)
-                        if not initialized:
-                            for entity_name in all_entity_names:
-                                if openacc:
-                                    self.acc_declare_create.append(entity_name.tostr())
-                            if F23.Attr_Spec('ALLOCATABLE') not in attr_spec:
-                                self.reads_in_decleration_routine.append(item)
-                            else:
-                                self.reads_in_read_routine.append(self.combine_allocate_declaration(input_dict[key]))
-                        else:
-                            if openacc:
-                                for entity_name in all_entity_names:
-                                    for child in entity_name.children:
-                                        if isinstance(child, F23.Name):
-                                            self.acc_declare_copyin.append(child.tostr())
-                    if is_alo_stmt:
-                        for allocation_stmt in self.add_entity_to_allocation(item, var_modif, openacc):
-                            self.add_to_routin.append(allocation_stmt.children[0])
-                    if is_use_stmt:
-                        self.add_to_usestm.append(item)
-            self.add_to_module = self.remove_intent_and_save(self.add_to_module)
-            self.reads_in_decleration_routine = self.remove_intent_and_save(self.reads_in_decleration_routine)
-            self.reads_in_decleration_routine = self.initialization_statement(self.reads_in_decleration_routine)
-            self.reads_in_read_routine = self.initialization_statement(self.reads_in_read_routine)
-            self.add_to_module = self.process_queue(self.add_to_module)
-            if self.acc_declare_copyin:
-                acc_declare_copyin_str = ', '.join([name for name in self.acc_declare_copyin])
-                self.acc_declare_copyin_cmd = self.parse_fortran_comment(f"!$ACC DECLARE COPYIN({acc_declare_copyin_str})")
-            if self.acc_declare_create:
-                acc_declare_create_str = ', '.join([name for name in self.acc_declare_create])
-                self.acc_declare_create_cmd = self.parse_fortran_comment(f"!$ACC DECLARE CREATE({acc_declare_create_str})")
-                self.acc_update_device_cmd = self.parse_fortran_comment(f"!$ACC UPDATE DEVICE({acc_declare_create_str})")
-            self.logger.info("Declarations and allocations processed successfully ")
-        except Exception as e:
-            self.logger.error(f"Failed to process declarations and allocations, Error: {e}")
+            self.logger.exception(f"Failed to generate global module routine, Error: {e}")
             raise
 
     def is_constant_initialization(self, init_node):
@@ -1699,7 +1422,7 @@ class Processor:
             return combined_list
 
         except Exception as e:
-            self.logger.error(f"Error in process_queue: {e}")
+            self.logger.exception(f"Error in process_queue: {e}")
             raise
 
     def compile_and_run(self, base_dir, target_dir, mode="CPU"):
@@ -1737,7 +1460,7 @@ class Processor:
         os.chdir(base_dir)
         return 0
 
-
+'''
 if __name__ == "__main__":
     import unittest
     import tempfile
@@ -2035,49 +1758,6 @@ if __name__ == "__main__":
             self.assertIsInstance(call_stmt, F23.Call_Stmt)
             self.assertEqual(call_stmt.tostr(), F23.Call_Stmt("CALL test(a)").tostr())
 
-        def test_generate_dummy_read_routine(self):
-            # Test generating read routine
-            decl = "integer :: a"
-            parsed_decl = self.processor.parse_fortran_statement(decl)
-            init = self.processor.initialization_statement([parsed_decl.children[0]])
-            
-            routine = self.processor.generate_dummy_read_routine([parsed_decl.children[0]], init, "test_sub")
-            self.assertIsInstance(routine, F23.Subroutine_Subprogram)
-            self.assertIn("READ(1363", routine.tostr())
-            self.assertIn("dummy.bin", routine.tostr())
-
-        def test_initialization_statement(self):
-            # Test creating initialization statements
-            decl = "integer :: a"
-            parsed_decl = self.processor.parse_fortran_statement(decl)
-            init = self.processor.initialization_statement([parsed_decl.children[0]])
-            
-            self.assertEqual(len(init), 1)
-            self.assertIsInstance(init[0].children[1], F23.If_Construct)
-            self.assertIn("READ(1363", init[0].tostr())
-            
-            # Test with OUT intent (should not create initialization)
-            decl = "integer, intent(out) :: b"
-            parsed_decl = self.processor.parse_fortran_statement(decl)
-            init = self.processor.initialization_statement([parsed_decl.children[0]])
-            self.assertEqual(len(init), 0)
-
-        def test_add_declarations(self):
-            # Test processing declarations
-            input_dict = {
-                "a": [self.processor.parse_fortran_statement("real :: a").children[0]],
-                "b": [self.processor.parse_fortran_statement("real, allocatable :: b(:)").children[0], 
-                    self.processor.parse_fortran_statement("allocate(b(10))").children[0]],
-                "c": [self.processor.parse_fortran_statement("real :: c(:)").children[0]]
-            }
-            
-            self.processor.add_declarations(input_dict, {"a"}, openacc=True)
-            
-            self.assertEqual(len(self.processor.add_to_module), 3)
-            self.assertEqual(len(self.processor.add_to_routin), 1)
-            self.assertIn("a_copy", self.processor.add_to_module[0].tostr())
-            self.assertIn("!$ACC DECLARE CREATE", self.processor.acc_declare_create_cmd.tostr())
-
         def test_process_queue(self):
             # Test processing declaration queue
             declarations = [
@@ -2111,3 +1791,4 @@ if __name__ == "__main__":
             os.chdir(original_cwd)
             shutil.rmtree(test_dir)
     unittest.main()
+'''

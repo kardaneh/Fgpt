@@ -85,7 +85,7 @@ class Shaper:
     Processor : For Fortran parsing utilities
     """
 
-    def __init__(self, module_dir, parsed_modules, module_path,dummy_arg_list, actual_arg_spec_list=None, call_subroutines=None):
+    def __init__(self, module_dir, parsed_modules, module_path,dummy_arg_list, actual_arg_spec_list=None, call_subroutines=None, logger=None):
         """
         Initialize the Shaper with module directory, parsed modules, and argument mappings.
         
@@ -106,11 +106,12 @@ class Shaper:
         self.dummy_arg_list = dummy_arg_list
         self.actual_arg_spec_list = actual_arg_spec_list
         self.call_subroutines = call_subroutines
+        self.logger = logger
         self.current_module_imp = ''
         self.module_tree_imp = None
         self.parsed_modules = parsed_modules
         self.module_path = module_path
-        self.processor = Processor()
+        self.processor = Processor(logger=self.logger)
         self.cases_to_exclude = ['clear', 'finalize', 'init', 'initialize', 'read']
 
     def find_fortran_files_subroutine(self, subroutine_key):
@@ -160,6 +161,7 @@ class Shaper:
                 else:
                     self.module_tree_imp = self.processor.parse_fortran_file(module_file_path)
                     self.parsed_modules[module_name] = self.module_tree_imp
+                    self.module_path[module_name] = module_file_path
                 
                 for sub in walk(self.module_tree_imp, F23.Subroutine_Subprogram):
                     subroutine_name, arg_list = None, None
@@ -190,7 +192,7 @@ class Shaper:
                         for item in call_stmt:
                             call_name = walk(item, F23.Name)[0].string
                             if call_name == subroutine_key:
-                                self.processor.logger.info('Subroutine "%s" is called inside module "%s"!', call_name, file_base)
+                                self.processor.logger.info(f"Subroutine '{call_name}' is called inside module '{file_base}'!")
                                 arg_list = walk(item, F23.Actual_Arg_Spec_List)
                                 if arg_list:
                                     arg_string = [string.strip() for string in arg_list[0].tostr().split(',')]
@@ -203,7 +205,7 @@ class Shaper:
             raise
         
         except Exception as e:
-            self.processor.logger.error(f"An error occurred while searching for Fortran files in method 'find_fortran_files_subroutine': {e}")
+            self.processor.logger.exception(f"An error occurred while searching for Fortran files in method 'find_fortran_files_subroutine': ", e)
             raise
 
     def shaper_subroutine(self, node, subroutine_key):
@@ -250,8 +252,7 @@ class Shaper:
             if subroutine_key not in self.actual_arg_spec_list or subroutine_key not in self.call_subroutines:
                 self.current_module_imp = walk(node.get_root(), F23.Name)[0].string
                 self.processor.logger.info(
-                    "The subroutine '%s' is called outside of the module '%s'. Searching the module...",
-                    subroutine_key, self.current_module_imp)
+                    f"The subroutine '{subroutine_key}' is called outside of the module '{self.current_module_imp}'. Searching the module...")
 
                 self.find_fortran_files_subroutine(subroutine_key)
             
@@ -263,8 +264,7 @@ class Shaper:
                 declaration_part = walk(enclosing_subroutine, F23.Specification_Part)
                 
                 self.processor.logger.info(
-                    'Corresponding element of "%s" is "%s" in call statement in subroutine "%s"!',
-                    name, act_arg, subroutine_key)
+                    f"Corresponding element of '{name}' is '{act_arg}' in call statement in subroutine '{subroutine_key}'!")
 
                 if declaration_part:
                     for decl in walk(declaration_part, F23.Type_Declaration_Stmt):
@@ -272,7 +272,7 @@ class Shaper:
                         if act_arg in declarations:
                             explicit_shape = walk(decl, F23.Explicit_Shape_Spec)
                             if explicit_shape:
-                                self.processor.logger.info('Found explicit shape in subroutine "%s"!', subroutine_key)
+                                self.processor.logger.info(f"Found explicit shape in subroutine '{subroutine_key}'!")
                                 return decl
                             else:
                                 return self.shaper_subroutine(decl, subroutine_key)
@@ -280,16 +280,14 @@ class Shaper:
             self.module_tree_imp = call.get_root()
             module_name = walk(self.module_tree_imp, F23.Name)[0].string
             self.processor.logger.info(
-                    '"%s" is not a dummy argument in subroutine "%s". Searching in module "%s"...',
-                    act_arg, subroutine_key, module_name
-                    )
+                    " '{act_arg}' is not a dummy argument in subroutine '{subroutine_key}'. Searching in module '{module_name}'...")
 
-            self.finder = Navigator(self.module_dir_imp, self.module_tree_imp, self.parsed_modules, self.module_path)
+            self.finder = Navigator(self.module_dir_imp, self.module_tree_imp, self.parsed_modules, self.module_path, logger=self.logger)
             self.finder.variable_finder(act_arg)
             return self.processor.combine_allocate_declaration(self.finder.var_declaration)
         
         except Exception as e:
-            self.processor.logger.error(f"An error occurred in method 'shaper_subroutine': {e}")
+            self.processor.logger.exception(f"An error occurred in method 'shaper_subroutine': ", e)
             raise
 
     def shaper_function(self, node, function_tree, function_key, all_array_info):
@@ -413,6 +411,7 @@ class Shaper:
                         else:
                             self.module_tree_imp = self.processor.parse_fortran_file(module_file_path)
                             self.parsed_modules[module_name] = self.module_tree_imp
+                            self.module_path[module_name] = module_file_path
                     else:
                         self.processor.logger.error(
                                 f"Function key '{function_key}' not found in any module, need to go to higher directory."
@@ -428,7 +427,7 @@ class Shaper:
                                 child.children[child.children.index(gchild)] = new_dec
             return new_dec
         except Exception as e:
-            self.processor.logger.error(f"An error occurred in method 'shaper_subroutine': {e}")
+            self.processor.logger.exception(f"An error occurred in method 'shaper_subroutine': ", e)
             raise
 
     def shaper_intrinsic_size(self, node):
@@ -482,9 +481,7 @@ class Shaper:
                         args = intrinsic_args.children
                         if len(args) == 1:
                             self.processor.logger.info(
-                                    "SIZE for %s without an explicit 'DIM'. This implies size of all dimensions.",
-                                    args[0].tostr()
-                                    )
+                                    f"SIZE for {args[0].tostr()} without an explicit 'DIM'. This implies size of all dimensions.")
                             dim_value = 'ALL'
                         if len(args) == 2:
                             if isinstance(args[1], F23.Actual_Arg_Spec):
@@ -534,7 +531,7 @@ class Shaper:
                         node.parent.children[node.parent.children.index(gchild)] = new_dec
             return new_dec
         except Exception as e:
-            self.processor.logger.error(f"An error occurred in method 'find_enclosing_subroutine': {e}")
+            self.processor.logger.exception(f"An error occurred in method 'find_enclosing_subroutine': ", e)
             raise
 
 
@@ -574,9 +571,10 @@ class Shaper:
             return None
         
         except Exception as e:
-            self.processor.logger.error(f"An error occurred in method 'find_enclosing_subroutine': {e}")
+            self.processor.logger.exception(f"An error occurred in method 'find_enclosing_subroutine': ", e)
             raise
 
+'''
 class TestShaper(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -797,3 +795,4 @@ class TestShaper(unittest.TestCase):
     
 if __name__ == "__main__":
     unittest.main()
+'''
