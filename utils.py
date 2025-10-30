@@ -619,7 +619,7 @@ class AdjustIndices(ast.NodeTransformer):
 
                 # Recursively adjust lower and upper if they exist
                 new_lower = self._adjust_index(index_node.lower) if index_node.lower else None
-                new_upper = self._adjust_index(index_node.upper) if index_node.upper else None
+                new_upper = index_node.upper  # self._adjust_index(index_node.upper) if index_node.upper else None
                 new_step = self._adjust_index(index_node.step) if index_node.step else None
 
                 return ast.Slice(lower=new_lower, upper=new_upper, step=new_step)
@@ -771,12 +771,50 @@ def ast_walk(node, node_type: ast.AST) -> Generator:
         yield None
 
 def find_folder(root_dir, target_folder):
+    """
+    Search for a target folder within a directory tree.
+
+    This function recursively walks through a directory starting at `root_dir`
+    and returns the full path to the first occurrence of `target_folder`.
+
+    Parameters
+    ----------
+    root_dir : str
+        The root directory to start the search from.
+    target_folder : str
+        The name of the folder to find.
+
+    Returns
+    -------
+    str or None
+        The absolute path to the target folder if found; otherwise, ``None``.
+    
+    """
     for dirpath, dirnames, _ in os.walk(root_dir):
         if target_folder in dirnames:
             return os.path.join(dirpath, target_folder)
     return None
 
 def find_used_globals(node, common_attributes):
+    """
+    Find all global variables used within an AST node.
+
+    This function recursively traverses an AST node and collects the names
+    of all variables that match entries in `common_attributes`, indicating
+    their usage as global variables or shared attributes.
+
+    Parameters
+    ----------
+    node : ast.AST
+        The root AST node to analyze.
+    common_attributes : iterable of str
+        A collection of variable names considered as global or shared attributes.
+
+    Returns
+    -------
+    set of str
+        A set of global variable names found within the given AST node.
+    """
     used_globals = set()
 
     def visit(n):
@@ -791,6 +829,28 @@ def find_used_globals(node, common_attributes):
     return used_globals
 
 def attach_instance(node, instance_name='self'):
+    """
+    Recursively attach an instance reference to all variable names in an AST node.
+
+    This function traverses an abstract syntax tree (AST) and converts any 
+    variable reference (``ast.Name``) into an attribute of a given instance name 
+    (e.g., converting ``x`` into ``self.x``). It handles nested AST nodes and 
+    lists of nodes recursively.
+
+    Parameters
+    ----------
+    node : ast.AST
+        The root AST node to process.
+    instance_name : str, optional
+        The name of the instance to attach (default is 'self').
+
+    Returns
+    -------
+    ast.AST
+        A modified AST node where all variable names are converted into 
+        instance attributes (e.g., ``x`` → ``self.x``).
+    """
+
     if isinstance(node, ast.Name):
         return ast.Attribute(
             value=ast.Name(id=instance_name, ctx=ast.Load()),
@@ -813,6 +873,36 @@ def attach_instance(node, instance_name='self'):
     return node
 
 def safe_eval_expr(node, attributes=None):
+    """
+    Safely evaluate a restricted AST expression with given variable bindings.
+
+    This function evaluates a subset of Python expressions represented as 
+    AST nodes. It supports constant values, binary arithmetic operations 
+    (addition, subtraction, multiplication, division, etc.), and variable 
+    lookups from a provided attribute dictionary. It is designed to avoid 
+    executing arbitrary code, unlike Python's built-in `eval`.
+
+    Parameters
+    ----------
+    node : ast.AST
+        The AST node representing the expression to evaluate.
+    attributes : dict of {str: tuple}, optional
+        A mapping of variable names to tuples containing their values.
+        For example, ``{'x': (5,), 'y': (10,)}``. Defaults to an empty dictionary.
+
+    Returns
+    -------
+    any
+        The evaluated result of the expression.
+
+    Raises
+    ------
+    NameError
+        If a variable is referenced that does not exist in `attributes`.
+    NotImplementedError
+        If the expression contains unsupported AST node types or operators.
+    
+    """
     if attributes is None:
         attributes = {}
 
@@ -852,15 +942,29 @@ def safe_eval_expr(node, attributes=None):
         raise NotImplementedError(f"Unsupported AST node type: {type(node)}")
 
 
-def update_methods(module_dict, function_defs):
+def update_methods(module_dict:Dict, function_defs:List):
     """
-    Update the 'methods' dictionary in a module-like dictionary structure,
-    regardless of the instance name (e.g., 'self', 'this').
+    Update the 'methods' entry of a module dictionary with new function definitions.
 
-    Args:
-        module_dict (dict): Dictionary containing the module and its components.
-        function_defs (list): List of ast.FunctionDef nodes to add.
+    This function adds or updates function definitions in the `'methods'` key of a given `module_dict`. Each entry in `function_defs` is expected to be
+    an `ast.FunctionDef` node representing a function to be included in the module's method dictionary.
+
+    Parameters
+    ----------
+    module_dict : dict
+        A dictionary representing a module structure. It should contain a
+        `'methods'` key mapping to a dictionary of existing function definitions.
+    function_defs : list of ast.FunctionDef
+        A list of function definition nodes to add or update in the module's
+        `'methods'` dictionary.
+
+    Returns
+    -------
+    dict
+        The updated module dictionary with new or modified function definitions
+        under the `'methods'` key.
     """
+
     # Loop over the top-level module(s)
     for _, module_content in module_dict.items():
         # Search for the inner dict that contains 'methods'
@@ -875,7 +979,23 @@ def update_methods(module_dict, function_defs):
                 break 
 
 def collect_dependencies(node):
-    """Collect all variable names this value depends on."""
+    """
+    Collect all variable names that an AST node depends on.
+
+    This function traverses an abstract syntax tree (AST) node and extracts all variable names referenced within it. Both plain variable names
+    (`ast.Name`) and object attributes (`ast.Attribute`) are included in the resulting dependency set.
+
+    Parameters
+    ----------
+    node : ast.AST
+        The AST node to analyze for variable dependencies.
+
+    Returns
+    -------
+    set of str
+        A set containing the names of all variables and attributes used within
+        the given AST node.
+    """
     deps = set()
     for child in ast.walk(node):
         if isinstance(child, ast.Name):
@@ -886,8 +1006,30 @@ def collect_dependencies(node):
 
 def order_assignments(assign_nodes:List, diff:List) -> List:
     """
-    Works similiarily to the search_dependant_variabels of Transformer class with the addition of creating a sorted values in which it's 
-    ordered using the topological sort using Kahn's algorithm to ensure proper valid order. 
+    Order assignment nodes based on variable dependencies using topological sorting.
+
+    This function analyzes a list of assignment nodes to determine their dependency relationships, similar to the `search_dependent_variables` method in the
+    `Transformer` class. It then orders the assignments using Kahn's algorithm for topological sorting to ensure that each variable is assigned only after its dependencies have been resolved.
+
+    Parameters
+    ----------
+    assign_nodes : list
+        A list of AST assignment nodes or equivalent representations of variable assignments.
+    diff : list
+        A list of dependency relationships or variable differences used to
+        establish ordering constraints among assignments.
+
+    Returns
+    -------
+    list
+        A list of assignment nodes sorted in a dependency-respecting order
+        according to topological sorting.
+
+    Notes
+    -----
+    - Kahn's algorithm is used to guarantee a valid ordering where dependencies precede dependents.
+    - This function is useful when generating or transforming code that relies on the correct order of variable initialization.
+
     """
     # Build dependency graph
     graph = defaultdict(set)
@@ -942,8 +1084,23 @@ def order_assignments(assign_nodes:List, diff:List) -> List:
 
 def search_convar_dependencies(conv_vars: List[str], node: ast.AST) -> Set[str]:
     """
-    Retrieves conventional variables (loop_dict) that are affected by or derived from other variables.
-    Returns a set of variable names that depend on the conventional variables.
+    Identify variables that depend on given conventional variables within an AST node.
+
+    This function traverses an abstract syntax tree (AST) and finds assignments where the right-hand side (RHS) expressions depend on any of the specified conventional variables (`conv_vars`). It returns the names of variables that are affected 
+    or derived from those conventional variables.
+
+    Parameters
+    ----------
+    conv_vars : list of str
+        A list of conventional variable names to search for in expressions.
+    node : ast.AST
+        The root AST node to analyze for variable dependencies.
+
+    Returns
+    -------
+    set of str
+        A set of variable names that are directly affected by or derived from the given conventional variables.
+
     """
     adjusted_vars = set()
 
@@ -963,7 +1120,6 @@ def search_convar_dependencies(conv_vars: List[str], node: ast.AST) -> Set[str]:
 
     return adjusted_vars
 
-
 def adjust_loop_variables(expr_node,loop_variables):
     for node in ast_walk(expr_node,ast.Name):
         loop_var = loop_variables.get(node.id)
@@ -972,7 +1128,23 @@ def adjust_loop_variables(expr_node,loop_variables):
 
 def _find_conv_vars_in_expr(child: ast.AST, conv_vars: List[str]) -> bool:
     """
-    Recursively checks if any variable in conv_vars is used in the expression node.
+    Recursively check whether any of the given conventional variables appear in an expression node.
+
+    This function traverses an AST expression node to determine if it contains any variables listed in `conv_vars`. It is typically used to detect whether 
+    an assignment or operation depends on specific conventional variables.
+
+    Parameters
+    ----------
+    child : ast.AST
+        The AST node (usually an expression) to inspect.
+    conv_vars : list of str
+        A list of conventional variable names to search for within the expression.
+
+    Returns
+    -------
+    bool
+        True if any variable from `conv_vars` is found within the expression, 
+        otherwise False.
     """
     if isinstance(child, ast.Name) and child.id in conv_vars:
         return True
