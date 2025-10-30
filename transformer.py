@@ -28,11 +28,10 @@ class Transformer:
     """
 
     def __init__(self, benchmark_dir:str,
-                 isolator:'Isolator',
-                 extractor:'Extractor',
+                 isolator: 'Isolator',
+                 extractor: 'Extractor',
                  ignore_case:List[str],
-                 config_path:str,
-                 logger:Logger = None
+                 config_path:str
                 ):
         if benchmark_dir is None: # THe benchmark directory
             current_dir = os.getcwd()
@@ -49,11 +48,8 @@ class Transformer:
         self.for_loop = False                   # If we want to create with either using using a for loop for the reading binary files 
         self.global_state = False               # Allows to define if the given code template is for global or not
 
-        if logger is None:
-            self.logger = Logger()
-        else:
-            self.logger = logger
-        self.logger.show_header("Transformer")
+        self.logger = Logger(Module_name="Transformer")
+        self.logger.show_header()
         
         self.f2np = F2NP(extractor)             # Class in charge of transforming a subroutine from fortran to python
         self.f2np.ast_mode = True
@@ -61,7 +57,6 @@ class Transformer:
         # This meant to be done to ensure that we get the log events happening inside the function thus wraps the method itself upon the wrapper function
         self.update_global_python = self.logger.log_event("Update_global_python")(self.update_global_python)
         self.update_main_python = self.logger.log_event('Update_main_python')(self.update_main_python)
-        self.run_python_scripts = self.logger.log_event('Run python scripts')(self.run_python_scripts)
 
     ################################################################################# Helper functions #################################################################################
     @staticmethod
@@ -791,22 +786,14 @@ class Transformer:
             # Thus ins and nslm makes it go out of bounds since python use zero based indexation,
             # First retrieve all the loop variables within the for loop usually present in cls.loop_dict si that we don't modify them
             cons_var = set()
-            loop_dict_values = self.extractor.loop_dict.get(subroutine_key,{})
-            if loop_dict_values: 
-                for values in loop_dict_values.values():
-                    value = sorted(values)
-                    if len(value)>1:
-                        cons_var.add(value[0])
-                        cons_var.add(value[1])
-                    else:
-                        cons_var.add(value[0])
-                # Sometimes the loop dict doesn't go onto enough depth that it leaves out some for loop target vairables due to the fact that loop dict only 
-                # looks upon the end loop range(max) and is known during processing time and not runtime variables like arrays
-                # THUS WE will retrieve the rest of the loop target variables
-                for loop_var in ast_walk(function_def, ast.For):
-                    if isinstance(loop_var.target, ast.Name) and loop_var.target.id not in cons_var:
-                        cons_var.add(loop_var.target.id)
-            # cons_var.add('jsl')
+            for values in self.extractor.loop_dict.values():
+                value = sorted(values)
+                if len(value)>1:
+                    cons_var.add(value[0])
+                    cons_var.add(value[1])
+                else:
+                    cons_var.add(value[0])
+            # cons_var.add('jj')
             # cons_var.add('jjj')
 
             # Now we visit each node and adjust the subscripts 
@@ -3207,55 +3194,61 @@ ffile = FortranFile(path, 'r')
         self.correct_function(module_stacks[module_stack_index], cls_info, subroutine_key,main_file_attributes=main_file_attributes)
         identify_replace_all(module_stacks[module_stack_index].body,cls_info)
         
-    def run_python_scripts(self, base_dir:str,target_dir:str, mode:Literal['CPU','GPU'] = 'CPU'):
+    def compile_and_run(self, base_dir,modules_dir):
+        target_module_dir_path = os.path.join(base_dir, modules_dir)
 
-        if not os.path.isdir(target_dir):
-            self.logger.log_error(f"Target module directory '{target_dir}' not found.")
+        if not os.path.isdir(target_module_dir_path):
+            self.logger.log_error(f"Target module directory '{target_module_dir_path}' not found.")
 
-        subdir_path = os.path.join(base_dir,target_dir)
-        subdir = os.path.basename(subdir_path)
-        if not os.path.isdir(subdir_path):
-            self.logger.warning(f"Skipping non-directory entry: {subdir_path}")
-            return
-        
-        self.logger.info(f"Processing module: {subdir_path}")
-        # Python file checks
-        main_file = os.path.join(subdir_path, 'main.py')
-        global_module_file = os.path.join(subdir_path, 'module_global.py')
+        for subdir in os.listdir(target_module_dir_path):
+            subdir_path = os.path.join(target_module_dir_path, subdir)
 
-        missing_files = []
-        if not os.path.exists(main_file):
-            missing_files.append('main.py')
-        if not os.path.exists(global_module_file):
-            missing_files.append('module_global.py')
-        
-        if missing_files:
-            self.logger.warning(f"Missing files in '{subdir}': {', '.join(missing_files)}")
-            self.logger.info(f"Skipping '{subdir}' due to missing Python files.\n")
-            return 
-        else:
-            self.logger.info(f"Required Python files found in '{subdir}'.")
-        
-        # Binary file checks
-        benchmark_subdir = os.path.join(self.benchmark_dir, subdir)
-        dummy_bin = os.path.join(benchmark_subdir, "dummy.bin")
-        global_bin = os.path.join(benchmark_subdir, "global.bin")
-        output_bin = os.path.join(benchmark_subdir, "output.bin")
-        bin_missing = []
-        for bin_file in [dummy_bin, global_bin, output_bin]:
-            if not os.path.exists(bin_file):
-                bin_missing.append(os.path.basename(bin_file))
+            if not os.path.isdir(subdir_path):
+                self.logger.warning(f"Skipping non-directory entry: {subdir}")
+                continue
 
-        if bin_missing:
-            self.logger.warning(f"Missing binary files for '{subdir}': {', '.join(bin_missing)}")
-            self.logger.info(f"Skipping '{subdir}' due to missing binaries.\n")
-            return 
-        
-        self.logger.info(f"All binary files found for '{subdir}'. Running unit tests...")
-        try:
-            result = subprocess.run(['python3', main_file], check=True, capture_output=True, text=True)
-            self.logger.info(f"Execution output for '{subdir}':\n{result.stdout}")
-        except subprocess.CalledProcessError as e:
-            self.logger.log_error(f"Error running main.py for '{subdir}': ", e.stderr)
-            return 
+            self.logger.info(f"Processing module: {subdir}")
+
+            # Python file checks
+            main_file = os.path.join(subdir_path, 'main.py')
+            global_module_file = os.path.join(subdir_path, 'module_global.py')
+
+            missing_files = []
+            if not os.path.exists(main_file):
+                missing_files.append('main.py')
+            if not os.path.exists(global_module_file):
+                missing_files.append('module_global.py')
+
+            if missing_files:
+                self.logger.warning(f"Missing files in '{subdir}': {', '.join(missing_files)}")
+                self.logger.info(f"Skipping '{subdir}' due to missing Python files.\n")
+                continue
+            else:
+                self.logger.info(f"Required Python files found in '{subdir}'.")
+
+            # Binary file checks
+            benchmark_subdir = os.path.join(self.benchmark_dir, subdir)
+            dummy_bin = os.path.join(benchmark_subdir, "dummy.bin")
+            global_bin = os.path.join(benchmark_subdir, "global.bin")
+            output_bin = os.path.join(benchmark_subdir, "output.bin")
+
+            bin_missing = []
+            for bin_file in [dummy_bin, global_bin, output_bin]:
+                if not os.path.exists(bin_file):
+                    bin_missing.append(os.path.basename(bin_file))
+
+            if bin_missing:
+                self.logger.warning(f"Missing binary files for '{subdir}': {', '.join(bin_missing)}")
+                self.logger.info(f"Skipping '{subdir}' due to missing binaries.\n")
+                continue
+
+            self.logger.info(f"All binary files found for '{subdir}'. Running unit tests...")
+
+            try:
+                result = subprocess.run(['python3', main_file], check=True, capture_output=True, text=True)
+                self.logger.info(f"Execution output for '{subdir}':\n{result.stdout}")
+            except subprocess.CalledProcessError as e:
+                self.logger.log_error(f"Error running main.py for '{subdir}': ", e.stderr)
+                continue
+
         
