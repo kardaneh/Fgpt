@@ -401,6 +401,20 @@ class AdjustIndices(ast.NodeTransformer):
     def visit_For(self, node):
         self.generic_visit(node)
 
+        loop_vars = self._extract_loop_vars(node.target)
+
+        used_vars = set()
+        for child in ast.walk(ast.Module(body=node.body, type_ignores=[])):
+            if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Load):
+                used_vars.add(child.id)
+
+        unused = [v for v in loop_vars if v not in used_vars]
+        if unused:
+            print(f"⚠️ Unused loop variable(s): {unused}")
+
+            for var in unused:
+                self._rename_var_in_target(node.target, var, "_")
+
         if not isinstance(node.iter, ast.Call) or not hasattr(node.iter, 'args'):
             return node  
 
@@ -412,6 +426,25 @@ class AdjustIndices(ast.NodeTransformer):
 
         node.iter.args = new_args
         return node
+
+    def _extract_loop_vars(self, target):
+        """Extract all variable names from the loop target (handles tuples)."""
+        if isinstance(target, ast.Name):
+            return [target.id]
+        elif isinstance(target, (ast.Tuple, ast.List)): # In the case we have enumerate instead of range
+            vars_ = []
+            for elt in target.elts:
+                vars_.extend(self._extract_loop_vars(elt))
+            return vars_
+        return []
+
+    def _rename_var_in_target(self, target, old, new):
+        """Rename a variable in the loop target."""
+        if isinstance(target, ast.Name) and target.id == old:
+            target.id = new
+        elif isinstance(target, (ast.Tuple, ast.List)):
+            for elt in target.elts:
+                self._rename_var_in_target(elt, old, new)
 
     def _process_arg(self, arg, node):
         """Handles transformation logic for each argument in node.iter.args"""
@@ -452,6 +485,11 @@ class AdjustIndices(ast.NodeTransformer):
         self.generic_visit(node)
         if isinstance(node.test, ast.Compare):
             self._handle_compare(node.test)
+        
+        if ((not node.body or all(isinstance(n, ast.Pass) for n in node.body)) and not node.orelse):
+            # Return None to delete the empty 'if' node entirely
+            return None
+
         return node
 
     def _handle_compare(self,node):

@@ -9,6 +9,7 @@ Python_templates:
             import functools
 
             nice = np.int32(8)
+            ncirc = np.int32(3)
             nsnow = np.int32(3)
             nslm = np.int32(11)
             nvm = np.int32(15)
@@ -38,6 +39,7 @@ Python_templates:
                 def __init__(self):
 
                     self.nice = np.int32(8)
+                    self.ncirc = np.int32(3)
                     self.nsnow = np.int32(3)
                     self.nslm = np.int32(11)
                     self.nvm = np.int32(15)
