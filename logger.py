@@ -231,7 +231,7 @@ class Logger:
         else:
             self.console.print(Panel(f"[bold red]{message}[/bold red]", title="[bold red]EXCEPTION[/bold red]", border_style="red"))
 
-    def log_error(self, message, exception=None):
+    def error(self, message, exception=None):
         """Display a formatted error log, optionally including exception trace."""
         if exception:
             tb = traceback.format_exc()
