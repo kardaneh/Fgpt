@@ -91,7 +91,7 @@ class Navigator:
     Processor : Supporting class for Fortran parsing utilities
     """
 
-    def __init__(self, subroutine_dir, module_tree, parsed_modules, module_path):
+    def __init__(self, subroutine_dir, module_tree, parsed_modules, module_path, logger=None):
         """
         Initialize the Navigator with directory, module tree, and parsed modules.
         
@@ -119,7 +119,8 @@ class Navigator:
         self.full_scout = False
         self.parsed_modules = parsed_modules
         self.module_path = module_path
-        self.processor = Processor()
+        self.logger = logger
+        self.processor = Processor(logger=self.logger)
         #self.logger = Logger(Module_name="Navigator")
         #self.logger.show_header()
 
@@ -189,8 +190,8 @@ class Navigator:
                                     )
                             self.processor.logger.info(str(stmt))
                         if isinstance(child.parent, F23.Function_Stmt):
-                            self.processor.logger.warning("Warning: '%s' is a function", self.variable_name_sc)
-                            self.processor.logger.warning("The containing directory is: %s", self.module_dir_sc)
+                            self.processor.logger.warning(f"Warning: '{self.variable_name_sc}' is a function")
+                            self.processor.logger.warning(f"The containing directory is: '{self.module_dir_sc}'")
                             function_name = child
                             function_subprogram = child.parent.parent
                             self.var_declaration.extend([function_name,function_subprogram, module_name])
@@ -202,7 +203,7 @@ class Navigator:
                         F23.Attr_Spec('ALLOCATABLE') in attr_spec and allocate_stmt == []:
                     self.return_key_sc = False
         except Exception as e:
-            raise RuntimeError(f"Error in 'find_variable_in_module': {str(e)}")
+            self.processor.logger.exception(f"Error in 'find_variable_in_module': ", e)
 
     def find_external_subroutine_in_module(self):
         """
@@ -238,7 +239,7 @@ class Navigator:
                             use_stmt = f'use {module_name}, ONLY: {self.variable_name_sc}'
                             self.var_declaration.append(F23.Use_Stmt(use_stmt))
                             self.return_key_sc = True
-                            self.processor.logger.info("'%s procedure' is found in the module '%s'", self.variable_name_sc, module_name)
+                            self.processor.logger.info(f"'{self.variable_name_sc}' procedure is found in the module '{module_name}' ")
                             return
             for sub in walk(self.module_tree_sc, F23.Subroutine_Subprogram):
                 for node in walk(sub, F23.Subroutine_Stmt):
@@ -248,10 +249,10 @@ class Navigator:
                         use_stmt = f'use {module_name}, ONLY: {self.variable_name_sc}'
                         self.var_declaration.append(F23.Use_Stmt(use_stmt))
                         self.return_key_sc = True
-                        self.processor.logger.info("'%s procedure' is found in the module '%s'", self.variable_name_sc, module_name)
+                        self.processor.logger.info(f"'{self.variable_name_sc}' procedure is found in the module '{module_name}' ")
                         return
         except Exception as e:
-            self.processor.logger.error(f"Error in 'find_external_subroutine_in_module': {str(e)}")
+            self.processor.logger.exception(f"Error in 'find_external_subroutine_in_module': ", e)
             raise
 
     def external_subroutine_finder(self, variable_name):
@@ -286,9 +287,9 @@ class Navigator:
             self.visited_modules_sc.add(module_name)
             self.add_modules_to_queue()
             self.find_var_in_child_modules(key='subroutine')
-            self.processor.logger.info("The containing directory is: %s", self.module_dir_sc)
+            self.processor.logger.info(f"The containing directory is: {self.module_dir_sc}")
         except Exception as e:
-            self.processor.logger.error(f"Error in 'external_subroutine_finder': {str(e)}")
+            self.processor.logger.exception(f"Error in 'external_subroutine_finder':", e)
             raise
 
     def variable_finder(self, variable_name):
@@ -320,7 +321,7 @@ class Navigator:
             self.variable_name_sc = variable_name
             self.find_variable_in_module()
             if self.return_key_sc:
-                self.processor.logger.info("The containing directory is: %s", self.module_dir_sc)
+                self.processor.logger.info(f"The containing directory is: {self.module_dir_sc}")
             else:
                 module_name = walk(self.module_tree_sc, F23.Name)[0].string
                 self.module_set_sc.add(module_name)
@@ -328,9 +329,9 @@ class Navigator:
                 self.visited_modules_sc.add(module_name)
                 self.add_modules_to_queue()
                 self.find_var_in_child_modules(key='variable')
-                self.processor.logger.info("The containing directory is: %s", self.module_dir_sc)
+                self.processor.logger.info(f"The containing directory is: {self.module_dir_sc}")
         except Exception as e:
-            self.processor.logger.error(f"Error in 'variable_finder': {str(e)}")
+            self.processor.logger.exception(f"Error in 'variable_finder': ", e)
             raise
 
     def add_modules_to_queue(self):
@@ -371,7 +372,7 @@ class Navigator:
                     self.queue_sc.append(module)
                     self.module_set_sc.add(module_name)
         except Exception as e:
-            self.processor.logger.error(f"Error in 'add_modules_to_queue': {str(e)}")
+            self.processor.logger.exception(f"Error in 'add_modules_to_queue': ", e)
             raise
     
     def find_var_in_child_modules(self, key='variable'):
@@ -477,9 +478,230 @@ class Navigator:
                     self.processor.logger.error("Queue is empty, return key is False, and full scout is True. Unable to proceed.")
                     raise
         except Exception as e:
-            self.processor.logger.error(f"Error in 'find_var_in_child_modules': {str(e)}")
+            self.processor.logger.exception(f"Error in 'find_var_in_child_modules': ", e)
             raise
 
+
+class FortranSearcher:
+    def __init__(self, module_path, parsed_modules, org_files_loaded, logger=None):
+        """
+        Args:
+            processor: object providing `logger` and `parse_fortran_file` methods.
+            module_path (dict): maps module names -> source file paths.
+            parsed_modules (dict): maps module names -> parsed fparser trees.
+        """
+        self.module_path = module_path
+        self.parsed_modules = parsed_modules
+        self.org_files_loaded = org_files_loaded
+        self.logger = logger
+        self.processor = Processor(logger=self.logger)
+        self.module_dir_sc = None  # Current search directory context
+
+    # =====================================================
+    # Main search routine
+    # =====================================================
+    def search_subroutine_in_dependencies(self, subroutine_name, current_module_name, current_dir):
+        """
+        Search for a subroutine by traversing module dependencies (USE statements).
+
+        Returns:
+            (found: bool, module_file_path: str | None, module_tree: object | None)
+        """
+        try:
+            self.module_dir_sc = os.path.normpath(current_dir)
+            visited_modules = set()
+            module_queue = deque([current_module_name])
+
+            while module_queue:
+                module_name = module_queue.popleft()
+                if module_name.lower() in ['mpi', 'xios', 'ioipsl', 'ieee_arithmetic', 'netcdf']:
+                    continue
+                if module_name in visited_modules:
+                    continue
+                visited_modules.add(module_name)
+
+                # --- Parse or reuse module tree ---
+                self.processor.logger.info(
+                                f"🔎 Searching for module name '{module_name}'"
+                                )
+                module_tree, module_file_path = self._get_or_parse_module(module_name)
+                if module_tree is None:
+                    self.processor.logger.warning(f"⚠️  Module '{module_name}' not found, skipping.")
+                    continue
+
+                # --- Search for the subroutine inside this module ---
+                for sub in walk(module_tree, F23.Subroutine_Subprogram):
+                    subroutine_stmt = walk(sub, F23.Subroutine_Stmt)[0]
+                    for child in subroutine_stmt.children:
+                        if isinstance(child, F23.Name) and child.tostr() == subroutine_name:
+                            self.processor.logger.info(
+                                f"✅ Found subroutine '{subroutine_name}' in module '{module_name}', '{module_file_path}' ")
+
+                            path_to_original = module_file_path.replace('.f90', '_org.fgpt').replace('.F90', '_org.Fgpt')
+                            if not os.path.exists(path_to_original):
+                                self.processor.logger.info(f"💾 Created backup: {path_to_original}")
+                                shutil.copy(module_file_path, path_to_original)
+                            return True, module_file_path, module_tree
+
+                # --- Collect USE dependencies ---
+                used_modules = self._collect_used_modules(module_tree, subroutine_name)
+                for used_module in used_modules:
+                    if used_module not in visited_modules and used_module not in module_queue:
+                        module_queue.append(used_module)
+
+            self.processor.logger.warning(
+                    f"⚠️  Subroutine '{subroutine_name}' not found in '{current_module_name}' or its dependencies."
+                    )
+            return False, None, None
+
+        except Exception as e:
+            self.processor.logger.exception(f"Error while searching for subroutine '{subroutine_name}'", e)
+            return False, None, None
+
+    # =====================================================
+    # Parse or reuse existing module (with org file handling)
+    # =====================================================
+    def _get_or_parse_module(self, module_name):
+        """
+        Search for a Fortran module definition by name using a breadth-first directory search.
+
+        Returns:
+            (module_tree, module_file_path) if found, else (None, None)
+        """
+        # Reuse cached result if available
+        if module_name in self.parsed_modules:
+            self.processor.logger.info(
+                    f"✅ Module '{module_name}' is already cached (path: '{self.module_path[module_name]}')"
+                    )
+            return self.parsed_modules[module_name], self.module_path.get(module_name)
+
+        visited_dirs = set()
+        dir_queue = deque([self.module_dir_sc])
+
+        while dir_queue:
+            dir_path = dir_queue.popleft()
+            dir_path = os.path.abspath(dir_path)
+            if dir_path in visited_dirs or not os.path.isdir(dir_path):
+                continue
+            visited_dirs.add(dir_path)
+
+            # --- Search all .f90 / .F90 files in this directory ---
+            files_in_dir = [
+                    f for f in os.listdir(dir_path)
+                    if f.endswith(".f90") or f.endswith(".F90")
+                    ]
+
+            def file_similarity_score(filename):
+                name = os.path.splitext(filename.lower())[0]  # remove extension
+                mod = module_name.lower()
+                if name == mod:
+                    return -float('inf')  # exact match first
+                if mod in name or name in mod:
+                    return -1000  # partial match next
+                common_prefix_len = len(os.path.commonprefix([name, mod]))
+                return -common_prefix_len  # longer prefix = higher priority
+
+            files_in_dir.sort(key=file_similarity_score)
+
+            for filename in files_in_dir:
+                file_path = os.path.join(dir_path, filename)
+
+                # --- Prefer original backup if available ---
+                path_to_original = (
+                    file_path.replace('.f90', '_org.fgpt')
+                             .replace('.F90', '_org.Fgpt')
+                )
+                if os.path.exists(path_to_original) and filename not in self.org_files_loaded:
+                    file_to_parse = path_to_original
+                    self.org_files_loaded.add(filename)
+                    self.processor.logger.info(
+                            f"💾 Using original backup for module '{filename}' (from '{path_to_original}')"
+                            )
+                else:
+                    file_to_parse = file_path
+
+                if file_path in self.module_path.values():
+                    for cached_mod, cached_path in self.module_path.items():
+                        if cached_path == file_path:
+                            module_tree = self.parsed_modules[cached_mod]
+                            self.processor.logger.info(
+                                    f"♻️  Reusing cached parse tree for file '{cached_mod}' module/program: '{file_path}'")
+                            if cached_mod.lower() == module_name.lower():
+                                self.processor.logger.info(
+                                        f"✅ Module '{cached_mod}' is already cached (path: '{file_path}')")
+                                return module_tree, file_path
+                            break
+                else:
+                    module_tree = self.processor.parse_fortran_file(file_to_parse)
+
+
+                # --- Extract and cache all modules in this file ---
+                found_target = False
+                for mod_stmt in walk(module_tree):
+                    if not isinstance(mod_stmt, (F23.Module_Stmt, F23.Program_Stmt)):
+                        continue
+                    mod_name_node = walk(mod_stmt, F23.Name)
+                    if not mod_name_node:
+                        continue
+
+                    mod_name = mod_name_node[0].tostr()
+                    mod_name_lower = mod_name.lower()
+
+                    # Cache module for reuse
+                    if mod_name not in self.parsed_modules:
+                        self.parsed_modules[mod_name] = module_tree
+                        self.module_path[mod_name] = file_path
+
+                    # Check if this is the requested module
+                    if mod_name_lower == module_name.lower():
+                        self.processor.logger.info(f"✅ Found module '{module_name}' in file: '{file_to_parse}'")
+                        self.module_dir_sc = dir_path
+                        return module_tree, file_path
+
+            # --- Add sibling src_* directories dynamically to the queue ---
+            parent_directory = os.path.abspath(os.path.join(dir_path, "../"))
+            for directory in os.listdir(parent_directory):
+                full_dir = os.path.join(parent_directory, directory)
+                if (
+                        directory.startswith("src_")
+                        and os.path.isdir(full_dir)
+                        and full_dir not in visited_dirs
+                        ):
+                    dir_queue.append(full_dir)
+
+        # --- Not found after scanning all directories ---
+        self.processor.logger.warning(
+                f"⚠️  Module '{module_name}' not found starting from '{self.module_dir_sc}'"
+                )
+        return None, None
+
+    # =====================================================
+    # Extract USE dependencies
+    # =====================================================
+    def _collect_used_modules(self, module_tree, target_name=None):
+        """
+        Return a set of module names referenced by USE statements.
+        """
+        used_modules = set()
+        for use_stmt in walk(module_tree, F23.Use_Stmt):
+            for child in use_stmt.children:
+                if isinstance(child, F23.Name):
+                    used_modules.add(child.tostr().lower())  # normalize
+
+        if target_name:
+            def similarity_score(mod_name):
+                target = target_name.lower()
+                if mod_name == target:
+                    return -float('inf')  # exact match first
+                if target in mod_name or mod_name in target:
+                    return -1000  # partial match next
+                common_prefix_len = len(os.path.commonprefix([mod_name, target]))
+                return -common_prefix_len
+            return sorted(used_modules, key=similarity_score)
+
+        return used_modules
+
+'''
 class TestNavigator(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -665,3 +887,4 @@ class TestNavigator(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+'''

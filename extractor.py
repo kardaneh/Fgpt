@@ -2,7 +2,7 @@ import os, sys
 from processor import Processor
 from fparser.two.utils import walk
 from fparser.two import Fortran2003 as F23
-from navigator import Navigator
+from navigator import Navigator, FortranSearcher
 from shaper import Shaper
 import re
 from fparser.common.readfortran import FortranStringReader
@@ -12,12 +12,13 @@ import shutil
 class Extractor:
     """
     """
-    def __init__(self, module_dir, module_tree):
+    def __init__(self, module_dir, module_tree, logger=None):
         """
         """
         try:
             self.module_dir = module_dir
             self.module_tree = module_tree
+            self.logger = logger
             self.subroutine_keys_all = set()
             self.subroutine_keys_ncl = set()
             self.subroutines = defaultdict()
@@ -29,9 +30,25 @@ class Extractor:
             self.call_within_sub = defaultdict(lambda: defaultdict(list))
             self.loop_dict = defaultdict(lambda: defaultdict(set)) #defaultdict(set)
             self.loop_vect = defaultdict(lambda: None)
-            self.exclude = {'kjpindex', 'nslm', 'nstm', 'nvm', 'nsnow', 'nice', 'DIM', 'dim', 'MASK', 'next_calc_loop'}
-            self.cases_to_exclude = ['clear', 'finalize', 'init', 'initialize', 'read', 'write']
-            self.allowed_external_subroutines = {'ipslerr_p', 'xios_orchidee_send_field', 'xios_orchidee_recv_field', 'flinget', 'flininfo', 'scatter'}
+            self.exclude = {'kjpindex', 'nslm', 'nstm', 'nvm', 'nsnow', 'nice', 'ncirc', 'DIM', 'dim', 'MASK', 'next_calc_loop'}
+            self.cases_to_exclude = [
+                    'clear', 
+                    'finalize', 
+                    'init', 
+                    'initialize', 
+                    'read', 
+                    'write',
+                    'albedo_surface_soilalb'
+                    ]
+            self.allowed_external_subroutines = {
+                    'ipslerr_p', 
+                    'xios_orchidee_send_field', 
+                    'xios_orchidee_recv_field', 
+                    'flinget', 
+                    'flininfo', 
+                    'scatter',
+                    'getin', 
+                    'bcast'}
             self.dec_global = defaultdict(lambda: defaultdict(list))
             self.all_array_info = defaultdict(lambda: defaultdict(list))
             self.imp_shape = defaultdict(dict)
@@ -50,9 +67,10 @@ class Extractor:
             self.module_global_stock = {}
             self.module_path = {}
             self.org_files_loaded = set()
-            self.processor = Processor() 
+            self.processor = Processor(logger=self.logger)
+            self.procedure_search = FortranSearcher(self.module_path, self.parsed_modules, self.org_files_loaded, logger=self.logger)
         except Exception as e:
-            self.processor.logger.error("Error in __init__: %s", str(e))
+            self.processor.logger.exception(f"Error in __init__: ", e)
             raise
 
     def extract_loop_vect(self, subroutine_key, subroutine_tree):
@@ -101,103 +119,8 @@ class Extractor:
                     else:
                         self.loop_vect[subroutine_key] = loop_string
         except Exception as e:
-            self.processor.logger.error(f"Error in extract_loop_indices: {str(e)}")
+            self.processor.logger.exception(f"Error in extract_loop_indices: ", e)
             raise
-
-    def search_subroutine_in_directory(self, subroutine_name,  current_module_name, current_dir):
-        """
-        """
-        try:
-            # Start search in current directory
-            search_dir = os.path.normpath(current_dir)
-            searched_dirs = set()
-
-            while True:
-                if search_dir in searched_dirs:
-                    break
-                searched_dirs.add(search_dir)
-
-                # Create queue for Fortran files in current directory
-                fortran_file_queue = deque()
-                for file in os.listdir(search_dir):
-                    if file.endswith(('.f90', '.F90')):
-                        if '_org.f90' in file or '_org.F90' in file:
-                            continue
-                        file_base, _ = os.path.splitext(file)
-                        module_file_path = os.path.join(search_dir, file)
-                        self.module_path[file_base] = module_file_path
-                        if file_base != current_module_name:
-                            fortran_file_queue.append(module_file_path)
-
-                # Search through all Fortran files in current directory
-                while fortran_file_queue:
-                    module_file_path = fortran_file_queue.popleft()
-                    module_file_name = os.path.basename(module_file_path)
-                    module_name, _ = os.path.splitext(module_file_name)
-
-                    path_to_original = module_file_path.replace('.f90', '_org.f90').replace('.F90', '_org.F90')
-                    if os.path.exists(path_to_original) and module_name not in self.org_files_loaded:
-                        file_to_parse = path_to_original
-                        self.org_files_loaded.add(module_name)  # Mark that we're using org file
-                    else:
-                        file_to_parse = module_file_path
-                    #file_to_parse = path_to_original if os.path.exists(path_to_original) else module_file_path
-
-                    # Get or parse the module tree
-                    if module_name in self.parsed_modules:
-                        module_tree = self.parsed_modules[module_name]
-                    else:
-                        module_tree = self.processor.parse_fortran_file(file_to_parse)
-                        self.parsed_modules[module_name] = module_tree
-
-                    # Search for the subroutine in this module
-                    for sub in walk(module_tree, F23.Subroutine_Subprogram):
-                        subroutine_stmt = walk(sub, F23.Subroutine_Stmt)[0]
-
-                        # Extract subroutine name from statement
-                        for child in subroutine_stmt.children:
-                            if isinstance(child, F23.Name):
-                                current_sub_name = child.tostr()
-                                if current_sub_name == subroutine_name:
-                                    self.processor.logger.info(
-                                        "Found subroutine '%s' in file: %s",
-                                        subroutine_name,
-                                        module_file_path
-                                    )
-                                    
-                                    if not os.path.exists(path_to_original):
-                                        shutil.copy(module_file_path, path_to_original)
-                                        self.processor.logger.info(
-                                                "Created backup of original file: %s",
-                                                path_to_original
-                                                )
-                                    else:
-                                        self.processor.logger.info(
-                                                "Backup file already exists: %s",
-                                                path_to_original
-                                                )
-                                    return True, module_file_path, module_tree
-
-                # If not found in current directory, move up one level
-                parent_dir = os.path.dirname(search_dir)
-                if parent_dir == search_dir:  # Reached root directory
-                    break
-                search_dir = parent_dir
-
-            self.processor.logger.warning(
-                "Subroutine '%s' not found in directory hierarchy starting from: %s",
-                subroutine_name,
-                current_dir
-            )
-            return False, None, None
-
-        except Exception as e:
-            self.processor.logger.error(
-                "Error searching for subroutine '%s': %s",
-                subroutine_name,
-                str(e)
-            )
-            return False, None, None
 
     def find_subroutines(self):
         """
@@ -210,7 +133,7 @@ class Extractor:
         #for sub in walk(self.module_tree, F23.Subroutine_Subprogram):
         while module_subroutines_queue:
             sub = module_subroutines_queue.popleft()
-            subroutine_key, arg_list = None, None
+            subroutine_key, dummy_arg_list = None, None
 
             # Extract the main subroutine statement
             subroutine_stmt = walk(sub, F23.Subroutine_Stmt)[0]
@@ -283,18 +206,12 @@ class Extractor:
                         self.call_within_sub[subroutine_key][call_name].append(item) #.add(call_name)
                         if call_name not in module_subroutines_avail:
                             self.processor.logger.warning(
-                                "Subroutine '%s' calls '%s' which is not defined in current module",
-                                subroutine_key,
-                                call_name
-                            )
+                                f"Subroutine '{subroutine_key}' calls '{call_name}' which is not defined in current module")
                             self.external_subroutines.add(call_name)
-                            found, module_file_path, module_tree = self.search_subroutine_in_directory(call_name,  current_module_name, self.module_dir)
+                            found, module_file_path, module_tree = self.procedure_search.search_subroutine_in_dependencies(call_name, current_module_name, self.module_dir)
                             if found:
                                 self.processor.logger.info(
-                                        "Found external subroutine '%s' in file: %s, adding to processing queue",
-                                        call_name,
-                                        module_file_path
-                                        )
+                                        f"Found external subroutine '{call_name}' in file: {call_name}, adding to processing queue")
                                 # Add the found subroutine to the right end of the queue for processing
                                 all_subroutines_in_module = walk(module_tree, F23.Subroutine_Subprogram)
                                 for subroutine_subprogram in all_subroutines_in_module:
@@ -375,7 +292,6 @@ class Extractor:
             # Compute read/write once
             is_write = any(var_name == node.tostr() for node in walk(lhs_expr, F23.Name))
             is_read = any(var_name == node.tostr() for node in walk(rhs_expr, F23.Name))
-
             # Only process if this is a dummy argument
             if var_name in dummy_arg_list:
 
@@ -429,7 +345,7 @@ class Extractor:
                         usage[var_name]['first_use_assign'] = child
 
                 # CHECK IF VARIABLE IS IN ARRAY SUBSCRIPT (read-only context)
-                if isinstance(name.parent, F23.Section_Subscript_List):
+                if isinstance(name.parent, (F23.Section_Subscript_List, F23.Subscript_Triplet)):
                     # Array subscripts are always read-only usage
                     if usage[var_name]['intent'] is None:
                         usage[var_name]['intent'] = 'IN'
@@ -797,7 +713,7 @@ class Extractor:
                     if isinstance(subroutine_tree, F23.Subroutine_Subprogram):
                         shape_finder = Shaper(self.module_dir, self.parsed_modules, self.module_path,\
                                 self.dummy_arg_list, self.actual_arg_spec_list, \
-                                self.call_subroutines)
+                                self.call_subroutines, logger=self.logger)
                         explicit_node = shape_finder.shaper_subroutine(node, subroutine_key)
                         self.processor.logger.info(f"An explicit similar declaration is found: {explicit_node}")
                         node = self.processor.map_declaration(node, explicit_dec=explicit_node, dimensions=None)
@@ -808,7 +724,7 @@ class Extractor:
 
                     elif isinstance(subroutine_tree, F23.Function_Subprogram):
                         assert parent_subroutine_key is not None, "Error: 'parent_subroutine_key' must not be None."
-                        shape_finder = Shaper(self.module_dir, self.parsed_modules, self.module_path, self.dummy_arg_list)
+                        shape_finder = Shaper(self.module_dir, self.parsed_modules, self.module_path, self.dummy_arg_list, logger=self.logger)
                         node = shape_finder.shaper_function(node, subroutine_tree, subroutine_key, self.all_array_info[parent_subroutine_key])
                         self.processor.logger.info(f"An explicit similar declaration is found: {node}")
                         entity_decl = walk(node, F23.Entity_Decl)[0].tostr()
@@ -817,7 +733,7 @@ class Extractor:
                 if intrinsic_name:
                     self.processor.logger.warning(f"Intrinsic name detected in the declaration {node}")
                     if isinstance(subroutine_tree, F23.Function_Subprogram):
-                        shape_finder = Shaper(self.module_dir, self.parsed_modules, self.module_path, self.dummy_arg_list)
+                        shape_finder = Shaper(self.module_dir, self.parsed_modules, self.module_path, self.dummy_arg_list, logger=self.logger)
                         node = shape_finder.shaper_intrinsic_size(node)
                         self.processor.logger.info(f"An explicit similar declaration is found: {node}")
                         #node = nodes
@@ -909,11 +825,11 @@ class Extractor:
                             self.var_in_local[subroutine_key].add(name)
                             
                 except Exception as e:
-                    self.processor.logger.error(f"Error processing declaration statement: {node.tostr()}")
+                    self.processor.logger.exception(f"Error processing declaration statement: {node.tostr()}", e)
                     raise
                     
         except Exception as e:
-            self.processor.logger.error(f"Error extracting local variables for '{subroutine_key}': {e}")
+            self.processor.logger.exception(f"Error extracting local variables for '{subroutine_key}': ", e)
             raise
 
     def extract_modified_variables(self, subroutine_key, subroutine_tree):
@@ -951,7 +867,7 @@ class Extractor:
                             f"in statement: {assign_stmt.tostr()}"
                         )
                 except Exception as e:
-                    self.processor.logger.error(f"Error processing assignment statement: {assign_stmt.tostr()}")
+                    self.processor.logger.exception(f"Error processing assignment statement: {assign_stmt.tostr()}", e)
                     raise
 
             # Process global declarations for modified variables info
@@ -988,11 +904,11 @@ class Extractor:
                                     if is_var_modified:
                                         self.var_modif_info[subroutine_key][entity_decl].append('DIMENSION')
                                 except Exception as e:
-                                    self.processor.logger.error(f"Error processing ALLOCATABLE declaration for {entity_decl}")
+                                    self.processor.logger.exception(f"Error processing ALLOCATABLE declaration for {entity_decl}", e)
                                     raise
 
                     except Exception as e:
-                        self.processor.logger.error(f"Error processing global declaration item: {item}")
+                        self.processor.logger.exception(f"Error processing global declaration item: {item}", e)
                         raise
 
             # Process dummy arguments for var_modif_info
@@ -1012,7 +928,7 @@ class Extractor:
                         if walk(item, F23.Explicit_Shape_Spec):
                             self.var_modif_info[subroutine_key][entity_decl].append('DIMENSION')
                 except Exception as e:
-                    self.processor.logger.error(f"Error processing dummy argument item: {item}")
+                    self.processor.logger.exception(f"Error processing dummy argument item: {item}", e)
                     raise
 
             # Sort the var_modif_info for consistency
@@ -1021,11 +937,11 @@ class Extractor:
                     sorted_inner = sorted(self.var_modif_info[subroutine_key].items())
                     self.var_modif_info[subroutine_key] = defaultdict(list, sorted_inner)
                 except Exception as e:
-                    self.processor.logger.error(f"Error sorting var_modif_info for '{subroutine_key}': {e}")
+                    self.processor.logger.exception(f"Error sorting var_modif_info for '{subroutine_key}': ", e)
                     raise
 
         except Exception as e:
-            self.processor.logger.error(f"Error extracting modified variables for '{subroutine_key}': {e}")
+            self.processor.logger.exception(f"Error extracting modified variables for '{subroutine_key}':", e)
             raise
 
     def find_global_variables(self, module_dir, module_tree, var_global, subroutine_key):
@@ -1092,13 +1008,13 @@ class Extractor:
                 #any_initialization
                 var_initial = walk(walk(cached_data, F23.Initialization), F23.Name)
                 if var_initial:
-                    self.processor.logger.warning("Attention: there are additional variables to search: %s", var_initial)
-                    self.processor.logger.warning("In the directory: %s", module_dir)
+                    self.processor.logger.warning(f"Attention: there are additional variables to search: {var_initial}")
+                    self.processor.logger.warning(f"In the directory: {module_dir}")
                     ffile = walk(module_tree, F23.Name)[0].string
-                    self.processor.logger.warning("In the module: %s", ffile)
+                    self.processor.logger.warning(f"In the module: {ffile}")
                     self.find_global_variables(module_dir, module_tree, var_initial, subroutine_key)
                 continue
-            self.finder = Navigator(module_dir, module_tree, self.parsed_modules, self.module_path)
+            self.finder = Navigator(module_dir, module_tree, self.parsed_modules, self.module_path, logger=self.logger)
             if declaration not in self.external_subroutines:
                 self.processor.logger.info(f"⏳... Searching for variable '{declaration}'")
                 self.finder.variable_finder(declaration)
@@ -1112,11 +1028,12 @@ class Extractor:
                         assert module_name in self.module_path, \
                                 f"Module '{module_name}' not found in module_path. Available modules: {list(self.module_path.keys())}"
                         current_module_path = self.module_path[module_name]
-                        path_to_original = current_module_path.replace('.f90', '_org.f90').replace('.F90', '_org.F90')
+                        path_to_original = current_module_path.replace('.f90', '_org.fgpt').replace('.F90', '_org.Fgpt')
                         if os.path.exists(path_to_original) and module_name not in self.org_files_loaded:
                             self.processor.logger.info(f"Loading original file for function '{declaration}': {path_to_original}")
                             original_module_tree = self.processor.parse_fortran_file(path_to_original)
                             self.parsed_modules[module_name] = original_module_tree
+                            self.module_path[module_name] = current_module_path
                             self.org_files_loaded.add(module_name)
                             # Search for the function in the original file
                             for sub in walk(original_module_tree, F23.Function_Subprogram):
@@ -1142,10 +1059,10 @@ class Extractor:
                                 )
                         
                         assert isinstance(function_subprogram, F23.Function_Subprogram), (
-                                f"Expected type 'F23.Function_Subprogram', but got '{type(values[0]).__name__}' instead.")
+                                f"Expected type 'F23.Function_Subprogram', but got '{type(function_subprogram).__name__}' instead.")
 
                         assert isinstance(function_name, F23.Name), (
-                                f"Expected type 'F23.Name', but got '{type(values[0]).__name__}' instead."
+                                f"Expected type 'F23.Name', but got '{type(function_name).__name__}' instead."
                                 )
                         self.subroutines[function_name.tostr()] = function_subprogram
                         self.extract_function_dummy_args(function_subprogram)
@@ -1156,10 +1073,10 @@ class Extractor:
                     self.processor.logger.error(f"Variable '{declaration}' is not found in any child modules.")
                     raise
                 if self.finder.var_initial:
-                    self.processor.logger.warning("Attention: there are additional variables to search: %s", self.finder.var_initial)
-                    self.processor.logger.warning("In the directory: %s", self.finder.module_dir_sc)
+                    self.processor.logger.warning(f"Attention: there are additional variables to search: '{self.finder.var_initial}'")
+                    self.processor.logger.warning(f"In the directory: '{self.finder.module_dir_sc}'")
                     ffile = walk(self.finder.module_tree_sc, F23.Name)[0].string
-                    self.processor.logger.warning("In the module: %s", ffile)
+                    self.processor.logger.warning(f"In the module: '{ffile}'")
                     self.find_global_variables(self.finder.module_dir_sc, self.finder.module_tree_sc, self.finder.var_initial, subroutine_key)
             elif declaration in self.external_subroutines:
                 self.processor.logger.info("⏳... Searching for procedure '{declaration}'")
@@ -1204,7 +1121,7 @@ class Extractor:
                                     "In extract_all_array_info: failed to combine_allocate_declaration!"
                                 normalized_arrays.append(declaration_stmt)
                     except Exception as e:
-                        self.processor.logger.error(f"Error processing global declaration in extract_all_array_info: {item}")
+                        self.processor.logger.exception(f"Error processing global declaration in extract_all_array_info: {item}", e)
                         raise
 
             # Process dummy arguments
@@ -1220,7 +1137,7 @@ class Extractor:
                     else:
                         normalized_scalars.append(item)
                 except Exception as e:
-                    self.processor.logger.error(f"Error processing dummy argument in extract_all_array_info: {item}")
+                    self.processor.logger.exception(f"Error processing dummy argument in extract_all_array_info: {item}", e)
                     raise
 
             # Process local variables
@@ -1232,7 +1149,7 @@ class Extractor:
                     else:
                         normalized_scalars.append(item)
                 except Exception as e:
-                    self.processor.logger.error(f"Error processing local variable in extract_all_array_info: {item}")
+                    self.processor.logger.exception(f"Error processing local variable in extract_all_array_info: {item}", e)
                     raise
 
             # Extract dimension information
@@ -1251,11 +1168,11 @@ class Extractor:
                             raise ValueError(f"Invalid dimension format: {dim.tostr()}")
                     self.all_array_info[subroutine_key][array_name] = [part for part in current_var_info]
                 except Exception as e:
-                    self.processor.logger.error(f"Error processing array dimension info for item: {item}")
+                    self.processor.logger.exception(f"Error processing array dimension info for item: {item}", e)
                     raise
 
         except Exception as e:
-            self.processor.logger.error(f"Error in extract_all_array_info for '{subroutine_key}': {e}")
+            self.processor.logger.exception(f"Error in extract_all_array_info for '{subroutine_key}': ", e)
             raise
 
     def process_declaration_variables(self, items, subroutine_key):
@@ -1332,6 +1249,157 @@ class Extractor:
                                     ):
                                 self.scalar_variables[subroutine_key].append(name)
                                 seen.add(name.string)
+    
+    def organize_code_components(self, subroutine_key, input_dict, openacc=False):
+        try:
+            var_modif = self.var_modif_info[subroutine_key]
+            # Initialize result dictionary to store all processed components
+            result = {
+                    'add_to_module': [],           # Declarations to add to module section
+                    'add_to_routin': [],           # Allocation statements for routine body
+                    'add_to_usestm': [],           # Collected USE statements
+                    'acc_declare_create': [],      # Variables for OpenACC CREATE directive
+                    'acc_declare_copyin': [],      # Variables for OpenACC COPYIN directive
+                    'reads_non_allocatables': [],  # Read statements for declaration routine
+                    'reads_allocatables': [],      # Read statements for read routine
+                    'write_stmt': []               # Write statements for file output
+                    }
+            # Process each variable in the input dictionary
+            for key in sorted(input_dict):
+                var_in_modif = key in var_modif  # Check if variable is modified
+                # Process each declaration item for this variable
+                for item in input_dict[key]:
+                    is_dec_stmt = isinstance(item, F23.Type_Declaration_Stmt)
+                    is_alo_stmt = isinstance(item, F23.Allocate_Stmt)
+                    is_use_stmt = isinstance(item, F23.Use_Stmt)
+                    
+                    # Handle type declaration statements
+                    if is_dec_stmt:
+                        # Add to module declarations, with OpenACC processing if needed
+                        result['add_to_module'].append(
+                                self.processor.add_entity_to_declaration(item, var_modif)
+                                if var_in_modif and openacc
+                                else item
+                                )
+                        # Extract declaration components
+                        all_entity_names = walk(item, F23.Entity_Decl)
+                        initialized = walk(item, F23.Initialization)
+                        attr_spec = walk(item, F23.Attr_Spec)
+                        # Process uninitialized variables
+                        if not initialized:
+                            # Add to OpenACC create list if OpenACC is enabled
+                            for entity_name in all_entity_names:
+                                if openacc:
+                                    result['acc_declare_create'].append(entity_name.tostr())
+                            # Categorize based on whether variable is allocatable
+                            if F23.Attr_Spec('ALLOCATABLE') not in attr_spec:
+                                result['reads_non_allocatables'].append(item)
+                            else:
+                                # Combine allocate and declaration for allocatable arrays
+                                combined = self.processor.combine_allocate_declaration(input_dict[key])
+                                result['reads_allocatables'].append(combined)
+                        else:
+                            # Add initialized variables to OpenACC copyin list
+                            if openacc:
+                                for entity_name in all_entity_names:
+                                    for child in entity_name.children:
+                                        if isinstance(child, F23.Name):
+                                            result['acc_declare_copyin'].append(child.tostr())
+
+                    # Handle allocation statements
+                    if is_alo_stmt:
+                        for allocation_stmt in self.processor.add_entity_to_allocation(item, var_modif, openacc):
+                            result['add_to_routin'].append(allocation_stmt.children[0])
+
+                    # Handle USE statements
+                    if is_use_stmt:
+                        result['add_to_usestm'].append(item)
+
+            # Post-process the collected items
+            result['add_to_module'] = self.processor.remove_intent_and_save(result['add_to_module'])
+            result['add_to_module'] = self.processor.process_queue(result['add_to_module'])
+
+            result['reads_non_allocatables'] = self.processor.remove_intent_and_save(result['reads_non_allocatables'])
+            read_list, write_stmt = self.generated_wr_statement(result['reads_non_allocatables'])
+            result['reads_non_allocatables'] = read_list
+            result['write_stmt'].extend(write_stmt)
+
+            read_list, write_stmt = self.generated_wr_statement(result['reads_allocatables'])
+            result['reads_allocatables'] = read_list
+            result['write_stmt'].extend(write_stmt)
+
+            # Create OpenACC directive commands if OpenACC is enabled
+            if result['acc_declare_copyin']:
+                acc_declare_copyin_str = ', '.join(result['acc_declare_copyin'])
+                result['acc_declare_copyin_cmd'] = self.processor.parse_fortran_comment(f"!$ACC DECLARE COPYIN({acc_declare_copyin_str})")
+
+            if result['acc_declare_create']:
+                acc_declare_create_str = ', '.join(result['acc_declare_create'])
+                result['acc_declare_create_cmd'] = self.processor.parse_fortran_comment(f"!$ACC DECLARE CREATE({acc_declare_create_str})")
+                result['acc_update_device_cmd'] = self.processor.parse_fortran_comment(f"!$ACC UPDATE DEVICE({acc_declare_create_str})")
+
+            self.processor.logger.info("Declarations and allocations processed successfully")
+            return result
+
+        except Exception as e:
+            self.processor.logger.exception(f"Failed to process declarations and allocations, Error: ", e)
+            raise
+
+    def generated_wr_statement(self, items):
+        """
+        """
+        try:
+            read_list = []    # Generated read statements for variable initialization
+            write_stmt= []
+            items_sep = []
+            # Separate multi-variable declarations into individual declarations
+            for item in items:
+                if len(walk(item, F23.Entity_Decl)) > 1:
+                    node_list = self.processor.separate_entity_declarations(item)
+                    items_sep.extend(node_list)
+                else:
+                    items_sep.append(item)
+
+            # Generate I/O statements for each declaration
+            for item in items_sep:
+                init = True
+                intent = walk(item, F23.Intent_Spec)
+
+                # Skip initialization for OUT intent variables
+                if F23.Intent_Spec('OUT') in intent:
+                    init = False
+
+                # Extract variable name from declaration
+                var_name = None
+                for child in item.children:
+                    if isinstance(child, F23.Entity_Decl_List):
+                        var_name = child.tostr()
+                        break  # Found the variable name, no need to continue
+
+                # Assert that var_name was successfully extracted
+                assert var_name is not None, f"Failed to extract variable name from declaration: {item}"
+
+                # Generate read/write statements for variables that need initialization
+                if init:
+                    # Create read statement with error handling
+                    code_template = f"""
+                    read(1363, iostat = ier){var_name}
+                    if (ier /= 0) then
+                    write(*,*) 'Error reading from file for {var_name}. ',' IOSTAT : ', ier
+                    endif
+                    """
+                    read_list.append(self.processor.parse_fortran_statement(code_template))
+
+                    # Create corresponding write statement
+                    write_stmt.append(F23.Write_Stmt(f"write(1363){var_name}"))
+
+            self.processor.logger.info("Processing initialization completed!")
+            return read_list, write_stmt
+
+        except Exception as e:
+            self.processor.logger.exception(f"Error processing initialization: ", e)
+            raise
+
 
 '''if __name__ == "__main__":
     import unittest
