@@ -192,7 +192,7 @@ class Isolator:
         #        openacc=self.openacc
         #        )
 
-        input_dict = cls.organize_code_components(
+        self.input_dict = cls.organize_code_components(
                 child_procedure, 
                 cls.dec_global[child_procedure], 
                 openacc=self.openacc
@@ -208,7 +208,7 @@ class Isolator:
 
         #file_path = os.path.join(subroutine_dir, self.module_global_file)
         self.processor.update_global_module(
-                input_dict, 
+                self.input_dict, 
                 subroutine_dir,
                 child_procedure,
                 procedure_tree,
@@ -235,13 +235,13 @@ class Isolator:
             decleration_name, decleration_list = self.processor.break_allocatable_declaration(decleration)
             dec_dummy[child_procedure][decleration_name] = decleration_list
 
-        input_dict = cls.organize_code_components(
+        self.input_dict = cls.organize_code_components(
                 child_procedure,
                 dec_dummy[child_procedure],
                 openacc=self.openacc
                 )
         self.processor.update_main_program(
-                input_dict=input_dict,
+                input_dict=self.input_dict,
                 call_stmts=call_stmts,
                 var_modif=cls.var_modif_info[child_procedure],
                 subroutine_dir=subroutine_dir,
@@ -281,12 +281,16 @@ class Isolator:
                     out_dict[child_key] = child_value
 
     def process_subroutines(self):
+        self.logger.start_task('Procedure Isolation/Transformation',
+                               description="Isolation and Transformation of procedures through FGPT",
+                               target_module = self.target_module)
+        
         cls = Extractor(self.module_dir_sp, self.module_tree_cp, self.logger)
         cls.module_path[self.target_module] = self.path_to_target
         cls.parsed_modules[self.target_module] = self.module_tree_cp
         cls.find_subroutines()
-        transformer = Transformer("/home/kardaneh/Fgpt/benchmark",self,cls,None,config_path = "/home/kardaneh/Fgpt/template.yaml",logger=self.logger)
-
+        transformer = Transformer("/home/ssivanes/Fgpt/benchmark",self,cls,None,config_path = "/home/ssivanes/Fgpt/template.yaml",logger=self.logger)
+        self.isolate_procedure = self.logger.log_event('Isolate_procedure')(self.isolate_procedure)
         # Process each parent subroutine and its children
         grand_parent_procedure = "hydrol_main"
         parent_procedure = "hydrol_main"
@@ -321,10 +325,10 @@ class Isolator:
         self.process_subroutines()
 
 if __name__ == "__main__":
-    rest_of_path = "modipsl_truck_opt/modeles/ORCHIDEE/src_sechiba/"
+    rest_of_path = "/data/ssivanes/modipsl_truck_opt/modeles/ORCHIDEE/src_sechiba/"
     target_modules = ["hydrol", "explicitsnow", "condveg"]
     target_module =  target_modules[0]
-    work = os.getenv("works")
+    work = os.getenv("work")
     openacc = False
     isolator = Isolator(rest_of_path, target_module, work, openacc)
     isolator.run()

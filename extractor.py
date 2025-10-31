@@ -1047,8 +1047,7 @@ class Extractor:
                         elif not os.path.exists(path_to_original):
                             shutil.copy(current_module_path, path_to_original)
                             self.processor.logger.info(
-                                    "Created backup of original file: %s",
-                                    path_to_original)
+                                    f"Created backup of original file: {path_to_original}")
                         parent = self.processor.find_enclosing_parent(var, F23.Assignment_Stmt)
                         self.processor.logger.info(f"The global {declaration} used in {parent} is a Function_Subprogram.")
                         self.call_subroutines[declaration].append(parent)
