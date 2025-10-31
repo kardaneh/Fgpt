@@ -681,7 +681,23 @@ class F2NP:
                             control_stack.pop()
 
                     elif isinstance(child, F23.Return_Stmt):
-                        pass 
+                        args = []
+                        for child in child.children:
+                            if child:
+                                args.append(self.handle_expr(child))
+
+                        if args:
+                            if len(args) == 1:
+                                stmt = ast.Return(value= args[0])
+                            else:
+                                stmt = ast.Return(value=ast.Tuple(elts = args))
+                        else:
+                            stmt = ast.Return()
+                            
+                        if counters["do"] == 0 and counters["if"] == 0:
+                            module_stack.append(stmt)
+                        else:
+                            self.append_to_current_parent(stmt, control_stack)
                     else:   
                         self.recursive_ast(child, ast_mode=ast_mode, control_stack=control_stack,counters=counters,module_stack=module_stack)
                 

@@ -605,7 +605,7 @@ class Transformer:
                 parsed_ast =  ast.parse(code_template).body[0]
                 return parsed_ast 
             except SyntaxError as e:
-                self.logger.log_error(f"Syntax error while parsing the timer template: {e}")
+                self.logger.error(f"Syntax error while parsing the timer template: {e}")
                 raise
         except Exception:
             self.logger.exception(f"Exception occurred in get_timer")
@@ -690,8 +690,7 @@ class Transformer:
                         if not any(arg.arg == instance_name for arg in function_def.args.args):
                             function_def.args.args.append(ast.arg(arg=instance_name))
 
-                call_indices = defaultdict(int)
-                method_main_source = False # This is just ensure that we are not in the class and but in the main file with functions 
+                call_indices = defaultdict(int) 
                 # walk through and modify function call nodes(subroutines that are called inside other subroutines/functions) if present inside the current subroutine since the 
                 # called subrotuine has been already modified
                 for node in ast_walk(function_def, ast.Call):
@@ -746,7 +745,7 @@ class Transformer:
                             node.args = args
 
                         except (IndexError, KeyError) as e:
-                            self.logger.log_error(f"Error mapping arguments for expr to '{func_name}' at index {i}:", e)
+                            self.logger.error(f"Error mapping arguments for expr to '{func_name}' at index {i}:", e)
                             
                 scalar_variables = set()
                 func_name = function_def.name 
@@ -923,7 +922,8 @@ class Transformer:
         """
         self.variable_order = []
         try:
-            for read_dec in [self.isolator.processor.reads_in_decleration_routine,self.isolator.processor.reads_in_read_routine]:
+            combined = self.isolator.input_dict['reads_non_allocatables'] + self.isolator.input_dict['reads_allocatables']
+            for read_dec in combined:
                 read_stmt = walk(read_dec,F23.Input_Item_List)
                 for item in read_stmt:
                     self.variable_order.append(item.children[0].string)
@@ -1875,7 +1875,7 @@ class Transformer:
                             self.scalar.append(var)
                 else: # This is used to separate scalar present in the var_dummy based on their INTENT(IN,INOUT)
                     for dec_statement in self.extractor.var_dummy[subroutine_key]:
-                        if any(i.tostr() in ["IN", "INOUT"] for i in walk(dec_statement, F23.Intent_Spec)):
+                        if any(i.tostr() in ["IN", "INOUT","OUT"] for i in walk(dec_statement, F23.Intent_Spec)):
                             varname = self._is_scalar_var(dec_statement)
                             if varname:
                                 self.scalar.append(varname)
@@ -2316,7 +2316,7 @@ class Transformer:
                                 attr |= cls_info[key][instance_name].get('instances')[other_key].get('attributes')
 
                 except (IndexError, KeyError, TypeError) as e:
-                    self.logger.log_error(f"Error accessing attributes for key '{key}':", e)
+                    self.logger.error(f"Error accessing attributes for key '{key}':", e)
                     raise
 
                 type_ = {"REAL": "float64",
@@ -2351,7 +2351,7 @@ ffile = FortranFile(path, 'r')
                     code = code.format(benchmark_dir=self.benchmark_dir, subroutine_name=subroutine_key)
                     tree = ast.parse(code).body
                 except (SyntaxError, KeyError) as e:
-                    self.logger.log_error(f"Error in formatting/parsing test function body:", e)
+                    self.logger.error(f"Error in formatting/parsing test function body:", e)
                     raise
 
                 function_def.body = tree 
@@ -2411,7 +2411,7 @@ ffile = FortranFile(path, 'r')
                     for_loop.body = core_step
 
                 except SyntaxError as e:
-                    self.logger.log_error(f"Syntax error while parsing the code template:",e)
+                    self.logger.error(f"Syntax error while parsing the code template:",e)
                     raise
 
                 # Now we append the modif_var_list and the for loop inside the test function 
@@ -2809,7 +2809,6 @@ ffile = FortranFile(path, 'r')
                 raise ValueError(f'Code template is None')
             
             self.retreive_variable_order()
-            
             self.pre_init_variables(code_template)
 
             # 2. Retrieve all the assignement python ast statements as well procesdure nodes(USE) for the global declarations
@@ -2907,7 +2906,7 @@ ffile = FortranFile(path, 'r')
             
     ############################################################################################ Main python ############################################################################################
 
-    def prepare_read_code_for_main_template(self, var_dummy:List,assign_nodes:List[ast.AST],subroutine_key:str) -> ast.FunctionDef:
+    def prepare_read_code_for_main_template(self,assign_nodes:List[ast.AST],subroutine_key:str) -> ast.FunctionDef:
         """
         Prepare the `read_dummy` method by considering local variables declared in the main file, 
         global attributes it depends on, variables that need to be returned and updated, 
@@ -2915,8 +2914,6 @@ ffile = FortranFile(path, 'r')
 
         Parameters
         ----------
-        var_dummy : list
-            List containing the argument names to be passed to the `read_dummy` function.
         assign_nodes : list of ast.AST
             List of AST assignment nodes that need to be initialized inside the function.
 
@@ -2955,15 +2952,12 @@ ffile = FortranFile(path, 'r')
                 raise ValueError("No FunctionDef found in read_ast")
             
             dummy_list = []
-            for node in var_dummy:
-                intent_spec = walk(node,F23.Intent_Spec)
-                if not F23.Intent_Spec('OUT') in intent_spec:
-                    var_name = walk(walk(node,F23.Entity_Decl),F23.Name)[0]
-                    arg_var = ast.arg(arg = var_name.string)
-                    function_def.args.args.append(arg_var)
-                    # We retrieve only the the input elements 
-                    dummy_list.append(node)
-            
+            for node in self.variable_order:
+                arg_var = ast.arg(arg = node)
+                function_def.args.args.append(arg_var)
+                # We retrieve only the the input elements 
+                dummy_list.append(node)
+
             self.separate_scalar(subroutine_key=subroutine_key) # THis will allows us to retrieve the scalars and boolean varaibles 
             # Now we retrieve only the scalars following the order that is present in transformer.scalar 
             assign_map = {}
@@ -2976,7 +2970,6 @@ ffile = FortranFile(path, 'r')
             var_list = self.read_file_ast(nodes) # This will get the read stateemnt for scalars, boolean
             # BEfore adding this we need to verify that within the var_dummy that the scalars/booleans elements are read first and then the arrays
             # To do so we will check the position of these scalars/boolean among the arrays, in the case that they aren't read in this manner, need to take into account the reading positions
-            dummy_var = [var.string for var in walk(dummy_list,F23.Entity_Decl)]
             arrays_to_add = []
             seen_arrays = set()
             seen_scalars = set()
@@ -2984,13 +2977,13 @@ ffile = FortranFile(path, 'r')
                 
             # Get index of each scalar in dummy_var to determine order in which these scalar are present inside the dummyvar as such we also
             # need to handle the cases in which the arrays might be at different indexes. 
-            scalar_positions = [(scalar, dummy_var.index(scalar)) for scalar in self.scalar if scalar in dummy_var]
+            scalar_positions = [(scalar, self.variable_order.index(scalar)) for scalar in self.scalar if scalar in self.variable_order]
             
             var_pos = next((i for i, node in enumerate(ast.iter_child_nodes(read_ast)) if isinstance(node, ast.For)), 0) - 1
             
             for scalar_name, scalar_pos in scalar_positions:
                 # Get all arrays before this scalar that which are not present in the self.scalar and have not been previously seen/already read. 
-                arrays_before_scalar = [name for name in dummy_var[:scalar_pos] if name not in self.scalar and name not in seen_arrays]
+                arrays_before_scalar = [name for name in self.variable_order[:scalar_pos] if name not in self.scalar and name not in seen_arrays]
                 # FIrst we add the arrays onto the read_ast 
                 for assign in assign_nodes:
                     target = assign.targets[0]
@@ -3035,9 +3028,8 @@ ffile = FortranFile(path, 'r')
             # EXCEPTIONAL CASE: in which all the arrays and scalars are being read line by line due to a scalar at the end of var dummy, we don't need the for loop
             # anymore thus could be removed or the fact we only have one element to read which could be just a scalar or boolean. 
 
-            variables = [var.string for var in walk(dummy_list,F23.Entity_Decl)]
             table = self.scalar if not arrays_to_add else self.scalar + arrays_to_add
-            difference = [item for item in variables if item not in table]
+            difference = [item for item in dummy_list if item not in table]
             if difference:
                 for_node.iter.elts = [ast.Name(id = var,ctx = ast.Load()) for var in difference]
             else:
@@ -3082,6 +3074,7 @@ ffile = FortranFile(path, 'r')
             
             out_main_template = self.out_main_python()
 
+            self.retreive_variable_order()
             main_function_def = [function for function in ast_walk(out_main_template,ast.FunctionDef) if function.name == "main"]
             if main_function_def:
                 main_function_def = main_function_def[-1]
@@ -3138,7 +3131,7 @@ ffile = FortranFile(path, 'r')
             idx = len(main_function_def.body) 
             
             # 3. Now we need to get the read template for these declared variables within the main function perhaps add a dummy only in the case if the input is present
-            read_dummy_ast = self.prepare_read_code_for_main_template(self.extractor.var_dummy[subroutine_key],assign_nodes,subroutine_key=subroutine_key) # THis will create the read_dummy function in Python AST
+            read_dummy_ast = self.prepare_read_code_for_main_template(assign_nodes,subroutine_key=subroutine_key) # THis will create the read_dummy function in Python AST
             read_dummy_ast_call_stmt = self.create_call_statements(read_dummy_ast)
             if read_dummy_ast_call_stmt is None:
                 raise ValueError(f'Read_ast_call_stmt is None')
@@ -3210,7 +3203,7 @@ ffile = FortranFile(path, 'r')
     def run_python_scripts(self, base_dir:str,target_dir:str, mode:Literal['CPU','GPU'] = 'CPU'):
 
         if not os.path.isdir(target_dir):
-            self.logger.log_error(f"Target module directory '{target_dir}' not found.")
+            self.logger.error(f"Target module directory '{target_dir}' not found.")
 
         subdir_path = os.path.join(base_dir,target_dir)
         subdir = os.path.basename(subdir_path)
@@ -3256,6 +3249,6 @@ ffile = FortranFile(path, 'r')
             result = subprocess.run(['python3', main_file], check=True, capture_output=True, text=True)
             self.logger.info(f"Execution output for '{subdir}':\n{result.stdout}")
         except subprocess.CalledProcessError as e:
-            self.logger.log_error(f"Error running main.py for '{subdir}': ", e.stderr)
+            self.logger.error(f"Error running main.py for '{subdir}': ", e.stderr)
             return 
         

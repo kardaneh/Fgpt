@@ -410,7 +410,7 @@ class AdjustIndices(ast.NodeTransformer):
 
         unused = [v for v in loop_vars if v not in used_vars]
         if unused:
-            print(f"⚠️ Unused loop variable(s): {unused}")
+            print(f" ⚠️ Unused loop variable(s): {unused}")
 
             for var in unused:
                 self._rename_var_in_target(node.target, var, "_")
@@ -632,7 +632,10 @@ class AdjustIndices(ast.NodeTransformer):
                 return self.visit_Subscript(index_node)
     
             elif isinstance(index_node,ast.Constant):
-                return ast.Constant(value=index_node.value - 1)
+                if index_node.value == 0:
+                    return index_node
+                else:
+                    return ast.Constant(value=index_node.value - 1)
     
             elif isinstance(index_node,ast.Attribute):
                 if index_node.attr not in self.CONV_VARS and index_node.attr not in self.adjusted_vars:
