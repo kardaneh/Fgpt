@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+
+DATE=$(date +"%Y%m%d")
+TODAY=$(date +"%Y%m%d_%H%M%S")
+
+# Path configuration
+WORK_DIR="$works"  # Using environment variable
+REST_OF_PATH="modipsl_truck_opt/modeles/ORCHIDEE/src_sechiba/"
+TARGET_MODULE="hydrol"
+
+# Parent and target subroutines
+PARENT_SUBROUTINE="hydrol_main"
+TARGET_SUBROUTINES="hydrol_alma hydrol_vegupd hydrol_canop hydrol_flood hydrol_hydraulic_arch_tuzet_calc hydrol_soil explicitsnow_main"
+
+# Isolation options
+OPENACC="False"
+F2PY="True"
+TAPENADE="False"
+
+# Script Generation
+run_script="run_isolator.sh"
+
+# Run Script
+cat > $run_script <<EOF
+#!/usr/bin/env bash
+echo "Starting isolation: $TODAY"
+echo "Target module: $TARGET_MODULE"
+echo "Parent subroutine: $PARENT_SUBROUTINE"
+echo "Target subroutines: $TARGET_SUBROUTINES"
+echo "OpenACC: $OPENACC, F2PY: $F2PY, Tapenade: $TAPENADE"
+echo "=========================================="
+
+python isolator.py \\
+    --work "$WORK_DIR" \\
+    --rest_of_path "$REST_OF_PATH" \\
+    --target_module "$TARGET_MODULE" \\
+    --parent_subroutine "$PARENT_SUBROUTINE" \\
+    --target_subroutines $TARGET_SUBROUTINES \\
+    --openacc "$OPENACC" \\
+    --f2py "$F2PY" \\
+    --tapenade "$TAPENADE"
+
+echo "=========================================="
+echo "Isolation completed: \$(date)"
+EOF
+
+chmod +x $run_script
+
+# Output Summary
+echo "=== Isolator Setup Complete ==="
+echo "Target Module: $TARGET_MODULE"
+echo "Source Path: $REST_OF_PATH"
+echo "Work Directory: $WORK_DIR"
+echo "Parent Subroutine: $PARENT_SUBROUTINE"
+echo "Target Subroutines: $TARGET_SUBROUTINES"
+echo "Features - OpenACC: $OPENACC, F2PY: $F2PY, Tapenade: $TAPENADE"
+echo ""
+echo "Run script generated: ./$run_script"
+echo ""
+echo "To execute:"
+echo "  ./$run_script"
+echo ""
+echo "Or run directly with:"
+echo "  python isolator.py --rest_of_path \"$REST_OF_PATH\" --target_module \"$TARGET_MODULE\" --work \"$WORK_DIR\" --parent_subroutine \"$PARENT_SUBROUTINE\" --target_subroutines $TARGET_SUBROUTINES --openacc \"$OPENACC\" --f2py \"$F2PY\" --tapenade \"$TAPENADE\""

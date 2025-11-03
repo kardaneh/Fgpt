@@ -10,6 +10,8 @@ from fparser.two.utils import walk
 from fparser.two import Fortran2003 as F23
 from fparser.two import Fortran2008 as F28
 from logger import Logger
+import argparse
+
 class Isolator:
     """
     The Isolator class is designed to extract and prepare a Fortran procedure (e.g., subroutine or function)
@@ -60,12 +62,16 @@ class Isolator:
     used in conjunction with automatic input generation, test harness creation,
     or source-to-source translation routines.
     """
-    def __init__(self, rest_of_path, target_module, work, openacc=False, tapenade=False, f2py=False):
+    def __init__(self, 
+                 rest_of_path="modipsl_truck_opt/modeles/ORCHIDEE/src_sechiba/", 
+                 target_module="hydrol", 
+                 work=os.getenv("works"), 
+                 openacc=False,
+                 tapenade=False,
+                 f2py=False):
         self.logger = Logger()
         self.logger.show_header('Isolator')
         self.processor = Processor(logger=self.logger)
-        self.module_global_file = "module_global.f90"
-        self.main_program_file = "main.f90"
         self.rest_of_path = rest_of_path
         self.target_module = target_module
         self.scratch_dir = work
@@ -187,12 +193,6 @@ class Isolator:
         subroutine_dir = os.path.join(self.target_module_dir, child_procedure)
         os.makedirs(subroutine_dir)
         self.logger.info(f"📁 Created parent function directory: {subroutine_dir}")
-        
-        #self.processor.add_declarations(
-        #        cls.dec_global[child_procedure], 
-        #        cls.var_modif_info[child_procedure],
-        #        openacc=self.openacc
-        #        )
 
         self.input_dict = cls.organize_code_components(
                 child_procedure, 
@@ -208,7 +208,6 @@ class Isolator:
         for sub_name in self.collect_all_subroutines(cls, child_procedure):
             sub_trees.append(self.working_subroutines[sub_name])
 
-        #file_path = os.path.join(subroutine_dir, self.module_global_file)
         self.processor.update_global_module(
                 self.input_dict, 
                 subroutine_dir,
@@ -231,7 +230,6 @@ class Isolator:
         else:
             raise ValueError(f"Unsupported procedure type: {procedure_type}")
         
-        #file_path = os.path.join(subroutine_dir, self.main_program_file)
         call_stmts = [call_stmt_org]
 
         dec_dummy = defaultdict(lambda: defaultdict(list)) 
@@ -286,7 +284,8 @@ class Isolator:
                 if child_key not in out_dict:
                     out_dict[child_key] = child_value
 
-    def process_subroutines(self):
+    def process_subroutines(self, parent_subroutine="hydrol_main", target_subroutines=['hydrol_soil']):
+
         self.logger.start_task('Procedure Isolation/Transformation',
                                description="Isolation and Transformation of procedures through FGPT",
                                target_module = self.target_module)
@@ -302,48 +301,78 @@ class Isolator:
         else:
             self.logger.info("Skipping Transformer initialization as f2np is disabled.")
             transpy = None
-        self.isolate_procedure = self.logger.log_event('Isolate_procedure')(self.isolate_procedure)
-        # Process each parent subroutine and its children
-        grand_parent_procedure = "hydrol_main"
-        #parent_procedure = "hydrol_soil"
-        #children = ['hydrol_root_profile'] #cls.call_within_sub[parent_procedure]
-        #self.logger.info(f"Processing parent subroutine: '{parent_procedure}' with {len(children)} children")
-        # Process each child subroutine of this parent
-        #for child_procedure in children:
-        #    self.logger.info(f"  Isolating child subroutine: '{child_procedure}' (called from '{parent_procedure}')")
-        #    try:
-        #       # Pass both parent and child to access the specific call sites
-        #        self.isolate_procedure(cls, parent_procedure, child_procedure, transformer = transpy)
-        #        self.logger.info(f"  Successfully isolated child subroutine: '{child_procedure}'")
-        #    except Exception as e:
-        #        self.logger.error(f"  Failed to isolate child schild_procedureubroutine '{child_procedure}': {e}")
-        #        raise
+
+        for child_procedure in target_subroutines:
+            self.logger.info(f"  Isolating target subroutine: '{child_procedure}' (called from '{parent_subroutine}')")
+            self.isolate_procedure(cls, parent_subroutine, child_procedure, transformer = transpy)
         
         
-        for parent_procedure in [
-                'hydrol_alma', 
-                'hydrol_vegupd',
-                'hydrol_canop',
-                'hydrol_flood', 
-                'hydrol_hydraulic_arch_tuzet_calc', 
-                'hydrol_soil', 
-                'explicitsnow_main'
-                ]:
-            self.isolate_procedure(cls, grand_parent_procedure, parent_procedure, transformer = transpy)
-        
-        
-    def run(self):
+    def run(self, parent_subroutine="hydrol_main", target_subroutines=None):
+        self.logger.info(f"Starting isolation for target subroutines: {target_subroutines} from parent subroutine: {parent_subroutine}")
         self.create_target_directory()
-        self.process_subroutines()
+        self.process_subroutines(parent_subroutine=parent_subroutine, target_subroutines=target_subroutines)
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Fortran procedure isolator for FGPT")
+    
+    parser.add_argument("--rest_of_path", 
+                       type=str, 
+                       required=True,
+                       help="Relative path to the directory containing the target Fortran module")
+    
+    parser.add_argument("--target_module", 
+                       type=str, 
+                       required=True,
+                       help="Name of the module to be isolated (without .f90)")
+    
+    parser.add_argument("--work", 
+                       type=str, 
+                       required=True,
+                       help="Working directory root (typically environment variable like $works)")
+    
+
+    parser.add_argument("--parent_subroutine",
+                       type=str,
+                       default="hydrol_main",
+                       help="Name of the parent subroutine containing target subroutines")
+                           
+    parser.add_argument("--target_subroutines",
+                       type=str,
+                       nargs='+',
+                       default=['hydrol_alma', 'hydrol_vegupd', 'hydrol_canop', 'hydrol_flood', 
+                               'hydrol_hydraulic_arch_tuzet_calc', 'hydrol_soil', 'explicitsnow_main'],
+                       help="List of subroutines to isolate")
+    
+    parser.add_argument("--openacc",
+                       type=lambda x: x.lower() == "true",
+                       default=False,
+                       help="Enable OpenACC support (True/False)")
+    
+    parser.add_argument("--f2py",
+                       type=lambda x: x.lower() == "true", 
+                       default=False,
+                       help="Enable f2py Python conversion (True/False)")
+    
+    parser.add_argument("--tapenade",
+                       type=lambda x: x.lower() == "true",
+                       default=False,
+                       help="Enable Tapenade auto-differentiation (True/False)")
+    
+    return parser.parse_args()
 
 if __name__ == "__main__":
-    rest_of_path = "modipsl_truck_opt/modeles/ORCHIDEE/src_sechiba/"
-    target_modules = ["hydrol", "explicitsnow", "condveg"]
-    target_module =  target_modules[0]
-    work = os.getenv("works")
-    openacc = False
-    f2py = True
-    tapenade = False
-    isolator = Isolator(rest_of_path, target_module, work, openacc, tapenade, f2py)
-    isolator.run()
+    args = parse_args()
+    
+    isolator = Isolator(
+        rest_of_path=args.rest_of_path, 
+        target_module=args.target_module, 
+        work=args.work,
+        openacc=args.openacc,
+        tapenade=args.tapenade,
+        f2py=args.f2py)
+    
+    isolator.run(
+        parent_subroutine=args.parent_subroutine,
+        target_subroutines=args.target_subroutines
+    )
 
