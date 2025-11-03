@@ -136,7 +136,7 @@ class Logger:
                 try:
                     result = func(*args, **kwargs)
                 except Exception as e:
-                    self.log_error(f"Error in node '{node_name}'", e)
+                    self.error(f"Error in node '{node_name}'", e)
                     raise
                 else:
                     end_time = time.time()

@@ -1,5 +1,6 @@
 import logging
 import re, os
+import subprocess
 from fparser.two.utils import walk
 from fparser.two import Fortran2003 as F23
 from fparser.two import Fortran2008 as F28
@@ -892,12 +893,35 @@ class Processor:
             self.logger.exception(f"Failed to write code to file: {file_path}, Error: ", e)
             raise
 
+    def generate_adjoint_and_tangent(self, file_path, module_name):
+        """Run Tapenade to generate tangent and adjoint versions."""
+        base_name = os.path.splitext(os.path.basename(file_path))[0]
+        dir_name = os.path.dirname(os.path.abspath(file_path)) or "."
+
+        # Tapenade commands
+        tangent_cmd = [
+            "tapenade", "-d", file_path,
+            "-tangent", "-head", module_name,
+            "-tangentmodulename", f"{module_name}_tgt"
+        ]
+        adjoint_cmd = [
+            "tapenade", "-b", file_path,
+            "-adjoint", "-head", module_name,
+            "-adjmodulename", f"{module_name}_adj"
+        ]
+
+        # Run both commands
+        subprocess.run(tangent_cmd, cwd=dir_name, check=True)
+        subprocess.run(adjoint_cmd, cwd=dir_name, check=True)
+
+
     def update_global_module(self, 
             input_dict, 
             subroutine_dir, 
             subroutine_name, 
             procedure_tree, 
-            custom_subroutine_trees
+            custom_subroutine_trees,
+            auto_diff=False
             ):
         """
         """
@@ -976,6 +1000,8 @@ class Processor:
 
             self.logger.info("Successfully updated the global module")
             self.write_fortran_code_to_file(self.out_module, file_path)
+            if auto_diff:
+                self.generate_adjoint_and_tangent(file_path, f"module_global_{subroutine_name}")
             global_read_routine = self.generate_read_routine(subroutine_name, input_dict, bin_filename="global.bin", routine_name="declaration_initialization")
 
             for node in self.out_main.content:
@@ -1177,7 +1203,37 @@ class Processor:
         except Exception as e:
             self.logger.exception(f"Failed to update main program, Error: {e}")
             raise
-    
+
+    def remove_external_calls(self, block, allowed_external_subroutines):
+        """
+        Recursively remove all call statements to allowed external subroutines.
+
+        Parameters
+        ----------
+        block : F23.Base
+            The AST block to process
+        allowed_external_subroutines : set
+            Set of subroutine names that should be removed
+        """
+        if hasattr(block, "content"):
+            i = 0
+            while i < len(block.content):
+                child = block.content[i]
+                
+                if isinstance(child, F23.Call_Stmt):
+                    call_name = child.children[0].tostr().lower()
+                    if call_name in allowed_external_subroutines:
+                        # Remove the call statement
+                        block.content.pop(i)
+                        self.logger.info(
+                            f"Removed call to external subroutine '{call_name}'"
+                        )
+                        continue  # Don't increment i since we removed the current item
+                
+                # Recursively process child blocks
+                self.remove_external_calls(child, allowed_external_subroutines)
+                i += 1
+
     def remove_io_statements(self, block, unit_number=1363):
         """
         Recursively remove all OPEN, WRITE, CLOSE statements with specific unit number.
@@ -1425,7 +1481,7 @@ class Processor:
             self.logger.exception(f"Error in process_queue: {e}")
             raise
 
-    def compile_and_run(self, base_dir, target_dir, mode="CPU"):
+    def compile_and_run(self, base_dir, target_dir, mode="CPU", auto_diff=False):
         """
         """
         
@@ -1438,6 +1494,12 @@ class Processor:
 
         os.environ["SUBDIR_PATH"] = target_dir
         os.environ["MODE"] = mode
+
+        if auto_diff:
+            os.environ["AUTO_DIFF"] = "ENABLED"
+        else:
+            os.environ.pop("AUTO_DIFF", None)
+
         os.chdir(target_dir)
 
         os.system("make clean -f {}".format(os.path.join(base_dir, "Makefile")))

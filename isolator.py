@@ -60,7 +60,7 @@ class Isolator:
     used in conjunction with automatic input generation, test harness creation,
     or source-to-source translation routines.
     """
-    def __init__(self, rest_of_path, target_module, work, openacc):
+    def __init__(self, rest_of_path, target_module, work, openacc=False, tapenade=False, f2py=False):
         self.logger = Logger()
         self.logger.show_header('Isolator')
         self.processor = Processor(logger=self.logger)
@@ -80,6 +80,8 @@ class Isolator:
         self.module_tree_cp = self.processor.parse_fortran_file(file_to_parse)
         self.target_module_dir = os.path.join(os.getcwd(), self.target_module.split('.')[0])
         self.openacc = openacc
+        self.f2py = f2py
+        self.tapenade = tapenade
         self.working_subroutines = defaultdict()
         self.isolated_subroutines = set()
     
@@ -104,7 +106,7 @@ class Isolator:
         return collected
 
 
-    def isolate_procedure(self, cls, transformer, parent_procedure, child_procedure):
+    def isolate_procedure(self, cls, parent_procedure, child_procedure, transformer=None):
         
         call_statements =  cls.call_within_sub[parent_procedure][child_procedure] 
         
@@ -165,7 +167,7 @@ class Isolator:
                 self.logger.info(f"   {i}. {grand_child_procedure}")
                 if grand_child_procedure not in self.isolated_subroutines:
                     self.logger.info(f"🔄 Call recursively for '{grand_child_procedure}' from parent '{child_procedure}'")
-                    self.isolate_procedure(cls, transformer, child_procedure, grand_child_procedure)
+                    self.isolate_procedure(cls, child_procedure, grand_child_procedure, transformer = transformer)
                     self.collect_global_vars_decl(cls.dec_global[grand_child_procedure], cls.dec_global[child_procedure])
                 else:
                     self.logger.info(f"⏭️  Skipping '{grand_child_procedure}' - already isolated")
@@ -212,11 +214,13 @@ class Isolator:
                 subroutine_dir,
                 child_procedure,
                 procedure_tree,
-                sub_trees
+                sub_trees,
+                auto_diff=self.tapenade
                 )
-        
-        out_module = transformer.update_global_python(subroutine_key=child_procedure)
-        transformer.transfer_to_pyfile(out_module,child_procedure,folder_name = self.target_module)
+        if transformer is not None:
+            self.logger.info("Transforming global module to Python...")
+            out_module = transformer.update_global_python(subroutine_key=child_procedure)
+            transformer.transfer_to_pyfile(out_module,child_procedure,folder_name = self.target_module)
 
         arg_list = ', '.join([name for name in cls.dummy_arg_list[child_procedure]])
         
@@ -252,14 +256,16 @@ class Isolator:
                 error_flag=None,
                 acc_data_copyin=None
                 )
-        
-        main_tree = transformer.update_main_python(out_module=out_module,subroutine_key=child_procedure)
-        transformer.transfer_to_pyfile(main_tree,child_procedure,folder_name = self.target_module,python_file_type="main")
+        if transformer is not None:
+            self.logger.info("Transforming main program to Python...")
+            main_tree = transformer.update_main_python(out_module=out_module,subroutine_key=child_procedure)
+            transformer.transfer_to_pyfile(main_tree,child_procedure,folder_name = self.target_module,python_file_type="main")
 
-        error_status = self.processor.compile_and_run(os.getcwd(), subroutine_dir)
+        error_status = self.processor.compile_and_run(os.getcwd(), subroutine_dir, auto_diff=self.tapenade)
         assert error_status == 0, "Error: Compilation failed or main_program not generated."
 
-        transformer.run_python_scripts(os.getcwd(), subroutine_dir)
+        if transformer is not None:
+            transformer.run_python_scripts(os.getcwd(), subroutine_dir)
 
         write_module_tree = procedure_tree.get_root()
         write_module_name = walk(write_module_tree, F23.Module_Stmt)[0].children[1].tostr()
@@ -289,35 +295,41 @@ class Isolator:
         cls.module_path[self.target_module] = self.path_to_target
         cls.parsed_modules[self.target_module] = self.module_tree_cp
         cls.find_subroutines()
-        transformer = Transformer("/home/ssivanes/Fgpt/benchmark",self,cls,None,config_path = "/home/ssivanes/Fgpt/template.yaml",logger=self.logger)
+
+        if self.f2py:
+            self.logger.info("Initializing Transformer for Python conversion using f2np...")
+            transpy = Transformer("benchmark",self,cls,None,config_path = "template.yaml",logger=self.logger)
+        else:
+            self.logger.info("Skipping Transformer initialization as f2np is disabled.")
+            transpy = None
         self.isolate_procedure = self.logger.log_event('Isolate_procedure')(self.isolate_procedure)
         # Process each parent subroutine and its children
         grand_parent_procedure = "hydrol_main"
-        parent_procedure = "hydrol_main"
-        '''children = ['albedo_surface_main'] #cls.call_within_sub[parent_procedure]
-        self.logger.info(f"Processing parent subroutine: '{parent_procedure}' with {len(children)} children")
+        #parent_procedure = "hydrol_soil"
+        #children = ['hydrol_root_profile'] #cls.call_within_sub[parent_procedure]
+        #self.logger.info(f"Processing parent subroutine: '{parent_procedure}' with {len(children)} children")
         # Process each child subroutine of this parent
-        for child_procedure in children:
-            self.logger.info(f"  Isolating child subroutine: '{child_procedure}' (called from '{parent_procedure}')")
-            try:
-               # Pass both parent and child to access the specific call sites
-                self.isolate_procedure(cls, parent_procedure, child_procedure)
-                self.logger.info(f"  Successfully isolated child subroutine: '{child_procedure}'")
-            except Exception as e:
-                self.logger.error(f"  Failed to isolate child schild_procedureubroutine '{child_procedure}': {e}")
-                raise
+        #for child_procedure in children:
+        #    self.logger.info(f"  Isolating child subroutine: '{child_procedure}' (called from '{parent_procedure}')")
+        #    try:
+        #       # Pass both parent and child to access the specific call sites
+        #        self.isolate_procedure(cls, parent_procedure, child_procedure, transformer = transpy)
+        #        self.logger.info(f"  Successfully isolated child subroutine: '{child_procedure}'")
+        #    except Exception as e:
+        #        self.logger.error(f"  Failed to isolate child schild_procedureubroutine '{child_procedure}': {e}")
+        #        raise
         
-        '''  
+        
         for parent_procedure in [
                 'hydrol_alma', 
-                #'hydrol_vegupd',
-                #'hydrol_canop',
-                #'hydrol_flood', 
-                #'hydrol_hydraulic_arch_tuzet_calc', 
-                #'hydrol_soil', 
-                #'explicitsnow_main'
+                'hydrol_vegupd',
+                'hydrol_canop',
+                'hydrol_flood', 
+                'hydrol_hydraulic_arch_tuzet_calc', 
+                'hydrol_soil', 
+                'explicitsnow_main'
                 ]:
-            self.isolate_procedure(cls, transformer, grand_parent_procedure, parent_procedure)
+            self.isolate_procedure(cls, grand_parent_procedure, parent_procedure, transformer = transpy)
         
         
     def run(self):
@@ -325,11 +337,13 @@ class Isolator:
         self.process_subroutines()
 
 if __name__ == "__main__":
-    rest_of_path = "/data/ssivanes/modipsl_truck_opt/modeles/ORCHIDEE/src_sechiba/"
+    rest_of_path = "modipsl_truck_opt/modeles/ORCHIDEE/src_sechiba/"
     target_modules = ["hydrol", "explicitsnow", "condveg"]
     target_module =  target_modules[0]
-    work = os.getenv("work")
+    work = os.getenv("works")
     openacc = False
-    isolator = Isolator(rest_of_path, target_module, work, openacc)
+    f2py = True
+    tapenade = False
+    isolator = Isolator(rest_of_path, target_module, work, openacc, tapenade, f2py)
     isolator.run()
 
