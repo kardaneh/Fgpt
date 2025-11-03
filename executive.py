@@ -1,6 +1,7 @@
 import os
 import argparse
 from processor import Processor
+from logger import Logger
 
 class Executive:
     """
@@ -19,12 +20,15 @@ class Executive:
         Parameters:
             target_module (str): The Fortran file name to compile and run.
         """
+        logger = Logger()
+        logger.show_header('executive')
+        processor = Processor(logger=logger)
         target_module_dir = os.path.join(os.getcwd(), target_module.split('.')[0])
         
         print(f"Executing compilation for {target_module} in directory {target_module_dir}")
         for subdir in os.listdir(target_module_dir):
             subdir_path = os.path.join(target_module_dir, subdir)
-            Processor().compile_and_run(os.getcwd(), subdir_path, mode)
+            processor.compile_and_run(os.getcwd(), subdir_path, mode)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Execute the specified Fortran module.")

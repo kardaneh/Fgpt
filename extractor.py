@@ -672,6 +672,8 @@ class Extractor:
         if not hasattr(execution_part, 'content'):
             raise AttributeError("Execution_Part has no 'content' attribute")
 
+        self.processor.remove_external_calls(execution_part, self.allowed_external_subroutines)
+               
         stmt_list = specification_part.content
         idx = 0
         while idx < len(stmt_list):
