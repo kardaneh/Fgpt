@@ -121,8 +121,6 @@ class Navigator:
         self.module_path = module_path
         self.logger = logger
         self.processor = Processor(logger=self.logger)
-        #self.logger = Logger(Module_name="Navigator")
-        #self.logger.show_header()
 
     def find_variable_in_module(self):
         """
@@ -151,13 +149,14 @@ class Navigator:
         try:
             module_name = walk(self.module_tree_sc, F23.Name)[0].string
             names = walk(self.module_tree_sc, F23.Name)
-            name_strings = [name.string for name in names]
+            name_strings = [name.string.lower() for name in names]
             if self.variable_name_sc in name_strings:
                 for child in names:
-                    if child.string == self.variable_name_sc:
+                    if child.string.lower() == self.variable_name_sc:
                         stmts = child.parent.parent.parent
                         any_allocate = walk(self.var_declaration, F23.Allocate_Stmt)
                         any_declarat = walk(self.var_declaration, F23.Type_Declaration_Stmt)
+                        any_derived_type_def = walk(self.var_declaration, F23.Derived_Type_Def)
                         if (isinstance(stmts, F23.Type_Declaration_Stmt) and not any_declarat) or (isinstance(stmts, F23.Allocate_Stmt) and not any_allocate):
                             current = stmts
                             while current is not None and not isinstance(current, (F23.Subroutine_Subprogram, F23.Function_Subprogram, F23.Module)):
@@ -196,12 +195,37 @@ class Navigator:
                             function_subprogram = child.parent.parent
                             self.var_declaration.extend([function_name,function_subprogram, module_name])
 
+                        if isinstance(child.parent,  (F23.Derived_Type_Stmt, F23.End_Type_Stmt)):
+                            if not any_derived_type_def:
+                                self.processor.logger.warning(f"Warning: '{self.variable_name_sc}' is a derived type")
+                                self.processor.logger.warning(f"The containing directory is: '{self.module_dir_sc}'")
+                                assert isinstance(child.parent.parent,  F23.Derived_Type_Def), (
+                                    f" Assertion failed in 'find_variable_in_module': Expected Derived_Type_Def as parent, but got {type(child.parent.parent)}.")
+                                derived_type_def = child.parent.parent
+                                self.processor.separate_multiple_declarations(derived_type_def)
+                                self.var_declaration.append(derived_type_def)
+                                if walk(derived_type_def, F23.Declaration_Type_Spec):
+                                    unique_type_names = {}
+                                    for declaration_type_spec in walk(derived_type_def, F23.Declaration_Type_Spec):
+                                        assert isinstance(declaration_type_spec.children[1], F23.Type_Name), \
+                                            "Expected declaration_type_spec to have a Type_Name as its second child. but got type {type(declaration_type_spec.children[1]).__name__}."
+                                        type_name = declaration_type_spec.children[1]
+                                        unique_type_names[type_name.tostr().lower()] = type_name
+                                    self.var_initial = list(unique_type_names.values())
+
             if self.var_declaration:
                 self.return_key_sc = True
-                allocate_stmt, attr_spec = walk(self.var_declaration, F23.Allocate_Stmt), walk(self.var_declaration, F23.Attr_Spec)
-                if F23.Attr_Spec('ALLOCATABLE') not in attr_spec and allocate_stmt != [] or \
-                        F23.Attr_Spec('ALLOCATABLE') in attr_spec and allocate_stmt == []:
+
+                allocate_stmt= walk(self.var_declaration, F23.Allocate_Stmt) 
+                attr_spec = walk(self.var_declaration, F23.Attr_Spec)
+                has_allocatable_attr = F23.Attr_Spec('ALLOCATABLE') in attr_spec
+                has_allocate_stmt = bool(allocate_stmt)
+                incomplete_allocatable = (has_allocatable_attr and not has_allocate_stmt) or \
+                    (not has_allocatable_attr and has_allocate_stmt)
+                
+                if incomplete_allocatable:
                     self.return_key_sc = False
+
         except Exception as e:
             self.processor.logger.exception(f"Error in 'find_variable_in_module': ", e)
 
@@ -318,11 +342,14 @@ class Navigator:
         - Logs the containing directory upon completion
         """
         try:
-            self.variable_name_sc = variable_name
+            self.variable_name_sc = variable_name.lower()
             self.find_variable_in_module()
+
             if self.return_key_sc:
                 self.processor.logger.info(f"The containing directory is: {self.module_dir_sc}")
+                return                    
             else:
+                self.processor.logger.info(f"'{self.variable_name_sc}' is not found in the current module. Searching in child modules...")
                 module_name = walk(self.module_tree_sc, F23.Name)[0].string
                 self.module_set_sc.add(module_name)
                 self.child_modules_sc.add(module_name)

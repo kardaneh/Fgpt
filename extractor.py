@@ -42,6 +42,7 @@ class Extractor:
                     ]
             self.allowed_external_subroutines = {
                     'ipslerr_p', 
+                    'histwrite_p',
                     'xios_orchidee_send_field', 
                     'xios_orchidee_recv_field', 
                     'flinget', 
@@ -261,22 +262,33 @@ class Extractor:
         """
 
         function_stmt = walk(function_tree, F23.Function_Stmt)[0]
+        function_key = None
+        arg_list = None
+        suffix = None
         for child in function_stmt.children:
             if child is None:
                 continue
             if isinstance(child, F23.Name):
                 function_key = child.tostr()
-                self.subroutines[function_key] = function_tree
+                
             elif isinstance(child, F23.Dummy_Arg_List):
                 arg_list = child
             elif isinstance(child, F23.Suffix):
-                self.func_result[function_key] = child.children[0].tostr()
+                self.logger.warning(f"Suffix found in function '{function_key}': {child.tostr()}")
+                suffix = child.children[0].tostr()
+
         assert function_key is not None, f"Unexpected type {function_key} encountered in children."
+        self.subroutines[function_key] = function_tree
+
+        if suffix is not None:
+            self.func_result[function_key] = suffix
+        else:
+            self.logger.warning(f"No suffix found in function '{function_key}', using '{function_key}_result' as result variable.")
+            self.func_result[function_key] = f"{function_key}_result"
+
         if arg_list is not None:
             for child in arg_list.children:
                 self.dummy_arg_list[function_key].append(child.tostr())
-        
-        self.subroutines[function_key] = function_tree
 
 
     def _process_intent_assignment_statement(self, child, child_parent, dummy_arg_list, usage):
@@ -673,37 +685,97 @@ class Extractor:
             raise AttributeError("Execution_Part has no 'content' attribute")
 
         self.processor.remove_external_calls(execution_part, self.allowed_external_subroutines)
-               
-        stmt_list = specification_part.content
-        idx = 0
-        while idx < len(stmt_list):
-            stmt = stmt_list[idx]
-            if isinstance(stmt, F23.Type_Declaration_Stmt):
-                entity_decls = walk(stmt, F23.Entity_Decl)
-                if len(entity_decls) > 1:
-                    new_stmts = self.processor.separate_entity_declarations(stmt)
-                    for new_stmt in new_stmts:
-                        new_stmt.parent = specification_part
-                    stmt_list[idx:idx+1] = new_stmts
-                    idx += len(new_stmts)-1
-                    continue
-            idx += 1
+        self.processor.separate_multiple_declarations(specification_part)
+         
+        #stmt_list = specification_part.content
+        #idx = 0
+        #while idx < len(stmt_list):
+        #    stmt = stmt_list[idx]
+        #    if isinstance(stmt, F23.Type_Declaration_Stmt):
+        #        entity_decls = walk(stmt, F23.Entity_Decl)
+        #        if len(entity_decls) > 1:
+        #            new_stmts = self.processor.separate_entity_declarations(stmt)
+        #            for new_stmt in new_stmts:
+        #                new_stmt.parent = specification_part
+        #            stmt_list[idx:idx+1] = new_stmts
+        #            idx += len(new_stmts)-1
+        #            continue
+        #    idx += 1
 
         self.var_declared[subroutine_key] = {name.tostr() for name in  walk(specification_part, F23.Entity_Decl)}
         names_declared, names_used = walk(specification_part, F23.Name), walk(execution_part, F23.Name)
 
+        locally_defined_types = set()
+        derived_type_defs = walk(specification_part, F23.Derived_Type_Def)
+        for type_def in derived_type_defs:
+            type_stmts = type_def.children[0]
+            for child in type_stmts.children:
+                if isinstance(child, F23.Type_Name):
+                    locally_defined_types.add(child.tostr().lower())
+
+        
+        names_queue = deque(names_used)
         declared_names_str = {name.string for name in names_declared }
         
         seen = {}
-        for name in names_used:
-            if (
-                    name.string not in declared_names_str and 
-                    name.string not in self.exclude
-                    ):
+
+        for declaration_type_spec in walk(specification_part, F23.Declaration_Type_Spec):
+            assert isinstance(declaration_type_spec.children[1], F23.Type_Name), \
+                "Expected declaration_type_spec to have a Type_Name as its second child. but got type {type(declaration_type_spec.children[1]).__name__}."
+            type_name = declaration_type_spec.children[1]
+            if type_name.tostr().lower() not in locally_defined_types:
+                self.processor.logger.info(f"Type_Name {type_name.tostr()} is not locally defined; add to global name.")
+                seen[type_name.tostr().lower] =  type_name
+
+
+        while names_queue:
+            name = names_queue.popleft()
+
+            if name.string.lower() == subroutine_key.lower():
+                self.processor.logger.warning(
+                        f"Variable name '{name.string}' matches subroutine name '{subroutine_key}'. "
+                        f"This mean that the procedure is a function.")
+                assert isinstance(subroutine_tree, F23.Function_Subprogram), \
+                        f"Subroutine '{subroutine_key}' is used as a variable but is not defined as a function."
+                assert self.func_result[subroutine_key] == f"{subroutine_key}_result", \
+                        f"Function '{subroutine_key}' must have its result variable named as {subroutine_key}_result."
+                function_stmt = walk(subroutine_tree, F23.Function_Stmt)[0]
+                self.logger.warning(f"Function statement: {function_stmt.tostr()} most includes the prefix for type_spec ")
+                prefix = None
+                for child in function_stmt.children:
+                    if isinstance(child, F23.Prefix):
+                        self.logger.info(f"Prefix found in function '{subroutine_key}': {child.tostr()}")
+                        prefix = child
+                assert prefix is not None, f"Function '{subroutine_key}' lacks a prefix for type specification."
+                type_decl_stmt = F23.Type_Declaration_Stmt(
+                        f'{prefix.tostr()}, intent(out) :: {subroutine_key}_result')
+                self.var_dummy[subroutine_key].append(type_decl_stmt)
+                continue
+
+            parent = name.parent
+            if isinstance(parent, F23.Data_Ref) and len(parent.children) > 1:
+                self.processor.logger.info(f"Data_Ref found: {parent.tostr()}")
+                base = parent.children[0]
+                if isinstance(base, F23.Part_Ref):
+                    base_var = base.children[0].tostr()
+                else:
+                    base_var = base.tostr()
+                if base_var in declared_names_str or base_var in self.exclude:
+                    children_to_remove = set()
+                    for child in parent.children[1:]:
+                        self.processor.logger.info(f"Base variable '{base_var}' is declared or excluded; skipping its component '{child.tostr()}'. ")
+                        if isinstance(child, F23.Name):
+                            children_to_remove.add(child.tostr())
+                        elif isinstance(child, F23.Part_Ref):
+                            children_to_remove.add(child.children[0].tostr())
+                    names_queue = deque(n for n in names_queue if n.tostr() not in children_to_remove)
+                    continue
+                
+            if name.string not in declared_names_str and name.string not in self.exclude:
                 seen[name.string] = name
 
-        self.var_global[subroutine_key] = list(seen.values()) #var_used - var_declared
 
+        self.var_global[subroutine_key] = list(seen.values())
         for idx, node in enumerate(specification_part.children):
             if isinstance(node, F23.Type_Declaration_Stmt):
                 assert len(walk(node, F23.Entity_Decl)) == 1,\
@@ -1080,7 +1152,7 @@ class Extractor:
                     self.processor.logger.warning(f"In the module: '{ffile}'")
                     self.find_global_variables(self.finder.module_dir_sc, self.finder.module_tree_sc, self.finder.var_initial, subroutine_key)
             elif declaration in self.external_subroutines:
-                self.processor.logger.info("⏳... Searching for procedure '{declaration}'")
+                self.processor.logger.info(f"⏳... Searching for procedure '{declaration}'")
                 self.finder.external_subroutine_finder(declaration)
                 if self.finder.var_declaration:
                     self.processor.logger.info("✅ Procedure found!")
@@ -1259,6 +1331,7 @@ class Extractor:
                     'add_to_module': [],           # Declarations to add to module section
                     'add_to_routin': [],           # Allocation statements for routine body
                     'add_to_usestm': [],           # Collected USE statements
+                    'add_to_dtyped': [],           # Collected derived type definitions
                     'acc_declare_create': [],      # Variables for OpenACC CREATE directive
                     'acc_declare_copyin': [],      # Variables for OpenACC COPYIN directive
                     'reads_non_allocatables': [],  # Read statements for declaration routine
@@ -1273,6 +1346,7 @@ class Extractor:
                     is_dec_stmt = isinstance(item, F23.Type_Declaration_Stmt)
                     is_alo_stmt = isinstance(item, F23.Allocate_Stmt)
                     is_use_stmt = isinstance(item, F23.Use_Stmt)
+                    is_dtyped_def = isinstance(item, F23.Derived_Type_Def)
                     
                     # Handle type declaration statements
                     if is_dec_stmt:
@@ -1315,6 +1389,10 @@ class Extractor:
                     # Handle USE statements
                     if is_use_stmt:
                         result['add_to_usestm'].append(item)
+
+                    # Handle derived type definitions
+                    if is_dtyped_def:
+                        result['add_to_dtyped'].append(item)
 
             # Post-process the collected items
             result['add_to_module'] = self.processor.remove_intent_and_save(result['add_to_module'])

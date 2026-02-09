@@ -69,7 +69,7 @@ class Isolator:
                  openacc=False,
                  tapenade=False,
                  f2py=False):
-        self.logger = Logger()
+        self.logger = Logger(console_output=True, file_output=True, record=True)
         self.logger.show_header('Isolator')
         self.processor = Processor(logger=self.logger)
         self.rest_of_path = rest_of_path
@@ -286,8 +286,8 @@ class Isolator:
 
     def process_subroutines(self, parent_subroutine="hydrol_main", target_subroutines=['hydrol_soil']):
 
-        self.logger.start_task('Procedure Isolation/Transformation',
-                               description="Isolation and Transformation of procedures through FGPT",
+        self.logger.start_task('Procedure Isolation/Transformation/Automatic Differentiation', 
+                               description="Isolation, Transformation, and Automatic Differentiation of procedures through FGPT",
                                target_module = self.target_module)
         
         cls = Extractor(self.module_dir_sp, self.module_tree_cp, self.logger)

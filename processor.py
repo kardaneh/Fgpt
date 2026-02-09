@@ -284,11 +284,15 @@ class Processor:
             for child in declaration_stmt.children:
                 if child==None:
                     continue
-                if not isinstance(child, F23.Entity_Decl_List):
+                if not isinstance(child, F23.Entity_Decl_List) and not isinstance(child, F23.Component_Decl_List):
                     left_part.append(child.tostr())
-                if isinstance(child, F23.Entity_Decl_List):
-                    for child_child in walk(child, F23.Entity_Decl):
-                        right_part.append(child_child.string)
+                if isinstance(child, (F23.Entity_Decl_List, F23.Component_Decl_List)):
+                    if isinstance(child, F23.Entity_Decl_List):
+                        for child_child in walk(child, F23.Entity_Decl):
+                            right_part.append(child_child.string)
+                    else:
+                        for child_child in walk(child, F23.Component_Decl):
+                            right_part.append(child_child.string)
 
             left_part_merged = ', '.join([name for name in left_part])
             new_decl = []
@@ -482,6 +486,8 @@ class Processor:
         try:
             if walk(implicit_dec, F23.Intrinsic_Type_Spec):
                 type_and_attributes = walk(implicit_dec, F23.Intrinsic_Type_Spec)[0].tostr()
+            elif walk(implicit_dec, F23.Declaration_Type_Spec):
+                type_and_attributes = walk(implicit_dec, F23.Declaration_Type_Spec)[0].tostr()
             else:
                 raise ValueError("variable type is not present!")
             
@@ -549,6 +555,8 @@ class Processor:
                 elif isinstance(item, F23.Type_Declaration_Stmt):
                     if walk(item, F23.Intrinsic_Type_Spec):
                         type_and_attributes = walk(item, F23.Intrinsic_Type_Spec)[0].tostr()
+                    elif walk(item, F23.Declaration_Type_Spec):
+                        type_and_attributes = walk(item, F23.Declaration_Type_Spec)[0].tostr()
                     else:
                         raise ValueError("variable type is not present!")
                     if walk(item, F23.Entity_Decl):
@@ -560,6 +568,8 @@ class Processor:
                         for dim in walk(item, F23.Explicit_Shape_Spec_List):
                             shape.append(dim.tostr())
                         dimensions = ', '.join([name for name in shape])
+                elif isinstance(item, F23.Derived_Type_Def):
+                    continue
                 else:
                     raise ValueError('Unrecognized statement')
             
@@ -577,6 +587,8 @@ class Processor:
             # Extract type and attributes
             if walk(declaration_stmt, F23.Intrinsic_Type_Spec):
                 type_and_attributes = walk(declaration_stmt, F23.Intrinsic_Type_Spec)[0].tostr()
+            elif walk(declaration_stmt, F23.Declaration_Type_Spec):
+                type_and_attributes = walk(declaration_stmt, F23.Declaration_Type_Spec)[0].tostr()
             else:
                 raise ValueError("Variable type is not present!")
 
@@ -645,6 +657,8 @@ class Processor:
                 right_part = ""
                 for child in stmt.children:
                     if isinstance(child, F23.Intrinsic_Type_Spec):
+                        left_part.append(child.tostr())
+                    elif isinstance(child, F23.Declaration_Type_Spec):
                         left_part.append(child.tostr())
                     elif isinstance(child, F28.Attr_Spec_List) or isinstance(child, F23.Attr_Spec_List):
                         for grandchild in child.children:
@@ -982,6 +996,11 @@ class Processor:
                                     subnode.content.insert(0, stmt)
                             ldx = len(subnode.content) - 1
 
+                            if input_dict['add_to_dtyped']:
+                                for stmt in input_dict['add_to_dtyped']:
+                                    subnode.content.insert(ldx + 1, stmt)
+                                    ldx += 1
+                
                             for stmt in input_dict['add_to_module']:
                                 subnode.content.insert(ldx + 1, stmt)
                                 ldx += 1
@@ -1084,6 +1103,12 @@ class Processor:
                             use_stmt = 'use ' + custom_module_name
                             subnode.content.insert(kdx + 1, F23.Use_Stmt(use_stmt))
                             kdx = len(subnode.content) - 1
+
+                            if input_dict['add_to_dtyped']:
+                                for stmt in input_dict['add_to_dtyped']:
+                                    subnode.content.insert(kdx + 1, stmt)
+                                    kdx += 1
+                            
                             for stmt in input_dict['add_to_module']:
                                 subnode.content.insert(kdx + 1, stmt)
                                 kdx += 1
@@ -1203,6 +1228,50 @@ class Processor:
         except Exception as e:
             self.logger.exception(f"Failed to update main program, Error: {e}")
             raise
+
+    def separate_multiple_declarations(self, specification_part):
+        """
+        Recursively separate type declaration statements with multiple entity declarations
+        into individual declaration statements.
+
+        Parameters
+        ----------
+        specification_part : F23.Specification_Part
+            The specification part to process
+        """
+        if hasattr(specification_part, "content"):
+            i = 0
+            while i < len(specification_part.content):
+                child = specification_part.content[i]
+                
+                if isinstance(child, (F23.Type_Declaration_Stmt, F23.Component_Part)):
+                    if isinstance(child, F23.Type_Declaration_Stmt):
+                        entity_decls = walk(child, F23.Entity_Decl)
+                    elif isinstance(child, F23.Component_Part):
+                        entity_decls = walk(child, F23.Component_Decl)
+                    else:
+                        entity_decls = []
+                    if len(entity_decls) > 1:
+                        # Separate the multiple declarations into individual statements
+                        if isinstance(child, F23.Type_Declaration_Stmt):
+                            arg = child
+                        else:
+                            arg = child.children[0]                        
+                        new_stmts = self.separate_entity_declarations(arg)
+                        for new_stmt in new_stmts:
+                            new_stmt.parent = specification_part
+                        
+                        # Replace the current statement with the new individual statements
+                        specification_part.content[i:i+1] = new_stmts
+                        self.logger.info(
+                            f"Separated type declaration with {len(entity_decls)} entities into {len(new_stmts)} individual declarations"
+                        )
+                        i += len(new_stmts)  # Move index past the new statements
+                        continue  # Don't increment i again since we already moved it
+                
+                # Recursively process child blocks
+                self.separate_multiple_declarations(child)
+                i += 1
 
     def remove_external_calls(self, block, allowed_external_subroutines):
         """
