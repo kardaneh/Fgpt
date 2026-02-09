@@ -20,7 +20,7 @@ class Executive:
         Parameters:
             target_module (str): The Fortran file name to compile and run.
         """
-        logger = Logger()
+        logger = Logger(console_output=True, file_output=True, record=True)
         logger.show_header('executive')
         processor = Processor(logger=logger)
         target_module_dir = os.path.join(os.getcwd(), target_module.split('.')[0])

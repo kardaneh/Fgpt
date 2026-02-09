@@ -280,7 +280,7 @@ class Shaper:
             self.module_tree_imp = call.get_root()
             module_name = walk(self.module_tree_imp, F23.Name)[0].string
             self.processor.logger.info(
-                    " '{act_arg}' is not a dummy argument in subroutine '{subroutine_key}'. Searching in module '{module_name}'...")
+                    f"'{act_arg}' is not a dummy argument in subroutine '{subroutine_key}'. Searching in module '{module_name}'...")
 
             self.finder = Navigator(self.module_dir_imp, self.module_tree_imp, self.parsed_modules, self.module_path, logger=self.logger)
             self.finder.variable_finder(act_arg)

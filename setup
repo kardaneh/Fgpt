@@ -6,16 +6,19 @@ TODAY=$(date +"%Y%m%d_%H%M%S")
 # Path configuration
 WORK_DIR="$works"  # Using environment variable
 REST_OF_PATH="modipsl_truck_opt/modeles/ORCHIDEE/src_sechiba/"
+#TARGET_MODULE="albedo_surface" #"condveg"
 TARGET_MODULE="hydrol"
 
 # Parent and target subroutines
+#PARENT_SUBROUTINE="albedo_surface_main" #"condveg_main"
+#TARGET_SUBROUTINES="multilevel_matrix" #"albedo_surface_main"
 PARENT_SUBROUTINE="hydrol_main"
 TARGET_SUBROUTINES="hydrol_alma hydrol_vegupd hydrol_canop hydrol_flood hydrol_hydraulic_arch_tuzet_calc hydrol_soil explicitsnow_main"
 
 # Isolation options
 OPENACC="False"
 F2PY="True"
-TAPENADE="False"
+TAPENADE="Flase"
 
 # Script Generation
 run_script="run_isolator.sh"

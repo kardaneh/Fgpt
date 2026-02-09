@@ -1,4 +1,6 @@
-import logging, time, json
+import logging
+import time
+import json
 import traceback
 import functools
 import inspect
@@ -15,7 +17,7 @@ from rich.logging import RichHandler
 
 
 class Logger:
-    def __init__(self, console_output=True, file_output=False, log_file="module_log_file.log", pretty_print=True, record=False):
+    def __init__(self, console_output=True, file_output=False, log_file="Fgpt_log_file.log", pretty_print=True, record=False):
 
         self.console_output = console_output
         self.file_output = file_output
@@ -26,11 +28,22 @@ class Logger:
         self.console = Console(record=self.record)
         self.logger = logging.getLogger(f"ModuleLogger")
         self.logger.setLevel(logging.INFO)
+        
+        # Clear any existing handlers
         if self.logger.hasHandlers():
             self.logger.handlers.clear()
 
-        handler = RichHandler(console=self.console, show_path=False, show_time=True)
-        self.logger.addHandler(handler)
+        # Plain text handler for file output only (no RichHandler for console)
+        if self.file_output:
+            file_handler = logging.FileHandler(self.log_file, mode="w", encoding='utf-8')
+            file_handler.setLevel(logging.INFO)
+            # Use a simple formatter for file output
+            formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+            file_handler.setFormatter(formatter)
+            self.logger.addHandler(file_handler)
+
+        # Prevent propagation to root logger to avoid duplicate messages
+        self.logger.propagate = False
 
         self.progress = Progress(
             SpinnerColumn(),
@@ -55,13 +68,17 @@ class Logger:
         if self.record and hasattr(self, "console") and self.console:
             self.console.clear()
 
-    def show_header(self,module_name):
+    def show_header(self, module_name):
         """Display startup banner."""
         self.module_name = module_name
-        self.console.print(Panel(
-            f"[bold red]🚀 Starting Module:[/bold red] [cyan]{self.module_name}[/cyan]",
-            title="Fortran General Purpose Transformer", border_style="bright_blue"
-        ))
+        if self.console_output:
+            self.console.print(Panel(
+                f"[bold red]🚀 Starting Module:[/bold red] [cyan]{self.module_name}[/cyan]",
+                title="Fortran General purpose Transformer (Fgpt)", border_style="bright_blue"
+            ))
+        # Also log to file
+        if self.file_output:
+            self.logger.info(f"🚀 Starting Module: {self.module_name}")
 
     def start_task(self, task_name: str, description: str = "", **meta):
         """Display a clearly formatted 'task start' message with good spacing."""
@@ -88,15 +105,21 @@ class Logger:
 
         content = Group(*components)
 
-        self.console.print(
-            Panel(
-                content,
-                title="[bold red]TASK STARTED[/bold red]",
-                border_style="red",
-                expand=False,
-                padding=(1, 4),  # (top-bottom, left-right)
+        if self.console_output:
+            self.console.print(
+                Panel(
+                    content,
+                    title="[bold red]TASK STARTED[/bold red]",
+                    border_style="red",
+                    expand=False,
+                    padding=(1, 4),  # (top-bottom, left-right)
+                )
             )
-        )
+        
+        # Log to file
+        if self.file_output:
+            meta_str = ", ".join([f"{k.upper()}: {v}" for k, v in meta.items()])
+            self.logger.info(f"TASK STARTED: {task_name} - {description} - {meta_str}")
 
     def log_event(self, node_name: str):
         def decorator(func):
@@ -105,7 +128,7 @@ class Logger:
                 self.metrics["node_sequence"].append(node_name)
                 self.metrics["node_count"][node_name] = self.metrics["node_count"].get(node_name, 0) + 1
                 start_time = time.time()
-                self.metrics["start_time"]
+                self.metrics["start_time"] = start_time
                 sig = inspect.signature(func)
                 bound_args = sig.bind(*args, **kwargs)
                 bound_args.apply_defaults()
@@ -113,6 +136,10 @@ class Logger:
                     f"[bold cyan]{name}[/bold cyan]=[green]{value!r}[/green]" 
                     for name, value in bound_args.arguments.items()
                 )
+
+                # Log to file
+                if self.file_output:
+                    self.logger.info(f"Entering node: {node_name} - Function: {func.__name__}({args_info})")
 
                 if func.__name__ == 'isolate_procedure':
                     
@@ -122,16 +149,22 @@ class Logger:
                     child = kwargs.get("child_procedure", None) or (args[3] if len(args) > 3 else None)
                     child_name = child if isinstance(child, str) else getattr(child, "__name__", "UnknownChild")
 
-                    entry_group = Group(
-                        f"🧬 [bold yellow]Entering node:[/bold yellow] [magenta]{node_name}[/magenta]",
-                        f"🔹 Child → Parent: [cyan]{child_name}[/cyan] → [magenta]{parent_name}[/magenta]",
-                    )
+                    if self.console_output:
+                        entry_group = Group(
+                            f"🧬 [bold yellow]Entering node:[/bold yellow] [magenta]{node_name}[/magenta]",
+                            f"🔹 Child → Parent: [cyan]{child_name}[/cyan] → [magenta]{parent_name}[/magenta]",
+                        )
+                        self.console.print(Panel(entry_group, title=f"🚀 Node Start", border_style="bright_blue"))
+                    
+                    if self.file_output:
+                        self.logger.info(f"Entering node: {node_name} - Child → Parent: {child_name} → {parent_name}")
                 else:
-                    entry_group = Group(
-                        f"[bold yellow]Entering node:[/bold yellow] [magenta]{node_name}[/magenta]",
-                        f"[bold white]Function:[/bold white] {func.__name__}({args_info})"
-                    )
-                self.console.print(Panel(entry_group, title=f"🚀 Node Start", border_style="bright_blue"))
+                    if self.console_output:
+                        entry_group = Group(
+                            f"[bold yellow]Entering node:[/bold yellow] [magenta]{node_name}[/magenta]",
+                            f"[bold white]Function:[/bold white] {func.__name__}({args_info})"
+                        )
+                        self.console.print(Panel(entry_group, title=f"🚀 Node Start", border_style="bright_blue"))
 
                 try:
                     result = func(*args, **kwargs)
@@ -148,22 +181,29 @@ class Logger:
                     )
                     self.metrics["steps_completed"] += 1
                     
+                    # Log to file
+                    if self.file_output:
+                        self.logger.info(f"Exiting node: {node_name} - Duration: {duration:.2f}s")
+
                     if func.__name__ == 'isolate_procedure':
                     
                         child = kwargs.get("child_procedure", None) or (args[3] if len(args) > 3 else None)
                         child_name = child if isinstance(child, str) else getattr(child, "__name__", "UnknownChild")
 
-                        exit_group = Group(
-                            f"[bold green]Exiting node:[/bold green] [magenta]{node_name}[/magenta]",
-                            f"[dim]Duration:[/dim] {duration:.2f}s"
-                            f" Done isolating → [magenta]{child_name}[/magenta]",
-                        )
+                        if self.console_output:
+                            exit_group = Group(
+                                f"[bold green]Exiting node:[/bold green] [magenta]{node_name}[/magenta]",
+                                f"[dim]Duration:[/dim] {duration:.2f}s",
+                                f" Done isolating → [magenta]{child_name}[/magenta]",
+                            )
+                            self.console.print(Panel(exit_group, title="✅ Node Complete", border_style="green"))
                     else:
-                        exit_group = Group(
-                            f"[bold green]Exiting node:[/bold green] [magenta]{node_name}[/magenta]",
-                            f"[dim]Duration:[/dim] {duration:.2f}s"
-                        )
-                    self.console.print(Panel(exit_group, title="✅ Node Complete", border_style="green"))
+                        if self.console_output:
+                            exit_group = Group(
+                                f"[bold green]Exiting node:[/bold green] [magenta]{node_name}[/magenta]",
+                                f"[dim]Duration:[/dim] {duration:.2f}s"
+                            )
+                            self.console.print(Panel(exit_group, title="✅ Node Complete", border_style="green"))
 
                     return result
 
@@ -171,36 +211,59 @@ class Logger:
         return decorator
     
     def log_metrics(self):
-        table = Table(title="📊 Pipeline Metrics", show_lines=True)
-        table.add_column("Node", style="cyan")
-        table.add_column("Count", justify="center")
-        table.add_column("Total Time (s)", justify="right")
+        """Log pipeline metrics"""
+        if self.console_output:
+            table = Table(title="📊 Pipeline Metrics", show_lines=True)
+            table.add_column("Node", style="cyan")
+            table.add_column("Count", justify="center")
+            table.add_column("Total Time (s)", justify="right")
 
-        for node, count in self.metrics["node_count"].items():
-            total_time = self.metrics["node_times"].get(node, 0)
-            table.add_row(node, str(count), f"{total_time:.2f}")
-        table.add_row(
-            "[bold]Total[/bold]",
-            f"[bold]{sum(self.metrics['node_count'].values())}[/bold]",
-            f"[bold]{sum(self.metrics['node_times'].values()):.2f}[/bold]"
-        )
-        self.console.print(Panel(table, title="Metrics Summary", border_style="bright_blue"))
+            for node, count in self.metrics["node_count"].items():
+                total_time = self.metrics["node_times"].get(node, 0)
+                table.add_row(node, str(count), f"{total_time:.2f}")
+            table.add_row(
+                "[bold]Total[/bold]",
+                f"[bold]{sum(self.metrics['node_count'].values())}[/bold]",
+                f"[bold]{sum(self.metrics['node_times'].values()):.2f}[/bold]"
+            )
+            
+            self.console.print(Panel(table, title="Metrics Summary", border_style="bright_blue"))
+        
+        # Log metrics to file
+        if self.file_output:
+            self.logger.info("Pipeline Metrics Summary:")
+            for node, count in self.metrics["node_count"].items():
+                total_time = self.metrics["node_times"].get(node, 0)
+                self.logger.info(f"  {node}: Count={count}, Total Time={total_time:.2f}s")
+            self.logger.info(f"  Total: Count={sum(self.metrics['node_count'].values())}, Total Time={sum(self.metrics['node_times'].values()):.2f}s")
 
     def info(self, message):
         """Formatted info message"""
-        self.console.print(f"[bold cyan][INFO][/bold cyan] {message}")
+        if self.console_output:
+            self.console.print(f"[bold cyan][INFO][/bold cyan] {message}")
+        if self.file_output:
+            self.logger.info(message)
 
     def warning(self, message):
         """Formatted warning message"""
-        self.console.print(f"[bold yellow][WARNING][/bold yellow] :warning: {message}")
+        if self.console_output:
+            self.console.print(f"[bold yellow][WARNING][/bold yellow] :warning: {message}")
+        if self.file_output:
+            self.logger.warning(message)
 
     def success(self, message):
         """Custom success level (not default logging level)"""
-        self.console.print(f":white_check_mark: [bold green]{message}[/bold green]")
+        if self.console_output:
+            self.console.print(f":white_check_mark: [bold green]{message}[/bold green]")
+        if self.file_output:
+            self.logger.info(f"SUCCESS: {message}")
 
     def step(self, step_name, message):
         """Highlight pipeline step events"""
-        self.console.print(f"[bold magenta]▶ Step: {step_name}[/bold magenta] — {message}")
+        if self.console_output:
+            self.console.print(f"[bold magenta]▶ Step: {step_name}[/bold magenta] — {message}")
+        if self.file_output:
+            self.logger.info(f"Step: {step_name} - {message}")
 
     def _format_traceback_panels(self, exception: Exception):
         """Format traceback as a series of Rich panels for readability."""
@@ -248,32 +311,41 @@ class Logger:
     def exception(self, message, exception=None):
         """Display a formatted exception message with visual stack trace."""
         if exception:
-            tb_panels = self._format_traceback_panels(exception)
-            main_panel = Panel(
-                Group(
-                    Text.from_markup(f"[bold red]{message}[/bold red]\n"),
-                    tb_panels
-                ),
-                title="[bold red]EXCEPTION[/bold red]",
-                border_style="red"
-            )
-            self.console.print(main_panel)
+            if self.file_output:
+                self.logger.error(f"{message} - {exception}")
+            if self.console_output:
+                tb_panels = self._format_traceback_panels(exception)
+                main_panel = Panel(
+                    Group(
+                        Text.from_markup(f"[bold red]{message}[/bold red]\n"),
+                        tb_panels
+                    ),
+                    title="[bold red]EXCEPTION[/bold red]",
+                    border_style="red"
+                )
+                self.console.print(main_panel)
         else:
-            self.console.print(Panel(f"[bold red]{message}[/bold red]", title="[bold red]EXCEPTION[/bold red]", border_style="red"))
+            if self.file_output:
+                self.logger.error(message)
+            if self.console_output:
+                self.console.print(Panel(f"[bold red]{message}[/bold red]", title="[bold red]EXCEPTION[/bold red]", border_style="red"))
 
     def error(self, message, exception=None):
         """Display a formatted error log, optionally including exception trace."""
         if exception:
-            tb = traceback.format_exc()
-            exception_type = type(exception).__name__
-            exception_msg = str(exception)
-            self.console.print(Panel(
-                f"[bold red]{message}[/bold red]\n\n"
-                f"[red]Error:[/red] [bold]{exception_type}[/bold]: {exception_msg}\n\n"
-                f"[dim]{tb}[/dim]",
-                title="[bold red]ERROR[/bold red]",
-                border_style="red"
-            ))
+            if self.file_output:
+                self.logger.error(f"{message} - {exception}")
+            if self.console_output:
+                tb = traceback.format_exc()
+                self.console.print(Panel(
+                    f"[bold red]{message}[/bold red]\n\n"
+                    f"[red]Error:[/red] [bold]{type(exception).__name__}[/bold]: {str(exception)}\n\n"
+                    f"[dim]{tb}[/dim]",
+                    title="[bold red]ERROR[/bold red]",
+                    border_style="red"
+                ))
         else:
-            self.console.print(Panel(f"[bold red]{message}[/bold red]", title="[bold red]ERROR[/bold red]", border_style="red"))
-    
+            if self.file_output:
+                self.logger.error(message)
+            if self.console_output:
+                self.console.print(Panel(f"[bold red]{message}[/bold red]", title="[bold red]ERROR[/bold red]", border_style="red"))
