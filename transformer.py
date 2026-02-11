@@ -291,11 +291,21 @@ class Transformer:
                                 # case: self.x = np.zeros([...], dtype=np.float64)
                                 elif assign.value.func.attr in ['zeros','array'] :
                                     # using cls.all_array_info to retrieve all the array info for the global elements
-                                    array_info = self.extractor.all_array_info[subroutine_key].get(target.attr)
+                                    arrays = self.extractor.all_array_info[subroutine_key]
+                                    normalized_arrays = {
+                                        k.casefold(): v
+                                        for k, v in arrays.items()
+                                    }
+                                    array_info = normalized_arrays.get(target.attr.casefold())
                                     if array_info is None:
                                         # Check within all of the call_within_sub dependencies which means that these arrays are from other subroutines 
                                         for key in self.isolator.working_subroutines.keys():
-                                            array_info = self.extractor.all_array_info[key].get(target.attr)
+                                            arrays = self.extractor.all_array_info[key]
+                                            normalized_arrays = {
+                                                k.casefold(): v
+                                                for k, v in arrays.items()
+                                            }
+                                            array_info = normalized_arrays.get(target.attr.casefold())
                                             if array_info is not None:
                                                 self.logger.info(f'Found array_info for {target.attr} in subroutine: {key}')
                                                 break 
@@ -516,7 +526,6 @@ class Transformer:
             # self.method_name() or gm.method_name instances
 
             args = [ast.Name(id=arg.arg, ctx=ast.Load()) for arg in function_def.args.args if arg.arg != 'self']
-
             # Look for a return statement
             return_stmt = next(ast_walk(function_def, ast.Return), None)
 
@@ -705,11 +714,13 @@ class Transformer:
                         i = min(i, len(self.extractor.call_subroutines.get(func_name, [])) - 1) # # Clamp i so it doesn’t exceed available subroutine entries
                         indexes = []
                         # print(ast.unparse(ast.fix_missing_locations(method)))
+                        dummy_args_list = self.extractor.dummy_arg_list[func_name]
+                        folded_args = [a.casefold() for a in dummy_args_list]
                         for arg in method.args.args:
-                            if arg.arg in self.extractor.dummy_arg_list[func_name]:
-                                index = self.extractor.dummy_arg_list[func_name].index(arg.arg)
-                                indexes.append(index)
-
+                            key = arg.arg.casefold()
+                            if key in folded_args:
+                                indexes.append(folded_args.index(key))
+                                
                         try:
                             actual_args_list = None
                             part_ref = None
@@ -743,7 +754,6 @@ class Transformer:
                                             f"{len(actual_args_list.children)} actual args found."
                                         )
                             node.args = args
-
                         except (IndexError, KeyError) as e:
                             self.logger.error(f"Error mapping arguments for expr to '{func_name}' at index {i}:", e)
                             
@@ -1047,7 +1057,7 @@ class Transformer:
                             if cls_mode:
                                 target = ast.Attribute(
                                         value = ast.Name(id="self",ctx=ast.Load()),
-                                        attr = var_name.string, ctx = ast.Store()
+                                        attr = var_name.string.lower() if var_name.string.isupper() else var_name.string, ctx = ast.Store()
                                 )
                             else:
                                 target = ast.Name(id=var_name.string, ctx=ast.Store())

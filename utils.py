@@ -2,7 +2,12 @@ import os
 import ast
 import logging
 import operator
-from typing import Generator,Dict,List,Set
+import jax
+import jax.numpy as jnp
+from jax import jit, lax
+import equinox as eqx
+from typing import Generator,Dict,List,Set,Optional,Callable,Any
+from dataclasses import dataclass
 from collections import defaultdict, deque
 
 # We will use the nodeTransformer https://docs.python.org/3/library/ast.html#ast.NodeTransformer to create a general purpose
@@ -19,6 +24,9 @@ class ReplaceGlobals(ast.NodeTransformer):
             for inst_key, value in instances.items():
                 cls_attr = value.get("attributes", [])
                 other_object_instances = value.get("instances",{})
+
+                if name.isupper():
+                    name = name.lower()
 
                 if name in cls_attr:
                     return ast.Attribute(
@@ -56,6 +64,9 @@ class ReplaceGlobals(ast.NodeTransformer):
                 for _, value in instances.items():
                     local_attrs = value.get("attributes", [])
                     other_instances = value.get("instances", [])
+
+                    if name.isupper():
+                        name = name.lower()
 
                     if name in local_attrs:
                         return node  # keep as self.name
@@ -265,7 +276,7 @@ class ReplaceGlobals(ast.NodeTransformer):
 class AdjustIndices(ast.NodeTransformer):
     def __init__(self,conv_vars,array_info:Dict,cls_attributes:Dict,**kwargs):
         self.CONV_VARS = conv_vars # This corresponds to the conventional loop variables such as ji,jst,jl etc... 
-        self.array_info = array_info
+        self.array_info = {k.casefold(): v for k, v in array_info.items()}
         self.cls_attributes = cls_attributes.get("attributes", {}) # Attributes of the class (arrays, sclaras)
         self.instances_global_attributes = cls_attributes.get("instances", {}) # Attributes of probably other object class if present inside teh parent class 
         self.adjusted_vars = kwargs.get("adjusted_vars",set())
@@ -287,7 +298,7 @@ class AdjustIndices(ast.NodeTransformer):
         # lower bound (not starting at 1), the corresponding loop variable must be corrected to
         # account for the offset between FORTRAN and Python indexing, thus recovering to the original Fortran index 
         if arr_name and arr_name in self.array_info:
-            dims_info = self.array_info[arr_name]
+            dims_info = self.array_info[arr_name.casefold()]
             if isinstance(node.slice, ast.Tuple):
                 new_elts = []
                 for i, elt in enumerate(node.slice.elts):
@@ -521,7 +532,7 @@ class AdjustIndices(ast.NodeTransformer):
                     subscript_node = next(iter(subscript_nodes))
                     arr_name = subscript_node.value.id if isinstance(subscript_node.value, ast.Name) else subscript_node.value.attr
                     
-                    dim_info = self.array_info[arr_name]
+                    dim_info = self.array_info[arr_name.casefold()]
                     if dim_info and len(dim_info) == 1:
                         if dim_info[0]['dim_str'] != "0": # If the lower bound is 0 this doesnt' require the creation of BinOp
     
@@ -1160,12 +1171,6 @@ def search_convar_dependencies(conv_vars: List[str], node: ast.AST) -> Set[str]:
                             adjusted_vars.add(target.value.id)
 
     return adjusted_vars
-
-def adjust_loop_variables(expr_node,loop_variables):
-    for node in ast_walk(expr_node,ast.Name):
-        loop_var = loop_variables.get(node.id)
-        if loop_var and node.id != loop_var:
-            node.id = loop_var
 
 def _find_conv_vars_in_expr(child: ast.AST, conv_vars: List[str]) -> bool:
     """

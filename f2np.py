@@ -8,7 +8,7 @@ import re
 import ast
 import copy
 import itertools
-from utils import ast_walk,adjust_loop_variables
+from utils import ast_walk
 from logger import Logger
 
 class F2NP:
@@ -321,7 +321,7 @@ class F2NP:
                                         slice = ast.Name(id='mask',ctx=ast.Load()),
                                         ctx = ast.Store()
                                     )],
-                                    value=self.apply_mask_to_rhs(stmt_copy.value)
+                                    value=self.apply_mask_to_rhs(stmt_copy.value) if getattr(self,"extractor", None) else stmt_copy.value
                                 )
         
                                 if module_stack and isinstance(module_stack[-1], (ast.If,list)):
@@ -344,7 +344,7 @@ class F2NP:
                                         ctx = ast.Store()
                                     )],
                                     # value=stmt_copy.value
-                                    value=self.apply_mask_to_rhs(stmt_copy.value) # We need to check the RHS to see if the target name is present and and apply the mask
+                                    value=self.apply_mask_to_rhs(stmt_copy.value) if getattr(self,"extractor", None) else stmt_copy.value # We need to check the RHS to see if the target name is present and and apply the mask
                                 )
 
                                 if control_stack and isinstance(control_stack[-1], (ast.If,list)):
@@ -698,6 +698,8 @@ class F2NP:
                             module_stack.append(stmt)
                         else:
                             self.append_to_current_parent(stmt, control_stack)
+                    elif isinstance(child, F23.Intrinsic_Stmt):
+                        pass 
                     else:   
                         self.recursive_ast(child, ast_mode=ast_mode, control_stack=control_stack,counters=counters,module_stack=module_stack)
                 
@@ -1463,7 +1465,7 @@ class F2NP:
                     # onto a binary operation 
                     for iarg, arg in enumerate(intrinsic_args.children):
                         if func_name == "np.sum":
-                            if isinstance(arg,F23.Actual_Arg_Spec): # THis is meant to work for the SUM since they might or might have DIM as argument 
+                            if isinstance(arg,F23.Actual_Arg_Spec): # THis is meant to work for the SUM since they might or not might have DIM as argument 
                                 keywords.append(self.handle_expr(arg))
                             elif not isinstance(arg, F23.Actual_Arg_Spec) and iarg > 0: # THis is the case where it might not have the DIM as argument 
                                 expr = self.handle_expr(arg)
@@ -1567,11 +1569,14 @@ class F2NP:
                 name = walk(part_ref, F23.Name)[0].string
                 name_found = False
 
-                # Check if name exists in any of the keys from all_array_info
-                for elements in self.extractor.all_array_info.values():
-                    if name in elements.keys():
-                        name_found = True
-                        break
+                # Check if name doesn't exists in any of the keys from all_array_info then it's a function else an array
+                if getattr(self,"extractor", None):
+                    for elements in self.extractor.all_array_info.values():
+                        if name in elements.keys():
+                            name_found = True
+                            break
+                else:
+                    name_found = True
 
                 if not name_found:
                     _,args_spec_list = part_ref.children
@@ -1873,9 +1878,10 @@ class F2NP:
                         # In some cases, we observed that arrays are assigned like this : a = TRUE within a function locally in this case
                         # Python will create a new local variables with the same name thus could pose a problem further down the code that might use the actual variable 
                         elem_found = None
-                        for key,value in self.extractor.all_array_info.items():
-                            if (lhs_node.string in value.keys()) and isinstance(rhs_node, (F23.Name,F23.Logical_Literal_Constant,F23.Real_Literal_Constant, F23.Int_Literal_Constant)):
-                                elem_found = self.extractor.all_array_info[key][lhs_node.string]
+                        if getattr(self,"extractor", None):
+                            for key,value in self.extractor.all_array_info.items():
+                                if (lhs_node.string in value.keys()) and isinstance(rhs_node, (F23.Name,F23.Logical_Literal_Constant,F23.Real_Literal_Constant, F23.Int_Literal_Constant)):
+                                    elem_found = self.extractor.all_array_info[key][lhs_node.string]
                         
                         if elem_found:
                             if len(elem_found) == 1:
@@ -1907,10 +1913,11 @@ class F2NP:
                         left_name = lhs_ast.id
                         right_name = rhs_ast.id
                     # Check if name exists in any of the keys from all_array_info
-                    for key,value in self.extractor.all_array_info.items():
-                        if (left_name in value.keys()) and (right_name in value.keys()):
-                            dim_found = self.extractor.all_array_info[key][left_name]
-                            break
+                    if getattr(self,"extractor", None):
+                        for key,value in self.extractor.all_array_info.items():
+                            if (left_name in value.keys()) and (right_name in value.keys()):
+                                dim_found = self.extractor.all_array_info[key][left_name]
+                                break
                     # If rhs is a known array, wrap with .copy() which creates a litteral new copy of the attributes thus we will go with the a[:,:] = b which copies onto the array
                     if dim_found: # THIs is to ensrue that only the assignement of type a = b.copy() is affected 
 
@@ -2125,8 +2132,13 @@ class F2NP:
                 else:
                     if "=" in expr_node.tostr() and len(expr_node.children) == 2:
                         rhs_ast = self.handle_expr(expr_node.children[1])
+                        if isinstance(expr_node.children[0], F23.Name) and expr_node.children[0].string.lower() == "mask":
+                            # THIS usually means that we have a case of np.sum(where=expr) case here the mask is the where
+                            name = "where"
+                        else:
+                            name = expr_node.children[0].string
                         stmt = ast.keyword(
-                            arg = expr_node.children[0].string,
+                            arg = name,
                             value = rhs_ast
                         )
                         return stmt

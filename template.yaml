@@ -124,10 +124,10 @@ Python_templates:
                 for var in []:
                     if isinstance(var, np.ndarray):
                         arr_shape = var.shape
-                        if var.dtype == np.float64:
+                        if np.issubdtype(var.dtype, np.float64):
                             data = ffile.read_reals(np.float64)
                             
-                        elif var.dtype == np.int32 or var.dtype == np.bool:
+                        elif np.issubdtype(var.dtype, np.int32) or np.issubdtype(var.dtype, np.bool):
                             data = ffile.read_ints(np.int32)
                             
                         if data.size != np.prod(arr_shape):
@@ -157,9 +157,9 @@ Python_templates:
             fortran_value = None 
             if isinstance(value,np.ndarray): 
                 arr_shape = value.shape
-                if value.dtype == np.float64:
+                if np.issubdtype(value.dtype, np.float64):
                     fortran_value = ffile.read_reals(np.float64).reshape(arr_shape, order='F')
-                elif value.dtype == np.int32 or value.dtype == np.bool:
+                elif np.issubdtype(value.dtype, np.int32) or np.issubdtype(value.dtype, np.bool):
                     fortran_value = ffile.read_ints(np.int32).reshape(arr_shape, order='F')
                 
                 if np.allclose(value,fortran_value):
@@ -170,10 +170,10 @@ Python_templates:
                     print(f' Min and max of python value: {value.min()}, {value.max()}')
                     print(f' Min and max of FORTRAN value: {fortran_value.min()}, {fortran_value.max()}')
                     
-            elif not isinstance(value, np.ndarray):
-                if value.dtype == np.bool or value.dtype == np.int32:
+            elif np.isscalar(value):
+                if np.issubdtype(value.dtype, np.int32) or np.issubdtype(value.dtype, np.bool):
                     fortran_value = ffile.read_ints(np.int32)[0]
-                elif value.dtype == np.float64:
+                elif np.issubdtype(value.dtype, np.float64):
                     fortran_value = ffile.read_reals(np.float64)[0]
                     
                 if np.isclose(value,fortran_value):
