@@ -3,7 +3,8 @@ from fparser.two.utils import walk
 from fparser.two import Fortran2003 as F23
 from fparser.two import Fortran2008 as F28
 from extractor import Extractor
-from typing import List, Dict, Optional,Union
+from intrinsic import normalize_intrinsic_call, intrinsic_signatures
+from typing import List, Dict, Optional, Union, Any, Tuple 
 import re
 import ast
 import copy
@@ -13,45 +14,79 @@ from logger import Logger
 
 class F2NP:
     """
-    F2NP is a class for converting Fortran code into NumPy-based Python code.
+    Translate a single Fortran subroutine/function body into a Python AST.
 
-    This class takes Fortran constructs and translates them into equivalent
-    Python code using NumPy for numerical operations. It handles various
-    Fortran statements, including subroutine calls, type declarations, 
-    control statements (if, do), and intrinsic functions.
+    Where :class:`~transformer.Transformer` works above the level of a whole
+    program (declarations, classes, modules, file I/O), ``F2NP`` operates at
+    the statement and expression level: it walks the Fortran AST produced by
+    ``fparser`` for one subroutine/function and incrementally builds the
+    equivalent Python :mod:`ast` tree, statement by statement, expression by
+    expression.
 
-    Attributes:
-        result (list): A list to store the results of the translation.
-        indentation_level (int): The current level of indentation for nested
-                                 structures.
-        npcode (str): The resulting Python code as a string.
-        replacements (dict): A mapping of Fortran logical and arithmetic 
-                             operators to their Python equivalents.
-        intrinsic_replacements (dict): A mapping of Fortran intrinsic 
-                                        functions to their NumPy equivalents.
+    Parameters
+    ----------
+    extractor : Extractor, optional
+        Instance providing extracted Fortran metadata (array shapes, loop
+        variable groupings, allowed external subroutines, etc.) needed to
+        disambiguate constructs such as array references vs. function calls
+        in :meth:`handle_part_ref`, or to apply array-masking semantics in
+        :meth:`apply_mask_to_rhs`. If ``None``, behavior that depends on this
+        metadata falls back to conservative defaults (e.g. treating an
+        ambiguous reference as an array rather than a function call).
 
-    Methods:
-        recursive(block): Recursively processes the Fortran block.
-        handle_subroutine_stmt(stmt): Translates Fortran subroutine statements.
-        handle_call_stmt(stmt): Translates Fortran subroutine call statements.
-        handle_type_declaration_stmt(stmt): Translates type declaration statements.
-        simplify_limits(expression): Simplifies loop limits and expressions.
-        handle_end_stmt(stmt): Handles end statements for control structures.
-        handle_print_stmt(stmt): Translates print statements.
-        handle_assignment(stmt): Handles variable assignments.
-        handle_do_stmt(stmt): Translates Fortran do loops to Python for loops.
-        handle_if_condition(condition): Translates Fortran if conditions.
-        handle_part_ref(stmt_str, part_ref): Handles array references.
-        handle_intrinsic_function_reference(stmt_str, intrinsic_function_reference): 
-            Translates intrinsic function calls.
+    Attributes
+    ----------
+    extractor : Extractor or None
+        Reference to the extractor instance, or ``None`` if not supplied.
+    replacements : dict
+        Mapping of Fortran relational/logical operator tokens and keywords
+        (``.LT.``, ``.AND.``, ``IF``, ``THEN``, etc.) to their Python textual
+        equivalents. Primarily used as a lookup table when resolving operator
+        tokens to entries in :attr:`conditional_ops_map`.
+    intrinsic_replacements : dict
+        Mapping of Fortran intrinsic function names (``ABS``, ``SQRT``,
+        ``MAXVAL``, ...) to their NumPy/Python equivalents, consulted by
+        :meth:`handle_intrinsic_function_reference`.
+    conditional_ops_map : dict
+        Mapping from Python operator symbols/keywords (``'>'``, ``'and'``,
+        ``'not'``, ...) to their corresponding :mod:`ast` operator node
+        instances (:class:`ast.Gt`, :class:`ast.And`, :class:`ast.Not`,
+        etc.).
+    logger : Logger
+        Logger instance used for structured logging and exception reporting.
+    func_name : str or None
+        Name of the subroutine/function currently being translated; set in
+        :meth:`recursive_ast` when a ``Subroutine_Stmt``/``Function_Stmt`` is
+        encountered and cleared at the corresponding end statement. Used to
+        look up per-function array metadata (see :meth:`_get_func_arrays`).
+    arg_list : list of str
+        Dummy argument names of the subroutine/function currently being
+        translated; populated by :meth:`handle_subroutine_stmt`.
+
+    Notes
+    -----
+    The main entry point is :meth:`recursive_ast`, which performs a
+    depth-first walk of the Fortran AST and dispatches each statement type
+    (assignments, ``DO``/``IF``/``WHERE``/``SELECT CASE`` constructs, ``CALL``
+    and ``PRINT``/``WRITE`` statements, ``CYCLE``/``EXIT``, ``RETURN``, etc.)
+    to a dedicated ``handle_*`` method. Control-flow constructs are tracked
+    via an explicit stack (``control_stack``) and per-construct counters
+    (``counters``) rather than relying on Python's call stack, since Fortran's
+    block-closing statements (``END IF``, ``END DO``, ``END SELECT``) must be
+    matched against possibly nested and chained (``ELSE IF``) constructs.
+
+    Expression-level translation is centralized in :meth:`handle_expr`, which
+    dispatches literals, binary/unary operations, array part references
+    (:meth:`handle_part_ref`), and intrinsic function calls
+    (:meth:`handle_intrinsic_function_reference`) to their respective
+    handlers and returns the corresponding :mod:`ast` node.
+
+    Fortran ``WHERE`` constructs are lowered to ``if mask.any(): ...``
+    blocks combined with boolean-mask subscripting on the left-hand side,
+    implemented via :meth:`handle_where_stmt` and :meth:`apply_mask_to_rhs`.
     """
     def __init__(self,extractor:Optional[Extractor]=None):
-        self.result = []
-        self.ast_mode = False
         self.extractor = extractor
-        self.loop_variables = {} # This is to ensure that each time we loop, the loop variables which are inserted in the order of apparation is properly used
-        self.indentation_level = 0
-        self.npcode = ""
         self.replacements = {
                 r'\bELSE IF\b': 'elif',
                 r'\bIF\b': 'if',
@@ -71,7 +106,7 @@ class F2NP:
                 r'\bINT\b': 'int',
                 r'\bREAL\b': 'float',
                 r'\bMIN\b': 'np.minimum', 
-                r'\bMAX\b': 'np.maximum', # https://medium.com/@amit25173/understanding-element-wise-maximum-in-numpy-43916b1c2002 but perhaps go with np.fmax since it handles NaN values too. 
+                r'\bMAX\b': 'np.maximum', # https://medium.com/@amit25173/understanding-element-wise-maximum-in-numpy-43916b1c2002
                 r'\bMAXVAL\b': 'np.max',
                 r'\bMINVAL\b': 'np.min',
                 r'\bMINLOC\b': 'np.argmin',
@@ -115,81 +150,36 @@ class F2NP:
         self.logger = Logger()
         self.logger.show_header("F2NP")
 
-    def recursive(self, block):
+        self.func_name = None
+
+    def append_to_current_parent(self, stmt: ast.AST, control_stack: List) -> None:
         """
-        Recursively processes a block of Fortran code, identifying and handling different types 
-        of Fortran statements such as subroutines, type declarations, DO loops, IF conditions, 
-        and assignments, converting them to equivalent Python code with NumPy.
-        
-        Parameters:
-        block: A Fortran block of code to be analyzed and transformed.
+        Append *stmt* to the body of the current control-flow parent.
+
+        The current parent is the top of *control_stack*, which may be an
+        ``ast.If``/``ast.For``/``ast.While`` node (appended to its
+        ``.body``), a bare Python list (an ``orelse`` list pushed
+        directly), or a dict carrying an ``'if_chain'`` key (from
+        :attr:`recursive_ast`'s ``SELECT CASE`` handling). If
+        *control_stack* is empty, *stmt* is pushed onto it directly,
+        becoming the new top-level container for subsequent appends.
+
+        Parameters
+        ----------
+        stmt : ast.AST
+            The statement to attach to the current control-flow scope.
+        control_stack : List
+            The stack tracking currently open loop/conditional/select
+            blocks, mutated in place.
+
+        Raises
+        ------
+        RuntimeError
+            If the top of *control_stack* is neither an object with a
+            ``.body`` list, a bare list, nor a recognised dict.
+        Exception
+            Re-raises any unexpected error after logging.
         """
-        if hasattr(block, "content"):
-            idx = 0
-            while idx < len(block.content):
-                child = block.content[idx]
-                if isinstance(child, F23.Subroutine_Stmt):
-                    print('\033[34m' + f"{child}" + '\033[0m')
-                    child = self.handle_subroutine_stmt(child)
-                    self.npcode += f"{self.indentation_level * '    '}{child}\n"
-                    self.indentation_level += 1
-                    print('\033[32m' + f"{child}" + '\033[0m\n')
-                elif isinstance(child, F23.Type_Declaration_Stmt):
-                    print('\033[34m' + f"{child}" + '\033[0m')
-                    child = self.handle_type_declaration_stmt(child)
-                    print('\033[32m' + f"{child}" + '\033[0m\n')
-                    if child is not None:
-                        self.npcode += f"{self.indentation_level * '    '}{child}\n"
-                    else:
-                        del block.content[idx]
-                        continue
-                elif isinstance(child, F23.Nonlabel_Do_Stmt):
-                    print('\033[34m' + f"{child}" + '\033[0m')
-                    child = self.handle_do_stmt(child)
-                    print('\033[32m' + f"{child}" + '\033[0m\n')
-                    self.npcode += f"{self.indentation_level * '    '}{child}\n"
-                    self.indentation_level += 1
-                elif isinstance(child, F23.If_Then_Stmt):
-                    print('\033[34m' + f"{child}" + '\033[0m')
-                    if walk(child, F23.Part_Ref):
-                        child = self.handle_assignment(child)
-                    else:
-                        child = child.tostr()
-                    child = self.handle_if_condition(child)
-                    print('\033[32m' + f"{child}" + '\033[0m\n')
-                    self.npcode += f"{self.indentation_level * '    '}{child}\n"
-                    self.indentation_level += 1
-                elif isinstance(child, (F23.Else_If_Stmt, F23.Else_Stmt)):
-                    print('\033[34m' + f"{child}" + '\033[0m')
-                    self.indentation_level -= 1
-                    if isinstance(child, F23.Else_If_Stmt) and walk(child, F23.Part_Ref):
-                        child = self.handle_assignment(child)
-                    else:
-                        child = child.tostr()
-                    child = self.handle_if_condition(child)
-                    print('\033[32m' + f"{child}" + '\033[0m\n')
-                    self.npcode += f"{self.indentation_level * '    '}{child}\n"
-                    self.indentation_level += 1
-                elif isinstance(child, (F23.End_If_Stmt, F23.End_Do_Stmt, F23.End_Subroutine_Stmt)):
-                    print('\033[34m' + f"{child}" + '\033[0m')
-                    self.indentation_level -= 1
-                    del block.content[idx]
-                    continue
-                elif isinstance(child, F23.Print_Stmt):
-                    print('\033[34m' + f"{child}" + '\033[0m')
-                    child = self.handle_print_stmt(child)
-                    print('\033[32m' + f"{child}" + '\033[0m\n')
-                    self.npcode += f"{self.indentation_level * '    '}{child}\n"
-                elif isinstance(child, F23.Assignment_Stmt):
-                    print('\033[34m' + f"{child}" + '\033[0m')
-                    child = self.handle_assignment(child)
-                    print('\033[32m' + f"{child}" + '\033[0m\n')
-                    self.npcode += f"{self.indentation_level * '    '}{child}\n"
-                else:
-                    self.recursive(child)
-                idx += 1
-    
-    def append_to_current_parent(self, stmt, control_stack:List):
         try:
             if not control_stack:
                 return 
@@ -202,8 +192,7 @@ class F2NP:
                 if hasattr(current_parent, 'body') and isinstance(current_parent.body, list):
                     current_parent.body.append(stmt)
                     
-                elif isinstance(current_parent, list): # This for the case of ELSE statemnt in which the control_stack will contain the 
-                    # orelse list 
+                elif isinstance(current_parent, list): 
                     current_parent.append(stmt)
                 
                 else:
@@ -218,46 +207,115 @@ class F2NP:
         except Exception:
             raise
 
-    def recursive_ast(self, block, ast_mode:bool=True, control_stack:List=None, counters:Dict=None, module_stack:List= None):
+    def recursive_ast(
+        self,
+        block,
+        control_stack: Optional[List] = None,
+        counters: Optional[Dict] = None,
+        module_stack: Optional[List] = None,
+    ) -> Tuple[List, Dict, List]:
         """
-        Recursively traverse and transform a Fortran AST block into a Python AST.
+        Recursively walk a Fortran AST block and build the equivalent
+        Python AST.
+
+        The main entry point of :class:`F2NP`. Iterates ``block.content``
+        and dispatches each child node by type to a dedicated handler,
+        threading three pieces of mutable state through the recursion:
+
+        - *control_stack* — tracks open loop/conditional/select-case
+        blocks so that ``END IF``/``END DO``/``END SELECT`` can be
+        matched against possibly nested and chained (``ELSE IF``)
+        constructs, since Fortran's block-closing statements don't carry
+        explicit nesting depth the way Python's indentation does.
+        - *counters* — per-construct-kind nesting counts (``'do'``,
+        ``'if'``, ``'elif'``, ``'ifwhere'``, ``'elifwhere'``, ``'case'``)
+        used to decide whether a freshly built statement belongs at
+        module level or inside the currently open block.
+        - *module_stack* — the top-level container statements are flushed
+        into once their enclosing block closes.
+
+        Dispatch table (non-exhaustive, by Fortran construct):
+
+        - ``Nonlabel_Do_Stmt`` → :meth:`handle_do_stmt`, pushed onto
+        *control_stack*.
+        - ``If_Then_Stmt`` → :meth:`handle_if_condition`, pushed onto
+        *control_stack*; ``If_Stmt`` (single-line ``IF ... THEN``
+        without a block) is built inline.
+        - ``Assignment_Stmt`` → :meth:`handle_assignment`; when inside a
+        ``WHERE``/``ELSEWHERE`` region (``counters['ifwhere']`` or
+        ``counters['elifwhere']`` > 0), the LHS is additionally wrapped
+        in a ``[mask]`` subscript and the RHS routed through
+        :meth:`apply_mask_to_rhs`.
+        - ``Else_If_Stmt`` / ``Else_Stmt`` → attached to the ``orelse`` of
+        the parent ``ast.If`` on *control_stack*, using
+        :meth:`handle_if_condition` for the new ``elif`` branch.
+        - ``End_Do_Stmt`` / ``End_If_Stmt`` → pops the matching frames from
+        *control_stack* (including unwinding chained ``elif`` frames),
+        flushing into *module_stack* once both ``'do'`` and ``'if'``
+        counters return to zero.
+        - ``Print_Stmt`` / ``Write_Stmt`` → :meth:`handle_print_stmt`.
+        - ``Call_Stmt`` → :meth:`handle_call_stmt`.
+        - ``Where_Stmt`` / ``Where_Construct_Stmt`` /
+        ``Masked_Elsewhere_Stmt`` / ``Elsewhere_Stmt`` / ``End_Where_Stmt``
+        → lowered to ``if mask.any(): ...`` chains via
+        :meth:`handle_where_stmt`, mirroring the ``If``/``Else``
+        bookkeeping above but tracked through ``counters['ifwhere']``
+        and ``counters['elifwhere']``.
+        - ``Subroutine_Stmt`` / ``Function_Stmt`` → :meth:`handle_subroutine_stmt`,
+        setting :attr:`func_name`; the matching ``End_Function_Stmt`` /
+        ``End_Subroutine_Stmt`` folds all of *module_stack* into the
+        function body and appends a ``return`` node if the parsed suffix
+        indicates a function result variable.
+        - ``Type_Declaration_Stmt`` → :meth:`handle_type_declaration_stmt`,
+        skipped for names already present in :attr:`arg_list` (dummy
+        arguments don't need local declarations).
+        - ``Cycle_Stmt`` / ``Exit_Stmt`` → ``ast.Continue()`` /
+        ``ast.Break()``, requiring an open ``DO`` loop.
+        - ``Select_Case_Stmt`` / ``Case_Stmt`` / ``End_Select_Stmt`` →
+        built into a chained ``ast.If``/``orelse`` structure via an
+        internal dict frame (``{'type': 'select_case', 'switch_expr':
+        ..., 'if_chain': ...}``) pushed onto *control_stack*.
+        - ``Return_Stmt`` → ``ast.Return()``, with explicit values resolved
+        through :meth:`handle_expr`.
+        - Any other node type → recurses into it directly via a nested
+        :meth:`recursive_ast` call, propagating the same three state
+        objects.
 
         Parameters
         ----------
         block : object
-            A node or block from the Fortran abstract syntax tree (AST) to be transformed.
-        ast_mode : bool, optional
-            If True, perform the transformation in AST mode; otherwise, may apply alternate processing to python string.
-            Default is True.
-        control_stack : list, optional
-            Stack used to keep track of control flow constructs (loops, conditionals) during recursion.
-            If None, an empty list is initialized.
-        counters : dict, optional
-            Dictionary to track counters or indices related to AST nodes during traversal.
-            If None, an empty dictionary is initialized.
-        module_stack : list, optional
-            Stack to track the primary module contexts in the Fortran AST.
-            If None, an empty list is initialized.
+            A node or block from the Fortran AST (must expose a
+            ``.content`` list) to translate.
+        control_stack : List, optional
+            Stack tracking open control-flow constructs. A fresh list is
+            created if ``None``.
+        counters : Dict, optional
+            Per-construct nesting counters. A fresh dict with all counts
+            at zero is created if ``None``.
+        module_stack : List, optional
+            Top-level statement container. A fresh list is created if
+            ``None``.
 
         Returns
         -------
-        control_stack : list, optional
-            Stack used to keep track of control flow constructs (loops, conditionals) during recursion.
-            If None, an empty list is initialized.
-        counters : dict, optional
-            Dictionary to track counters or indices related to AST nodes during traversal.
-            If None, an empty dictionary is initialized.
-        module_stack : list, optional
-            Stack to track the primary module contexts in the Fortran AST.
-            If None, an empty list is initialized.
+        Tuple[List, Dict, List]
+            ``(control_stack, counters, module_stack)`` — the same objects
+            passed in (or freshly created), mutated to reflect the final
+            state after traversal.
 
+        Raises
+        ------
+        AttributeError
+            If *block* has no ``.content`` attribute.
+        Exception
+            Re-raises any unexpected error after logging.
+        
         Notes
         -----
         This method recursively walks the Fortran AST, transforming nodes into their Python AST
         equivalents. The stacks and counters assist in maintaining contextual information throughout
         the traversal, supporting accurate translation of control flow and modular constructs.
         """
-        self.ast_mode = ast_mode
         if control_stack is None: # THis will now be used for the loops and conditional elements
             control_stack = []
 
@@ -275,9 +333,9 @@ class F2NP:
                     if isinstance(child, F23.Nonlabel_Do_Stmt):
                         for_loop = self.handle_do_stmt(child)
                         self.append_to_current_parent(for_loop, control_stack)
-                        control_stack.append(for_loop)  # for_loop has a body
+                        control_stack.append(for_loop)  
                         counters['do'] += 1
-                        # print(ast.unparse(ast.fix_missing_locations(for_loop)))
+                        
                     # Handle IF-THEN
                     elif isinstance(child, F23.If_Then_Stmt):
                         if walk(child, F23.Part_Ref):
@@ -285,7 +343,7 @@ class F2NP:
                             
                         if_stmt = self.handle_if_condition(child)
                         self.append_to_current_parent(if_stmt, control_stack)
-                        control_stack.append(if_stmt)  # if_stmt has body
+                        control_stack.append(if_stmt)  
                         counters['if'] += 1
                     
                     elif isinstance(child,F23.If_Stmt):
@@ -302,17 +360,13 @@ class F2NP:
                             module_stack.append(if_stmt)
                         else:
                             self.append_to_current_parent(if_stmt, control_stack)
-                            # control_stack.append(if_stmt)
-
+                            
                     elif isinstance(child,F23.Assignment_Stmt):
                         stmt = self.handle_assignment(child)
-                        # print(counters, ast.unparse(ast.fix_missing_locations(stmt)))
-                        if counters["if"] == 0 and counters["do"] == 0 and counters['case'] == 0: # We don't need to check for the counters['elif'] since the if the `if` counters is empty then elif is also empty 
-                            # since elif can't exist without the other. 
-                            # control_stack.append(stmt)
+
+                        if counters["if"] == 0 and counters["do"] == 0 and counters['case'] == 0: 
                             if counters['ifwhere'] > 0 or counters["elifwhere"] > 0:
-                                # Need to create a deepcopy if not they will share the same address, found out the hard way during the
-                                # rest of the process
+                                # Need to create a deepcopy if not they will share the same address
                                 stmt_copy = copy.deepcopy(stmt)
                                 # Now we need to modify the stmt itself
                                 stmt = ast.Assign( 
@@ -329,12 +383,10 @@ class F2NP:
                                 else:
                                     module_stack.append(stmt)
                             else:
-                                # print(ast.unparse(ast.fix_missing_locations(stmt)))
                                 module_stack.append(stmt)
                         else:
                             if counters['ifwhere'] > 0:
-                                # Need to create a deepcopy if not they will share the same address, found out the hard way during the
-                                # rest of the process
+                                # Need to create a deepcopy if not they will share the same address
                                 stmt_copy = copy.deepcopy(stmt)
 
                                 stmt = ast.Assign( 
@@ -343,22 +395,18 @@ class F2NP:
                                         slice = ast.Name(id='mask',ctx=ast.Load()),
                                         ctx = ast.Store()
                                     )],
-                                    # value=stmt_copy.value
-                                    value=self.apply_mask_to_rhs(stmt_copy.value) if getattr(self,"extractor", None) else stmt_copy.value # We need to check the RHS to see if the target name is present and and apply the mask
+                                    value=self.apply_mask_to_rhs(stmt_copy.value) if getattr(self,"extractor", None) else stmt_copy.value 
                                 )
 
                                 if control_stack and isinstance(control_stack[-1], (ast.If,list)):
                                     self.append_to_current_parent(stmt, control_stack=control_stack)
                                 else:
                                     control_stack.append(stmt)
-
-                                # self.append_to_current_parent(stmt,control_stack=control_stack)
                             else:
                                 self.append_to_current_parent(stmt, control_stack)
 
                     elif isinstance(child, (F23.Else_If_Stmt, F23.Else_Stmt)):
                         if not control_stack or not isinstance(control_stack[-1], ast.If):
-                            # print(ast.unparse(ast.fix_missing_locations(control_stack[-1][0])))
                             raise RuntimeError("Else/Else If without a preceding If")
 
                         parent_if = control_stack[-1] # We go back to the parent if of the current else/else if statement
@@ -379,7 +427,6 @@ class F2NP:
                             counters["elif"] += 1
 
                         if isinstance(child, F23.Else_Stmt):
-                            # print(child)
                             # https://stackoverflow.com/questions/44728436/difference-between-nested-if-else-and-elif
                             if not control_stack or not isinstance(control_stack[-1], ast.If):
                                 raise RuntimeError("Else without a preceding If")
@@ -387,40 +434,40 @@ class F2NP:
                             control_stack.append(parent_if.orelse)
                             
                     elif isinstance(child, (F23.End_Do_Stmt, F23.End_If_Stmt)):
-                        if ast_mode and control_stack:
+                        if control_stack:
                             if isinstance(child,F23.End_Do_Stmt) and counters["do"] != 0:
                                 counters['do'] -= 1
-                                #self.loop_variables.popitem() # Pops the last inserted loop variables key and value 
                             elif isinstance(child,F23.End_If_Stmt) and counters["if"] != 0:
                                 counters['if'] -= 1
 
                             if len(control_stack) > 1:
-                                # Special handling for ELSE and ELSE IF:
-                                # In these cases, we temporarily pushed the `orelse` list (a Python list) onto the stack so `popped` may be a list instead of an AST node.
+                                # NOTE: Special handling for ELSE and ELSE IF:
+                                # In these cases, we temporarily pushed the `orelse` list (a Python list) 
+                                # onto the stack so `popped` may be a list instead of an AST node.
                                 # If the popped element is a list and the current top of stack is an ast.If node,
-                                # then we are finishing an ELSE/ELSE IF(which is basically a IF) block, and we may also need to pop the corresponding IF.
-                                # print(control_stack[-1],control_stack[-2],counters["if"])
-                                if isinstance(control_stack[-1],list) and isinstance(control_stack[-2],ast.If): # and counters["if"] != 0
-                                    # This is primarily used for removing the else if present inside the if loop
+                                # then we are finishing an ELSE/ELSE IF(which is basically a IF) block, 
+                                # and we may also need to pop the corresponding IF.
+                                
+                                if isinstance(control_stack[-1],list) and isinstance(control_stack[-2],ast.If):
                                     control_stack.pop()
                                 if counters["elif"] > 0: 
-                                    # Case: nested IF/ELIF chains
-                                    # Fortran uses a single END IF to close a chain of IF / ELSE IF / ELSE, whereas Python AST uses nested `if` statements in `orelse`.
-                                    # We need to pop all the nested `ast.If` nodes representing the ELSE IF chain and thanks to the elif statement
-                                    # we can ensure that we remoeve only the corresponding the number of if(elif). 
+                                    # NOTE: Case: nested IF/ELIF chains
+                                    # Fortran uses a single END IF to close a chain of IF / ELSE IF / ELSE, 
+                                    # whereas Python AST uses nested `if` statements in `orelse`.
+                                    # We need to pop all the nested `ast.If` nodes representing the 
+                                    # ELSE IF chain and thanks to the elif statement
+                                    # we can ensure that we remove only the corresponding the number of if(elif). 
                                     while counters["elif"] > 0:
                                         if isinstance(control_stack[-1], ast.If):
                                             control_stack.pop()
                                             counters["elif"] -= 1
                                         else:
                                             break  
-                                # print(control_stack) 
+                                 
                                 if len(control_stack) > 1:
-                                    control_stack.pop() # Now we pop the if corresponding to the parent if 
-                                # print(control_stack)
-                        if counters["do"] == 0 and counters["if"] == 0: # we don't take into account the elif since we primarily based on 
-                            # when the end do or end if appear
-                            # print(control_stack,counters)
+                                    control_stack.pop() 
+                                
+                        if counters["do"] == 0 and counters["if"] == 0:
                             module_stack.extend(control_stack)
                             control_stack.clear()
                             
@@ -429,10 +476,11 @@ class F2NP:
                         pass
                         
                     elif isinstance(child,(F23.Print_Stmt,F23.Write_Stmt)):
-                        # FOR NOW WE will treat it as a print since numout = 6 in the class https://docs.oracle.com/cd/E19957-01/805-4940/6j4m1u7oh/index.html
+                        # NOTE: FOR NOW WE will treat it as a print since numout = 6 in the class 
+                        # https://docs.oracle.com/cd/E19957-01/805-4940/6j4m1u7oh/index.html
                         # https://stackoverflow.com/questions/28620899/difference-between-write-and-write6-in-fortran
-                        # Since 1363 is to write into the files. '(a,i2.2,"|",F13.4,"|",F13.4,"|",3(F9.6))' in split soil
-                        # print(child.children)
+                        # Since 1363 is to write into the files
+                        
                         if not any(walk(walk(child,F23.Io_Control_Spec),F23.Int_Literal_Constant)):
                             stmt = self.handle_print_stmt(child)
                             if counters["do"] == 0 and counters["if"] == 0:
@@ -458,7 +506,6 @@ class F2NP:
                         value_stmt_ast = self.handle_assignment(child.children[1])
 
                         stmt_copy = copy.deepcopy(value_stmt_ast)
-                                # Now we need to modify the stmt itself
                         stmt = ast.Assign( 
                             targets= [ast.Subscript(
                                 value = stmt_copy.targets[0],
@@ -473,9 +520,8 @@ class F2NP:
                         else:
                             self.append_to_current_parent(stmt, control_stack)
 
-                        
                     elif isinstance(child,F23.Where_Construct_Stmt):
-                        # This corresponds to the IF format
+                        # NOTE: Where statements are transformed into If/else of Python
                         stmt = self.handle_where_stmt(child)
                         counters['ifwhere'] += 1
                         if counters["do"] == 0 and counters["if"] == 0:
@@ -487,29 +533,23 @@ class F2NP:
                             control_stack.append(stmt)
 
                     elif isinstance(child,(F23.Masked_Elsewhere_Stmt,F23.Elsewhere_Stmt)):
-                        # This corresponds to the ELSEIF format look at replace_where in modifier.py
                         if counters["do"] == 0 and counters["if"] == 0:
                             stack_to_check = module_stack
                         else:
                             stack_to_check = control_stack
 
                         if not stack_to_check or not isinstance(stack_to_check[-1], ast.If):
-                            # print(ast.unparse(ast.fix_missing_locations(control_stack[-1][0])))
                             raise RuntimeError("Else/Else If for where stmt without a preceding If")
                         
-                        parent_if = stack_to_check[-1] # We go back to the parent if of the current else/else if statement
-                        # print(child)
+                        parent_if = stack_to_check[-1] 
                         if isinstance(child, F23.Masked_Elsewhere_Stmt):
                             # Create new ast.If node for Else If
                             if isinstance(child, F23.Masked_Elsewhere_Stmt) and walk(child, F23.Part_Ref): 
                                 child = self.handle_assignment(child)
                             
                             elif_node = self.handle_where_stmt(child)
-                            # while stack_to_check and not isinstance(stack_to_check[-1], ast.If):
-                            #     stack_to_check.pop()
                             # Attach to orelse of previous If the new instance IF 
                             parent_if.orelse.append(elif_node) 
-                            # print(ast.dump(parent_if,indent=4))
                             # But we move on to the newly created elif_node
                             stack_to_check.append(elif_node)
                             counters["elifwhere"] += 1
@@ -529,8 +569,7 @@ class F2NP:
 
                         if stack_to_check:
                             if len(stack_to_check) > 1:
-                                if isinstance(stack_to_check[-1],list) and isinstance(stack_to_check[-2],ast.If): # and counters["if"] != 0
-                                    # This is primarily used for removing the else if present inside the if loop
+                                if isinstance(stack_to_check[-1],list) and isinstance(stack_to_check[-2],ast.If):
                                     stack_to_check.pop()
                                 if counters["elifwhere"] > 0: 
                                     while counters["elifwhere"] > 0:
@@ -539,7 +578,6 @@ class F2NP:
                                             counters["elifwhere"] -= 1
                                         else:
                                             break  
-                                # print(control_stack) 
                                 if len(stack_to_check) > 1:
                                     stack_to_check.pop()
 
@@ -547,6 +585,7 @@ class F2NP:
                         pass
 
                     elif isinstance(child,F23.Subroutine_Stmt):
+                        self.func_name = child.items[1].string
                         stmt = self.handle_subroutine_stmt(child)
                         if stmt is None:
                             raise ValueError(f'AST subroutine function statement is None due to prior error')
@@ -568,20 +607,21 @@ class F2NP:
                             for node in module_stack[1:]:
                                 func_body.append(node)
                                 
-                            module_stack[:] = [func_def] # In the case, we send the function definition, we keep only the function def since
-                            # we have appended the execution part inside the body
+                            module_stack[:] = [func_def] 
                             if isinstance(child,F23.End_Function_Stmt):
-                                # Try to check if teh eleemnt SUFFIX is present or not, which usually means that we have a function and not a subroutine 
+                                # Try to check if the element SUFFIX is present or not, which usually means that we have a function and not a subroutine 
                                 return_stmt = walk(walk(child.parent,F23.Suffix),F23.Name)[0]
                                 return_node = ast.Return()
                                 if return_stmt:
                                     return_node.value = ast.Name(id=return_stmt.string,ctx=ast.Load())
                             
                                     func_def.body.append(return_node)
+                            self.func_name = None
                         else:
                             raise AttributeError("Function definition does not have a 'body' attribute")
                     
                     elif isinstance(child, F23.Function_Stmt):
+                        self.func_name = child.items[1].string
                         stmt = self.handle_subroutine_stmt(child)
                         if stmt is None:
                             raise ValueError(f'AST function statement is None due to prior error')
@@ -596,7 +636,6 @@ class F2NP:
                         else:
                             self.append_to_current_parent(stmt, control_stack)
 
-                    
                     elif isinstance(child,F23.Exit_Stmt):
                         stmt = ast.Break()
 
@@ -635,7 +674,7 @@ class F2NP:
                             prev_if = select_info['if_chain']
                             if prev_if is None:
                                 raise RuntimeError("CASE DEFAULT without any preceding CASE")
-                            # Default → orelse list of the last if
+                            # Default -> orelse list of the last if
                             prev_if.orelse = []
                             control_stack.append(prev_if.orelse)
                         else:
@@ -667,9 +706,6 @@ class F2NP:
                                     prev_if = prev_if.orelse[0]
                                 prev_if.orelse = [case_if]
                                 select_info['if_chain'] = case_if
-
-                            # # Push this CASE to stack (so body statements append correctly)
-                            # control_stack.append(case_if)
                     
                     elif isinstance(child, F23.End_Select_Stmt):
                         if counters.get('case', 0) > 0:
@@ -701,299 +737,585 @@ class F2NP:
                     elif isinstance(child, F23.Intrinsic_Stmt):
                         pass 
                     else:   
-                        self.recursive_ast(child, ast_mode=ast_mode, control_stack=control_stack,counters=counters,module_stack=module_stack)
+                        self.recursive_ast(child, control_stack=control_stack,counters=counters,module_stack=module_stack)
                 
                 except Exception as e:
                     self.logger.exception(f"Exception in recursive block at index {idx}, block type: {type(child).__name__}", e)
                     raise 
                     
                 idx += 1
-                # print(counters, module_stack, child)
         else:
             raise AttributeError(f"Block doesn't have the `content` attribute for the block : {block}, {type(block)}")
         
         return control_stack,counters,module_stack
 
-    def handle_subroutine_stmt(self, stmt) -> Union[str,ast.FunctionDef]:
+    def handle_subroutine_stmt(
+        self,
+        stmt: Union[F23.Subroutine_Stmt, F23.Function_Stmt],
+    ) -> ast.FunctionDef:
         """
-        Handles a Fortran subroutine statement, extracting its name and arguments,
-        and converting it into a Python function definition.
-        
-        Parameters
-        ----------
-        stmt 
-            A Fortran subroutine statement to be converted.
-        
-        Returns
-        -------
-        str|ast.FunctionDef
-            Python function definition corresponding to the subroutine or Python AST based on the `ast_mode` attribute. 
-        """
-        self.arg_list = []
-        for child in stmt.children:
-            if child is None:
-                continue
-            if isinstance(child, F23.Name):
-                subroutine_name = child.tostr()
-            elif isinstance(child, F23.Dummy_Arg_List):
-                arg_list = child.tostr()
-                for gchild in child.children:
-                    self.arg_list.append(gchild.tostr())
-        if not self.ast_mode:
-            return f"def {subroutine_name}({arg_list}):"
-        else:
-            try:                
-                args = [ast.arg(arg) for arg in self.arg_list]                
-                function_def = ast.FunctionDef(
-                    name = subroutine_name,
-                        args = ast.arguments(
-                            posonlyargs=[],
-                            args = args,
-                            kwonlyargs=[],
-                            kw_defaults=[],
-                            defaults=[]
-                        ),
-                        body = [],
-                        decorator_list=[]
-                    ) 
-                return function_def
-            except Exception as e:
-                self.logger.exception(f'Exception in handle_subroutine_stmt', e)
-                raise 
+        Convert a Fortran ``SUBROUTINE``/``FUNCTION`` statement into a
+        Python ``ast.FunctionDef`` shell.
 
-    def handle_call_stmt(self, stmt) -> Union[str,ast.Expr]:
-        """
-        Handles a Fortran CALL statement, converting it to a Python function call or AST based on the `ast_mode` attribute
-        
+        Extracts the routine name and its dummy argument list, populating
+        :attr:`arg_list` so that later declarations
+        (:meth:`handle_type_declaration_stmt`, dispatched from
+        :meth:`recursive_ast`) can skip names that are already parameters.
+        The returned function has an empty body; statements are appended
+        to it later as :meth:`recursive_ast` processes the routine's
+        content, and the body is folded in when the matching
+        ``End_Function_Stmt``/``End_Subroutine_Stmt`` is reached.
+
         Parameters
         ----------
-        stmt
-            A Fortran CALL statement.
-        
+        stmt : F23.Subroutine_Stmt or F23.Function_Stmt
+            The Fortran subroutine/function statement to convert.
+
         Returns
         -------
-        str|ast.Expr
-            Python function call equivalent to the Fortran CALL or Expression based on the `ast_mode` attribute.
+        ast.FunctionDef
+            Function definition with name and arguments populated, empty
+            body.
+
+        Raises
+        ------
+        Exception
+            Re-raises any unexpected error after logging.
         """
-        if not self.ast_mode:
+
+        try:
+            self.arg_list = []
             for child in stmt.children:
                 if child is None:
                     continue
                 if isinstance(child, F23.Name):
                     subroutine_name = child.tostr()
-                elif isinstance(child, F23.Actual_Arg_Spec_List):
+                elif isinstance(child, F23.Dummy_Arg_List):
                     arg_list = child.tostr()
-            return f"{subroutine_name}({arg_list})"
-        else:
-            try:
-                if not hasattr(stmt,'children'):
-                    raise AttributeError(f'stmt has no children')
-                
-                if len(stmt.children) != 2:
-                    raise ValueError('Expected two children: function_name and args_spec_list')
-                
-                function_name,args_spec_list = stmt.children
-                args = []
-                stmt = None
-                special_skip_functions = {"xios_orchidee_send_field", "xios_orchidee_recv_field"}
+                    for gchild in child.children:
+                        self.arg_list.append(gchild.tostr())
+        
+                     
+            args = [ast.arg(arg) for arg in self.arg_list]                
+            function_def = ast.FunctionDef(
+                name = subroutine_name,
+                    args = ast.arguments(
+                        posonlyargs=[],
+                        args = args,
+                        kwonlyargs=[],
+                        kw_defaults=[],
+                        defaults=[]
+                    ),
+                    body = [],
+                    decorator_list=[]
+                ) 
+            return function_def
+        except Exception as e:
+            self.logger.exception(f'Exception in handle_subroutine_stmt', e)
+            raise 
 
-                if not function_name.string in self.extractor.allowed_external_subroutines:
-                    for arg in args_spec_list.children:
-                        arg_ast = self.handle_expr(arg)
-                        # if self.loop_variables:
-                        #     adjust_loop_variables(arg_ast,self.loop_variables)
-                        args.append(arg_ast)
-                        
-                    stmt = ast.Expr(value = ast.Call(
-                                            func = ast.Name(id = function_name.string, ctx = ast.Load()),
-                                            args = args,
-                                            keywords = []
-                                        )
-                                    )
-                else:
-                    
-                    for arg in args_spec_list.children:
-                        if isinstance(arg, F23.Char_Literal_Constant):
-                            value = arg.items[0].strip(" ' ") # this will remove the 'hydrol' and if there any extra '' inside
-                            args.append(value)
-                    
-                    logging_method ='info' if function_name.string in special_skip_functions else 'error'
-
-                    args.insert(0, "Exception:" if not function_name.string in special_skip_functions else f'INFO: {function_name.string}:')
-                    final_message = " ".join(args)
-                    
-                    # logging.error AST call
-                    stmt = ast.Expr(
-                        value=ast.Call(
-                            func=ast.Attribute(
-                                value=ast.Name(id='logging', ctx=ast.Load()),
-                                attr=logging_method,
-                                ctx=ast.Load()
-                            ),
-                            args=[ast.Constant(value=final_message)],
-                            keywords=[]
-                        )
-                    )
-                return stmt
-            except Exception:
-                self.logger.exception(f'Exception in handle_call_stmt:')
-                raise 
-
-    def handle_type_declaration_stmt(self, stmt) -> Union[str,ast.Assign]:
+    
+    def handle_call_stmt(self, stmt: F23.Call_Stmt) -> ast.Expr:
         """
-        Handles a Fortran type declaration, converting it to a NumPy array declaration.
-        It determines the data type (e.g., REAL, INTEGER) and the dimensions of the array.
+        Convert a Fortran ``CALL`` statement into a Python call expression.
+
+        Two cases are handled based on whether the called routine appears
+        in :attr:`extractor`'s ``allowed_external_subroutines``: ordinary
+        calls are built via :meth:`_build_regular_call`; calls to routines
+        in that set are instead treated as logging calls and built via
+        :meth:`_build_call_logging` (used for routines like XIOS field
+        send/receive that have no meaningful Python translation but whose
+        invocation is worth recording).
 
         Parameters
         ----------
-        stmt
-            A Fortran type declaration statement.
-        
-        Returns:
-        str | ast.Assign
-            NumPy array declaration corresponding to the Fortran type declaration or the AST based on the `ast_mode` attribute
+        stmt : F23.Call_Stmt
+            The Fortran ``CALL`` statement to convert.
+
+        Returns
+        -------
+        ast.Expr
+            An expression statement wrapping either a regular function
+            call or a logging call.
+
+        Raises
+        ------
+        AttributeError
+            If *stmt* has no ``children`` attribute.
+        ValueError
+            If *stmt* does not have exactly two children (function name
+            and argument spec list).
+        Exception
+            Re-raises any unexpected error after logging.
         """
-        if not self.ast_mode:
-            var_part = []
-            for child in stmt.children:
-                if child is None:
-                    continue
-                if isinstance(child, F23.Intrinsic_Type_Spec):
-                    if child.children[0]=='REAL':
-                        dtype = 'float32'
-                    elif child.children[0]=='INTEGER':
-                        dtype = 'int'
-                    elif child.children[0]=='LOGICAL':
-                        dtype = 'bool'
-                    else:
-                        raise ValueError("unknown dtype")
-                elif isinstance(child, F23.Entity_Decl_List):
-                    entity_decls = walk(child, F23.Entity_Decl)
-                    assert len(entity_decls) == 1,\
-                            "walk(child, F23.Entity_Decl)!= 1, but got a different number."
-                    if entity_decls[0].tostr() not in self.arg_list:
-                        var_part = entity_decls[0].tostr()
-                    else:
-                        return None
-            if walk(stmt, F23.Explicit_Shape_Spec):
-                shape = []
-                for dim in walk(stmt, F23.Explicit_Shape_Spec):
-                    shape.append(dim.tostr())
-                shape.reverse()
-                dimensions = ', '.join([name for name in shape])
-            else:
-                return None
+        
+        try:
+            if not hasattr(stmt, 'children'):
+                raise AttributeError('stmt has no children')
 
-            return f"{var_part} = np.zeros(({dimensions}),dtype={dtype})"
-        else:
-            shape = []
-            TYPE = {'REAL':'np.float64','INTEGER':'np.int32', 'LOGICAL':'np.bool'}
-            ast_stmt = None
-            try: 
-                for dim in walk(stmt,F23.Explicit_Shape_Spec):
-                    left,right = None,None
-                    lb,ub = dim.children[0],dim.children[1]
-                    if lb and ub:
-                        # This for the formula: ub - lb + 1
-                        right = self.handle_expr(lb)
-                        left = self.handle_expr(ub)
-                        
-                        arg_shape = ast.BinOp(
-                                left = ast.BinOp(
-                                    left = left,
-                                    op = ast.Sub(),
-                                    right = right),
-                                op = ast.Add(),
-                                right = ast.Constant(1))
-                        
-                        shape.append(arg_shape)
-                    elif lb:
-                        # Only lower bound is given
-                        shape.append(self.handle_expr(lb))
+            if len(stmt.children) != 2:
+                raise ValueError('Expected two children: function_name and args_spec_list')
 
-                    elif ub:
-                        # Only upper bound is given
-                        shape.append(self.handle_expr(ub))
-                    else:
-                        raise ValueError(f'Both of the, lower bound:{lb}, upper bound:{ub}')
-                
-                if shape:
-                    name = walk(walk(stmt,F23.Entity_Decl),F23.Name)[0].string
-                    
-                    fdtype = walk(stmt,F23.Intrinsic_Type_Spec)[0].children[0]
-                    np_dtype = TYPE.get(fdtype)
-                    idx,attr = np_dtype.split('.')
-                    if np_dtype is None:
-                        raise KeyError("Non corresponding key given")
-                    
-                    if walk(stmt,F23.Array_Constructor):
-                        array_list = walk(walk(stmt,F23.Array_Constructor),F23.Ac_Value_List)[0]
-                        elements = []
-                        for val in array_list.children:
-                            elements.append(self.handle_expr(val))
+            function_node, args_spec_list = stmt.children
+            func_name = function_node.string
 
-                        val = ast.Call(
-                                func=ast.Attribute(value=ast.Name(id='np', ctx=ast.Load()), attr='array', ctx=ast.Load()),
-                                args=[ast.List(elts=elements, ctx=ast.Load())],
-                                keywords=[ast.keyword(arg='dtype',
-                                    value=ast.Attribute(value=ast.Name(id=idx, ctx=ast.Load()), attr=attr, ctx=ast.Load()))]
-                            )
-                        ast_stmt = ast.Assign(
-                                                targets=[ast.Name(id=name,ctx=ast.Store())],
-                                                value=val
-                                            )
-                    else:
-                        ast_stmt = ast.Assign(
-                            targets = [ast.Name(id=name,ctx=ast.Store())],
-                            value = ast.Call(func=ast.Attribute(value=ast.Name(id=idx,ctx=ast.Load()),attr='zeros',ctx=ast.Load()),
-                                            args = [ast.Tuple(elts=shape,ctx=ast.Load())],
-                                            keywords = [
-                                                ast.keyword(arg='dtype',value = ast.Attribute(value=ast.Name(id = idx,ctx=ast.Load()),
-                                                                                            attr=attr,
-                                                                                            ctx=ast.Load()))
-                                            ]))
+            # Case 1: regular function call
+            if func_name not in self.extractor.allowed_external_subroutines:
+                return ast.Expr(value=self._build_regular_call(func_name, args_spec_list))
+
+            # Case 2: special/logging call
+            return self._build_call_logging(func_name, args_spec_list)
+
+        except Exception:
+            self.logger.exception('Exception in handle_call_stmt')
+            raise
+
+    def _build_regular_call(self, func_name: str, args_spec_list: F23.Base) -> ast.Call:
+        """
+        Build a plain Python function call AST node.
+
+        Each argument in *args_spec_list* is converted via
+        :meth:`handle_expr`. Used both by :meth:`handle_call_stmt` for
+        ordinary ``CALL`` statements and by :meth:`handle_part_ref` when a
+        part reference resolves to a function call rather than an array
+        access.
+
+        Parameters
+        ----------
+        func_name : str
+            Name of the function to call.
+        args_spec_list : F23.Base
+            Fortran node containing the call's argument list.
+
+        Returns
+        -------
+        ast.Call
+            The constructed call expression.
+        """
+        args = [
+            self.handle_expr(arg)
+            for arg in args_spec_list.children
+        ]
+
+        return ast.Call(
+                func=ast.Name(id=func_name, ctx=ast.Load()),
+                args=args,
+                keywords=[]
+            )
+
+    def _build_call_logging(self, func_name: str, args_spec_list: F23.Base) -> ast.Expr:
+        """
+        Convert a special Fortran ``CALL`` into a Python ``logging`` call.
+
+        Routines in a fixed set (XIOS field send/receive) are logged at
+        ``INFO`` level with an ``"INFO: <name>:"`` prefix; any other
+        routine in :attr:`extractor`'s allowed-external set is logged at
+        ``ERROR`` level with an ``"Exception:"`` prefix. String literal
+        arguments are extracted via :meth:`_extract_string_args` and
+        joined into the log message, then passed to
+        :meth:`_build_logging_call` as a raw message.
+
+        Parameters
+        ----------
+        func_name : str
+            Name of the function being called.
+        args_spec_list : F23.Base
+            Fortran node representing the call's arguments.
+
+        Returns
+        -------
+        ast.Expr
+            Expression statement wrapping the logging call.
+        """
+
+        special_skip_functions = {
+            "xios_orchidee_send_field",
+            "xios_orchidee_recv_field"
+        }
+
+        string_args = self._extract_string_args(args_spec_list)
+
+        is_info = func_name in special_skip_functions
+        level = "info" if is_info else "error"
+
+        prefix = (
+            f"INFO: {func_name}:"
+            if is_info
+            else "Exception:"
+        )
+
+        message = " ".join([prefix] + string_args)
+        call = self._build_logging_call(
+            level=level,
+            raw_message=message
+        )
+
+        return ast.Expr(value=call)
+
+    
+    def _extract_string_args(self, args_spec_list: F23.Base) -> List[str]:
+        """
+        Extract string literal values from a call's argument list.
+
+        Only ``F23.Char_Literal_Constant`` arguments are extracted; other
+        argument kinds are ignored. Used by :meth:`_build_call_logging` to
+        assemble the text of a logging message.
+
+        Parameters
+        ----------
+        args_spec_list : F23.Base
+            Fortran node containing the call's argument list.
+
+        Returns
+        -------
+        List[str]
+            String literal values, with surrounding quotes stripped.
+        """
+        values = []
+
+        for arg in args_spec_list.children:
+            if isinstance(arg, F23.Char_Literal_Constant):
+                # safer strip (only quotes, not spaces inside)
+                value = arg.items[0].strip().strip("'").strip('"')
+                values.append(value)
+
+        return values
+
+    def handle_type_declaration_stmt(self, stmt: F23.Type_Declaration_Stmt) -> ast.Assign:
+        """
+        Convert a Fortran type declaration into a NumPy-backed Python
+        assignment.
+
+        Dispatches to one of three builders depending on the declaration
+        shape, determined via :meth:`_extract_shapes`,
+        :meth:`_extract_decl_name`, and :meth:`_extract_dtype`:
+
+        - An array with an explicit constructor (``walk(stmt,
+        F23.Array_Constructor)`` non-empty) → :meth:`_build_array_from_constructor`.
+        - An array without a constructor → :meth:`_build_zeros_array`.
+        - A scalar declaration → :meth:`_handle_scalar_declaration`.
+
+        Parameters
+        ----------
+        stmt : F23.Type_Declaration_Stmt
+            The Fortran type declaration statement to convert.
+
+        Returns
+        -------
+        ast.Assign
+            Assignment initialising the declared variable.
+        
+        Raises
+        ------
+        Exception
+            Re-raises any unexpected error after logging.
+        """
+        
+        try:
+            func_arrays = self._extract_shapes(stmt)
+
+            name = self._extract_decl_name(stmt)
+            dtype_name, dtype_attr = self._extract_dtype(stmt)
+
+            # Case 1: Array declaration
+            if func_arrays:
+                if bool(walk(stmt, F23.Array_Constructor)):
+                    value = self._build_array_from_constructor(stmt, dtype_name, dtype_attr)
                 else:
-                    intrinsic_type_spec,_,entity_decl_list = stmt.children # This gives out a tuple
-                    entity_decls = entity_decl_list.children
+                    value = self._build_zeros_array(func_arrays, dtype_name, dtype_attr)
 
-                    np_dtype = TYPE.get(intrinsic_type_spec.string, 'np.float64')
-                    idx,attr = np_dtype.split('.')
+                return ast.Assign(
+                    targets=[ast.Name(id=name, ctx=ast.Store())],
+                    value=value
+                )
 
-                    for entity_decl in entity_decls:
-                        var_name, _,_, initialization = entity_decl.children
+            # Case 2: Scalar declaration
+            return self._handle_scalar_declaration(stmt, dtype_name, dtype_attr)
 
-                        target = ast.Name(id=var_name.string, ctx=ast.Store())
-                        value = None
-                        if initialization is not None:
-                            _,value = initialization.children
-                        if not isinstance(value,F23.Name):
-                            if intrinsic_type_spec.children[0] in ["REAL", "INTEGER"]:
-                                num_var = self.handle_expr(value)
-                                ast_stmt = ast.Assign(
-                                            targets=[target],
-                                            value=ast.Call( func=ast.Attribute(value=ast.Name(id=idx, ctx=ast.Load()), attr=attr, ctx=ast.Load()),
-                                                        args=[num_var],
-                                                        keywords = []
-                                                    )
-                                        )
-                            elif intrinsic_type_spec.children[0] == "LOGICAL":
-                                if value.string.split(".")[1] == "TRUE":
-                                    bool_val = True
-                                        
-                                    bool_call = ast.Call(
-                                                func=ast.Attribute(value=ast.Name(id='np', ctx=ast.Load()), attr='bool', ctx=ast.Load()),
-                                                args=[ast.Constant(value=bool_val)],
-                                                keywords=[]
-                                            )
-                                    ast_stmt = ast.Assign(
-                                        targets=[target],
-                                        value = bool_call
-                                    )
-                        
-                return ast_stmt
-            except Exception:
-                self.logger.exception(f'Exception in handle_type_declaration_stmt')
-                raise 
+        except Exception:
+            self.logger.exception('Exception in handle_type_declaration_stmt')
+            raise
+    
+    def _extract_shapes(self, stmt: F23.Base) -> List[ast.AST]:
+        """
+        Extract per-dimension size expressions from an array declaration's
+        explicit shape specification.
+
+        For each ``F23.Explicit_Shape_Spec`` found, builds the Python
+        expression for that dimension's extent: when both lower and upper
+        bounds are present, ``upper - lower + 1``; when only one bound is
+        present, that bound alone (matching Fortran's implicit
+        lower-bound-1 convention). Each bound is converted via
+        :meth:`handle_expr`. Consumed by :meth:`handle_type_declaration_stmt`
+        to decide between array and scalar handling, and by
+        :meth:`_build_zeros_array` as the shape tuple.
+
+        Parameters
+        ----------
+        stmt : F23.Base
+            Fortran node representing the array declaration.
+
+        Returns
+        -------
+        List[ast.AST]
+            One size expression per declared dimension.
+
+        Raises
+        ------
+        ValueError
+            If a dimension has neither a lower nor an upper bound.
+        """
+        shape = []
+
+        for dim in walk(stmt, F23.Explicit_Shape_Spec):
+            lb, ub = dim.children
+
+            if lb and ub:
+                # This for the formula: ub - lb + 1
+                lower = self.handle_expr(lb)
+                upper = self.handle_expr(ub)
+
+                shape.append(
+                    ast.BinOp(
+                        left=ast.BinOp(left=upper, op=ast.Sub(), right=lower),
+                        op=ast.Add(),
+                        right=ast.Constant(1)
+                    )
+                )
+            elif lb:
+                shape.append(self.handle_expr(lb))
+            elif ub:
+                shape.append(self.handle_expr(ub))
+            else:
+                raise ValueError("Invalid shape specification")
+
+        return shape
+
+    def _extract_decl_name(self, stmt: F23.Base) -> str:
+        """
+        Extract the declared variable's name from an entity declaration.
+
+        Parameters
+        ----------
+        stmt : F23.Base
+            Fortran node representing the entity declaration.
+
+        Returns
+        -------
+        str
+            The declared variable's name.
+        """
+        return walk(walk(stmt, F23.Entity_Decl), F23.Name)[0].string
+
+    def _extract_dtype(self, stmt: F23.Base) -> Tuple[str, str]:
+        """
+        Resolve a Fortran intrinsic type to its NumPy module/attribute
+        pair.
+
+        Maps ``REAL`` → ``np.float64``, ``INTEGER`` → ``np.int32``,
+        ``LOGICAL`` → ``np.bool``. Used by
+        :meth:`handle_type_declaration_stmt` to determine the ``dtype``
+        keyword passed to :meth:`_build_array_from_constructor`,
+        :meth:`_build_zeros_array`, or :meth:`_handle_scalar_declaration`.
+
+        Parameters
+        ----------
+        stmt : F23.Base
+            Fortran node containing the type specification.
+
+        Returns
+        -------
+        Tuple[str, str]
+            ``(module_name, type_name)``, e.g. ``('np', 'float64')``.
+
+        Raises
+        ------
+        KeyError
+            If the Fortran intrinsic type has no NumPy mapping.
+        """
+        TYPE = {
+            'REAL': 'np.float64',
+            'INTEGER': 'np.int32',
+            'LOGICAL': 'np.bool'
+        }
+
+        fdtype = walk(stmt, F23.Intrinsic_Type_Spec)[0].children[0]
+
+        np_dtype = TYPE.get(fdtype)
+        if np_dtype is None:
+            raise KeyError(f"Unsupported dtype: {fdtype}")
+
+        idx, attr = np_dtype.split('.')
+        return idx, attr
+    
+    def _build_array_from_constructor(
+        self,
+        stmt: F23.Base,
+        idx: str = 'np',
+        attr: str = 'float64',
+    ) -> ast.Call:
+        """
+        Build a ``np.array([...], dtype=...)`` call from a Fortran array
+        constructor.
+
+        Each element of the constructor's value list is converted via
+        :meth:`handle_expr`. Invoked from
+        :meth:`handle_type_declaration_stmt` when the declaration includes
+        an explicit ``F23.Array_Constructor``.
+
+        Parameters
+        ----------
+        stmt : F23.Base
+            Fortran node representing the array constructor declaration.
+        idx : str, optional
+            NumPy module alias, by default ``'np'``.
+        attr : str, optional
+            NumPy dtype attribute name, by default ``'float64'``.
+
+        Returns
+        -------
+        ast.Call
+            The constructed ``np.array(...)`` call.
+        """
+
+        array_list = walk(walk(stmt, F23.Array_Constructor), F23.Ac_Value_List)[0]
+
+        elements = [self.handle_expr(val) for val in array_list.children]
+
+        return ast.Call(
+            func=ast.Attribute(value=ast.Name(id='np', ctx=ast.Load()), attr='array', ctx=ast.Load()),
+            args=[ast.List(elts=elements, ctx=ast.Load())],
+            keywords=[
+                ast.keyword(
+                    arg='dtype',
+                    value=ast.Attribute(
+                        value=ast.Name(id=idx, ctx=ast.Load()),
+                        attr=attr,
+                        ctx=ast.Load()
+                    )
+                )
+            ]
+        )
+
+    def _build_zeros_array(
+        self,
+        shape: List[ast.expr],
+        idx: str = 'np',
+        attr: str = 'float64',
+    ) -> ast.Call:
+        """
+        Build a ``np.zeros((...), dtype=...)`` call for an array
+        declaration with no explicit constructor.
+
+        Invoked from :meth:`handle_type_declaration_stmt` with the shape
+        expressions produced by :meth:`_extract_shapes`.
+
+        Parameters
+        ----------
+        shape : List[ast.expr]
+            Per-dimension size expressions.
+        idx : str, optional
+            NumPy module alias, by default ``'np'``.
+        attr : str, optional
+            NumPy dtype attribute name, by default ``'float64'``.
+
+        Returns
+        -------
+        ast.Call
+            The constructed ``np.zeros(...)`` call.
+        """
+        return ast.Call(
+            func=ast.Attribute(value=ast.Name(id=idx, ctx=ast.Load()), attr='zeros', ctx=ast.Load()),
+            args=[ast.Tuple(elts=shape, ctx=ast.Load())],
+            keywords=[
+                ast.keyword(
+                    arg='dtype',
+                    value=ast.Attribute(
+                        value=ast.Name(id=idx, ctx=ast.Load()),
+                        attr=attr,
+                        ctx=ast.Load()
+                    )
+                )
+            ]
+        )
+    
+    def _handle_scalar_declaration(
+        self,
+        stmt: F23.Base,
+        idx: str = 'np',
+        attr: str = 'float64',
+    ) -> Optional[ast.Assign]:
+        """
+        Build an initialising assignment for a scalar variable
+        declaration.
+
+        Handles ``REAL``/``INTEGER`` declarations by wrapping the
+        initial-value expression (resolved via :meth:`handle_expr`) in the
+        matching NumPy scalar constructor, and ``LOGICAL`` declarations by
+        parsing the Fortran boolean literal directly into
+        ``np.bool(True/False)``. Invoked from
+        :meth:`handle_type_declaration_stmt` when the declaration is not
+        an array.
+
+        Parameters
+        ----------
+        stmt : F23.Base
+            Fortran node representing the scalar declaration.
+        idx : str, optional
+            NumPy module alias, by default ``'np'``.
+        attr : str, optional
+            NumPy dtype attribute name, by default ``'float64'``.
+
+        Returns
+        -------
+        Optional[ast.Assign]
+            The initialising assignment, or ``None`` if the declaration
+            has no initial value.
+        """
+        intrinsic_type_spec, _, entity_decl_list = stmt.children
+
+        for entity_decl in entity_decl_list.children:
+            var_name, _, _, initialization = entity_decl.children
+
+            target = ast.Name(id=var_name.string, ctx=ast.Store())
+
+            if initialization is None:
+                return None  # or default value if needed
+
+            _, value_node = initialization.children
+            value_ast = self.handle_expr(value_node)
+
+            # Numeric types
+            if intrinsic_type_spec.children[0] in ["REAL", "INTEGER"]:
+                return ast.Assign(
+                    targets=[target],
+                    value=ast.Call(
+                        func=ast.Attribute(
+                            value=ast.Name(id=idx, ctx=ast.Load()),
+                            attr=attr,
+                            ctx=ast.Load()
+                        ),
+                        args=[value_ast],
+                        keywords=[]
+                    )
+                )
+
+            # Logical
+            if intrinsic_type_spec.children[0] == "LOGICAL":
+                bool_val = value_node.string.strip('.').upper() == "TRUE"
+
+                return ast.Assign(
+                    targets=[target],
+                    value=ast.Call(
+                        func=ast.Attribute(
+                            value=ast.Name(id='np', ctx=ast.Load()),
+                            attr='bool',
+                            ctx=ast.Load()
+                        ),
+                        args=[ast.Constant(value=bool_val)],
+                        keywords=[]
+                    )
+                )
 
     def simplify_limits(self, expression) -> str:
         """
@@ -1030,105 +1352,170 @@ class F2NP:
             new_expression += f' {sign} {abs(total)}'
         return new_expression.lstrip('+ ').strip()
 
-    def handle_end_stmt(self, stmt) -> str:
-        assert isinstance(stmt, (F23.End_Do_Stmt, F23.End_If_Stmt, F23.End_Function_Stmt, F23.End_Subroutine_Stmt)), (
-                f"Unexpected statement type: {type(stmt).__name__}. Expected one of: "
-                f"End_Do_Stmt, End_If_Stmt, End_Function_Stmt, End_Subroutine_Stmt.")
-        return ''
-
-    def handle_specification(self, stmt) -> None:
-        print(f"# Specification: {stmt}")
-        self.result.append(f"# Specification: {stmt}")
-
-    def handle_where_stmt(self, stmt:F23.Where_Construct_Stmt) -> Union[str,ast.Expr]:
+    def handle_where_stmt(self, stmt: F23.Where_Construct_Stmt) -> ast.If:
         """
-        Handles a Fortran WHERE construct statement, converting it into an equivalent Python representation or ast.Expr.
+        Convert a Fortran ``WHERE`` construct into an ``if mask.any():``
+        block.
+
+        Extracts the mask condition via :meth:`_extract_where_masks`
+        (currently only single-condition ``WHERE`` blocks are supported),
+        wraps it in an ``.any()``/``np.any()`` test via
+        :meth:`_build_any_call`, and assigns the raw mask expression to a
+        ``mask`` variable inside the block body via
+        :meth:`_build_mask_assignment`. The body's actual masked
+        assignments are filled in separately by :meth:`recursive_ast` as
+        it processes the construct's statements.
 
         Parameters
         ----------
         stmt : F23.Where_Construct_Stmt
-            A Fortran WHERE construct statement.
+            The Fortran ``WHERE`` construct statement.
 
         Returns
         -------
-        str or ast.Expr
-            Python equivalent of the Fortran WHERE construct, either as source code or Expression node(ast.Expr),depending on the `ast_mode` attribute.
+        ast.If
+            ``if <mask>.any(): mask = <mask_expr>`` with an empty
+            ``orelse``.
+
+        Raises
+        ------
+        NotImplementedError
+            If the ``WHERE`` statement has more than one mask condition.
+        Exception
+            Re-raises any unexpected error after logging.
         """
 
-        if not self.ast_mode:
-            condition = stmt.items[0].string
-            print(f"np.where({condition})")
-            self.result.append(f"np.where({condition})")
-        else:
-            try:
-                mask_node = []
-                for element in stmt.children:
-                    if element:
-                        mask_node.append(self.handle_expr(element))
-                if len(mask_node) == 1:
-                    if isinstance(mask_node[0],ast.Subscript):
-                        expr_node = ast.Call(
-                                func=ast.Attribute(
-                                    value=ast.Name(id='np',ctx=ast.Load()),
-                                    attr='any',
-                                    ctx=ast.Load()
-                                ),
-                                args = [mask_node[0]],
-                                keywords=[]
-                            )
-                    elif isinstance(mask_node[0], ast.Compare):
-                        expr_node = ast.Call(
-                            func=ast.Attribute(
-                                value=mask_node[0],
-                                attr="any",
-                                ctx=ast.Load()
-                            ),
-                            args=[],
-                            keywords=[]
-                        )
-                    else:
-                        expr_node = ast.Call(
-                            func=ast.Attribute(
-                                value=mask_node[0],
-                                attr="any",
-                                ctx=ast.Load()
-                            ),
-                            args=[],
-                            keywords=[]
-                        )
-                        # raise NotImplementedError(f"Not implemented error for the where condition type:{type(mask_node[0])}")
+        try:
+            masks = self._extract_where_masks(stmt)
 
-                    where_if_stmt = ast.If(
-                        test = expr_node,
-                        body= [ast.Assign(
-                                    targets=[ast.Name(id='mask',ctx=ast.Store())],
-                                    value=mask_node[0]
-                                )],
-                        orelse=[]
-                    )
-                    return where_if_stmt
-                else:
-                    raise NotImplementedError("Not implemented handle_where_stmt with multiple conditions")
-                
-            except Exception:
-                self.logger.exception(f'Exception in handle_where_stmt')
-                raise 
+            if len(masks) != 1:
+                raise NotImplementedError(
+                    "handle_where_stmt with multiple conditions is not implemented"
+                )
 
-    def get_conventional_var(self, candidate_var:str, upper_key:str) -> str:
+            mask_ast = masks[0]
+            test_expr = self._build_any_call(mask_ast)
+
+            return ast.If(
+                test=test_expr,
+                body=[self._build_mask_assignment(mask_ast)],
+                orelse=[]
+            )
+
+        except Exception:
+            self.logger.exception('Exception in handle_where_stmt')
+            raise
+
+    def _extract_where_masks(self, stmt: F23.Base) -> List[ast.AST]:
         """
-        Retrieve and correct the loop variable corresponding to the upper key.
+        Extract and convert each non-``None`` child of a ``WHERE``
+        statement into a Python expression.
+
+        Each child is resolved via :meth:`handle_expr`. Used by
+        :meth:`handle_where_stmt`.
+
+        Parameters
+        ----------
+        stmt : F23.Base
+            Fortran node representing the ``WHERE`` statement.
+
+        Returns
+        -------
+        List[ast.AST]
+            One expression per mask condition found.
+        """
+        return [
+            self.handle_expr(child)
+            for child in stmt.children
+            if child is not None
+        ]
+
+    def _build_any_call(self, expr: ast.AST) -> ast.Call:
+        """
+        Build a ``.any()`` or ``np.any()`` call wrapping *expr*.
+
+        Subscript expressions (array references) use the free-function
+        form ``np.any(expr)``; any other expression uses the method form
+        ``expr.any()``. Used by :meth:`handle_where_stmt` to build the
+        ``WHERE`` block's guard condition.
+
+        Parameters
+        ----------
+        expr : ast.AST
+            The mask expression to wrap.
+
+        Returns
+        -------
+        ast.Call
+            The ``.any()``/``np.any()`` call.
+        """
+        if isinstance(expr, ast.Subscript):
+            return ast.Call(
+                func=ast.Attribute(
+                    value=ast.Name(id='np',ctx=ast.Load()),
+                    attr='any',
+                    ctx=ast.Load()
+                ),
+                args = [expr],
+                keywords=[]
+            )
+        return ast.Call(
+            func=ast.Attribute(
+                value=expr,
+                attr="any",
+                ctx=ast.Load()
+            ),
+            args=[],
+            keywords=[]
+        )
+
+    def _build_mask_assignment(self, mask_ast: ast.AST) -> ast.Assign:
+        """
+        Build the ``mask = <mask_ast>`` assignment placed inside a
+        ``WHERE``-derived ``if`` block.
+
+        Parameters
+        ----------
+        mask_ast : ast.AST
+            The mask expression to assign.
+
+        Returns
+        -------
+        ast.Assign
+            Assignment to the variable named ``mask``.
+        """
+        return ast.Assign(
+            targets=[ast.Name(id='mask', ctx=ast.Store())],
+            value=mask_ast
+        ) 
+
+    def get_conventional_var(self, candidate_var: str, upper_key: str) -> Optional[str]:
+        """
+        Resolve a loop variable name to its "conventional" counterpart for
+        a given dimension key.
+
+        Builds a mapping from :attr:`extractor`'s ``loop_dict`` (which
+        groups loop-variable names by the array dimension they index) and
+        looks up *candidate_var* under the normalised *upper_key*. For
+        dimensions with a single associated variable, that variable maps
+        to itself; for dimensions with two associated variables, both map
+        to the second (sorted) one — used to canonicalise inconsistent
+        Fortran loop-index naming across nested loops indexing the same
+        dimension.
 
         Parameters
         ----------
         candidate_var : str
-            Loop variable that needs to be checked.
+            The loop variable name to look up.
         upper_key : str
-            Upper key to which the loop variable needs to correspond.
+            The dimension key (loop bound expression text) to resolve
+            against; whitespace is normalised before lookup.
 
         Returns
         -------
-        str
-            Corresponding (and possibly corrected) loop variable.
+        Optional[str]
+            The conventional variable name, or ``None`` if no mapping
+            exists for the given key/variable pair.
         """
         normalized_upper_key = upper_key.replace(" ", "")
     
@@ -1146,571 +1533,919 @@ class F2NP:
 
         return mapping.get((normalized_upper_key, candidate_var))
     
-    def handle_do_stmt(self, stmt) -> Union[str,ast.For]:
+    def handle_do_stmt(self, stmt: F23.Nonlabel_Do_Stmt) -> Union[ast.For, ast.While]:
         """
-        Handles a Fortran DO loop, converting it into a Python for loop or AST for loop based on the `ast_mode` attribute.
+        Convert a Fortran ``DO`` loop into an ``ast.For`` or ``ast.While``.
+
+        Loop control with no iteration elements (a ``DO WHILE`` loop) is
+        converted to an ``ast.While`` with its test resolved via
+        :meth:`handle_expr` and an empty body. Counted ``DO`` loops are
+        converted to ``ast.For`` over ``range(start, end, stride)``: the
+        start bound is shifted to Python's 0-based indexing via
+        :meth:`adjust_start`, the end bound is wrapped in ``int(...)`` when
+        it is itself a ``Part_Ref`` (since Fortran array-size expressions
+        may be inexact), and the end bound is further corrected for
+        negative strides via :meth:`adjust_end_for_stride`.
 
         Parameters
         ----------
-        stmt
-            A Fortran DO loop statement.
+        stmt : F23.Nonlabel_Do_Stmt
+            The Fortran ``DO`` statement to convert.
 
         Returns
         -------
-        str|ast.For
-            Python for loop equivalent to the Fortran DO loop or AST for loop based on the `ast_mode` attribute.
+        Union[ast.For, ast.While]
+            The Python loop equivalent, with an empty body to be
+            populated by the caller (:meth:`recursive_ast`).
+
+        Raises
+        ------
+        ValueError
+            If a ``DO WHILE`` loop's control expression cannot be
+            resolved.
+        Exception
+            Re-raises any unexpected error after logging.
         """
-        if not self.ast_mode:
-            line_parts = stmt.tostr().split('=')
-            loop_var = line_parts[0].split()[-1]
-            start_end_stride_values = line_parts[1].split(',')
-            start = start_end_stride_values[0].strip() + '-1'
-            end = start_end_stride_values[1].strip()
-            if len(start_end_stride_values)==2:
-                stride = 1
-            elif len(start_end_stride_values)==3:
-                stride = start_end_stride_values[2].strip()
+        try:
+            loop_control = walk(stmt, F23.Loop_Control)[0]
+            elements = loop_control.children[1]
+
+            # Handle DO WHILE loops
+            if not elements:
+                loop_expr = next((self.handle_expr(c) for c in loop_control.items if c), None)
+                if loop_expr is None:
+                    raise ValueError("Empty DO WHILE loop control")
+                return ast.While(test=loop_expr, body=[], orelse=[])
+
+            # Handle DO loops
+            loop_var, start_end_stride_values = elements[0].string, elements[1]
+            start, end = start_end_stride_values[0], start_end_stride_values[1]
+
+            # Adjust start to Python 0-based indexing
+            start = self.adjust_start(start)
+            stride = start_end_stride_values[2] if len(start_end_stride_values) == 3 else 1
+
+            # Convert bounds and stride to AST nodes
+            lower_bound = self.to_ast_constant_or_expr(start)
+            if isinstance(end,F23.Part_Ref):
+                end_ast = ast.Call(func=ast.Name(id='int',ctx=ast.Load()),
+                                                args =[self.handle_expr(end)],
+                                                keywords = [])
             else:
-                raise ValueError("Loop control error!")
-            lb = self.simplify_limits(start)
-            if not lb:
-                lb = 0
-            return f"for {loop_var} in range({lb}, {end}, {stride}):"
-        else:
-            # WE directly use the stmt not as the string except for the start which corresponds to the lower bound 
-            elements = walk(stmt,F23.Loop_Control)[0].children[1]
-            if elements: # FOr loop DO in fortran 
-                loop_var, start_end_stride_values = elements[0].string,elements[1]
-                start,end = start_end_stride_values[0], start_end_stride_values[1]
+                end_ast = self.handle_expr(end)
+            stride_ast = self.to_ast_constant_or_expr(stride)
 
-                # Now we need to make sure that the start(lower bound) is compatible which we transform to string
-                if isinstance(start,F23.Int_Literal_Constant):
-                    value = self.simplify_limits(start.tostr() + '-1')
-                    if value == '':
-                        start = F23.Int_Literal_Constant('0')
-                    else:
-                        start = F23.Int_Literal_Constant(value)
-                else:
-                    start = F23.Level_2_Expr((start.tostr(),'-','1'))
-                if len(start_end_stride_values) == 2:
-                    stride = 1
-                elif len(start_end_stride_values) == 3:
-                    stride = start_end_stride_values[2]
-                else:
-                    raise ValueError("Loop control error!")
-                
-                arg = []
-                lb = start
+            # Adjust end if stride is negative
+            end_ast = self.adjust_end_for_stride(end_ast, stride_ast)
 
-                if not lb:
-                    lb = 0
-                # FOr the lower bound control which is kept as a string 
-                if type(lb) == int: # is of type int
-                    arg.append(ast.Constant(value=int(lb)))
-                else:
-                    arg.append(self.handle_expr(lb))
-                    
-                # Before creating the ast node, we need to verify if the loop_var corresoponds the convention used 
-                # based on the upper bound, THe candidate var is also in string format
-                candidate_var = self.get_conventional_var(loop_var,end.string)
-                # self.loop_variables[loop_var] = candidate_var
-                # if candidate_var is not None:
-                #     loop_var = candidate_var
+            return ast.For(
+                target=ast.Name(id=loop_var, ctx=ast.Store()),
+                iter=ast.Call(
+                    func=ast.Name(id="range", ctx=ast.Load()),
+                    args=[lower_bound, end_ast, stride_ast],
+                    keywords=[]
+                ),
+                body=[],
+                orelse=[]
+            )
+        except Exception as e:
+            self.logger.exception(f'Exception in handle_do_stmt')
+            raise
 
-                end_ast = None
-                if isinstance(end,F23.Part_Ref):
-                    end_ast = ast.Call(func=ast.Name(id='int',ctx=ast.Load()),
-                                                    args =[self.handle_expr(end)],
-                                                    keywords = [])
-                else:
-                    end_ast = self.handle_expr(end)
-                
-                arg.append(end_ast)
-                # We need to verify the type of the stride since the stride could be an integer format or that of the unary format ex : -1 or -nslm 
-                if type(stride) == int:
-                    arg.append(ast.Constant(value = stride))
-                else:
-                    stride_ast = self.handle_expr(stride)
-                    # Before appending we need to verify if that the if the stride is negative thus the end variable need to be negative too
-                    if isinstance(stride_ast,ast.UnaryOp):
-                        end_ast = arg[-1]
-                        if isinstance(end_ast, ast.Constant) and isinstance(end_ast.value, int):
-                            if end_ast.value > 0:
-                                end_ast.value = -1 * end_ast.value
-                    arg.append(stride_ast)
-
-                for_loop = ast.For(
-                    target = ast.Name(id=loop_var, ctx = ast.Store()),
-                    iter = ast.Call(
-                        func = ast.Name(id="range",ctx = ast.Load()),
-                        args = arg,
-                        keywords = []),
-                    body = [],
-                    orelse = []
-                )       
-
-            else: # While loop DO while 
-                # print(stmt.children)
-                loop_control = walk(stmt,F23.Loop_Control)[0]
-                for cont in loop_control.items:
-                    if cont is not None:
-                        loop_control_ast = self.handle_expr(cont)
-                    
-                for_loop = ast.While(
-                    test = loop_control_ast,
-                    body=[],
-                    orelse=[]
-                )
-
-            return for_loop
-
-    def handle_if_condition(self, condition) -> Union[str,ast.If]:
+    def adjust_start(self, start: F23.Base) -> Union[F23.Int_Literal_Constant, F23.Level_2_Expr]:
         """
-        Handles a Fortran IF condition, converting it to a Python IF statement or If AST based on the `ast_mode` attribute.
+        Shift a Fortran loop start bound to Python's 0-based indexing.
+
+        For integer literal starts, the shift is folded directly into a
+        new literal via :meth:`simplify_limits`. For non-literal starts
+        (variable or expression bounds), a ``Level_2_Expr`` representing
+        ``start - 1`` is constructed instead, to be resolved later by
+        :meth:`handle_expr`.
 
         Parameters
         ----------
-        stmt
-            A Fortran IF condition statement.
-        
+        start : F23.Base
+            The Fortran loop's start-bound node.
+
         Returns
         -------
-        str|ast.If
-            Python IF statement equivalent to the Fortran condition or If AST based on the `ast_mode` attribute.
+        Union[F23.Int_Literal_Constant, F23.Level_2_Expr]
+            The 0-based-adjusted start bound, still in Fortran AST form.
         """
-        if not self.ast_mode:
-            for fortran_op, python_op in self.replacements.items():
-                condition = re.sub(fortran_op, python_op, condition, flags=re.IGNORECASE)
-            return condition
-        else:
-            try:
-                if condition is None:
-                    raise ValueError(f'condition argument is None')
-                condition_stmt = None
-                if isinstance(condition,ast.AST):
-                    condition_stmt = ast.If(
-                                test = condition,
-                                body=[],
-                                orelse=[]
+        if isinstance(start, F23.Int_Literal_Constant):
+            value = self.simplify_limits(start.tostr() + '-1')
+            return F23.Int_Literal_Constant(value or '0')
+        return F23.Level_2_Expr((start.tostr(), '-', '1'))
+
+    def to_ast_constant_or_expr(self, value: Union[int, F23.Base]) -> ast.AST:
+        """
+        Convert a plain Python integer or a Fortran expression node into a
+        Python AST node.
+
+        Parameters
+        ----------
+        value : int or F23.Base
+            Either a literal Python integer or a Fortran expression node.
+
+        Returns
+        -------
+        ast.AST
+            An ``ast.Constant`` for integer input, or the result of
+            :meth:`handle_expr` for Fortran node input.
+        """
+        if isinstance(value, int):
+            return ast.Constant(value=value)
+        return self.handle_expr(value)
+
+    def adjust_end_for_stride(self, end_ast: ast.AST, stride_ast: ast.AST) -> ast.AST:
+        """
+        Negate a constant loop end bound when the stride is negative.
+
+        ``range()`` requires a negative-direction end bound to itself be
+        negative-going for descending loops; this corrects an end bound
+        that was parsed as a plain positive constant when the accompanying
+        stride is an ``ast.UnaryOp`` (i.e. a negative literal).
+
+        Parameters
+        ----------
+        end_ast : ast.AST
+            The loop's end-bound expression.
+        stride_ast : ast.AST
+            The loop's stride expression.
+
+        Returns
+        -------
+        ast.AST
+            *end_ast*, with its value negated in place if the stride is
+            negative and the end bound is a positive constant; otherwise
+            unchanged.
+        """
+        if isinstance(stride_ast, ast.UnaryOp) and isinstance(end_ast, ast.Constant) and end_ast.value > 0:
+            end_ast.value *= -1
+        return end_ast
+
+    def handle_if_condition(self, condition: Union[F23.If_Then_Stmt, F23.Else_If_Stmt]) -> ast.If:
+        """
+        Convert a Fortran ``IF``/``ELSE IF`` condition into an ``ast.If``
+        node with an empty body.
+
+        Three input shapes are handled: an already-converted Python
+        ``ast.AST`` test (used when :meth:`recursive_ast` has pre-processed
+        the condition via :meth:`handle_assignment` for part-reference
+        conditions); a bare logical name condition (``IF (flag) THEN``),
+        resolved via :meth:`handle_expr`; and a general condition requiring
+        full assignment-style parsing via :meth:`handle_assignment`.
+
+        Parameters
+        ----------
+        condition : F23.If_Then_Stmt or F23.Else_If_Stmt
+            The Fortran ``IF``/``ELSE IF`` condition statement.
+
+        Returns
+        -------
+        ast.If
+            ``ast.If`` node with the resolved test and empty
+            ``body``/``orelse``.
+
+        Raises
+        ------
+        ValueError
+            If *condition* is ``None``.
+        Exception
+            Re-raises any unexpected error after logging.
+        """
+        
+        try:
+            if condition is None:
+                raise ValueError(f'condition argument is None')
+            condition_stmt = None
+            if isinstance(condition,ast.AST):
+                condition_stmt = ast.If(
+                            test = condition,
+                            body=[],
+                            orelse=[]
+                    )
+            else:
+                if hasattr(condition, 'children') and condition.children[0] is not None: # These cases corresponds to the IF/ELSE IF 
+                    if len(condition.children) == 1 and isinstance(condition.children[0],F23.Name): # This is for the logical case
+                        condition = self.handle_expr(condition.children[0])
+                        condition_stmt = ast.If(
+                            test = condition,
+                            body=[],
+                            orelse=[]
+                        )
+                    else:
+                        stmt = self.handle_assignment(condition)
+                        condition_stmt = ast.If(
+                            test = stmt,
+                            body=[],
+                            orelse=[]
+                        )
+
+            return condition_stmt
+        except Exception:
+            self.logger.exception(f'Exception in handle_if_condition')
+            raise
+
+    def handle_print_stmt(self, stmt: F23.Base) -> ast.Expr:
+        """
+        Convert a Fortran ``PRINT`` statement into a ``logging.info(...)``
+        call.
+
+        Separates string literals from value expressions via
+        :meth:`_extract_print_items`, then builds the logging call (as a
+        structured f-string when value parts are present) via
+        :meth:`_build_logging_call`.
+
+        Parameters
+        ----------
+        stmt : F23.Base
+            The Fortran ``PRINT`` statement.
+
+        Returns
+        -------
+        ast.Expr
+            Expression statement wrapping the logging call.
+        
+        Raises
+        ------
+        Exception
+            Re-raises any unexpected error after logging.
+        """
+        
+        try:
+            string_parts, value_parts = self._extract_print_items(stmt)
+            call = self._build_logging_call(
+                level='info', 
+                string_parts=string_parts, 
+                value_parts=value_parts
+            )
+            return ast.Expr(value=call)
+
+        except Exception:
+            self.logger.exception('Exception in handle_print_statement')
+            raise
+
+    def _extract_print_items(self, stmt: F23.Base) -> Tuple[List[ast.AST], List[ast.AST]]:
+        """
+        Separate a ``PRINT`` statement's output items into string literals
+        and value expressions.
+
+        Each item is resolved via :meth:`handle_expr`; character literal
+        items are classified as string parts, everything else as value
+        parts. Used by :meth:`handle_print_stmt`.
+
+        Parameters
+        ----------
+        stmt : F23.Base
+            Fortran node representing the ``PRINT`` statement.
+
+        Returns
+        -------
+        Tuple[List[ast.AST], List[ast.AST]]
+            ``(string_parts, value_parts)``.
+        """
+
+        string_parts = []
+        value_parts = []
+
+        for child in stmt.children:
+            if isinstance(child, F23.Output_Item_List):
+                for elem in child.children:
+                    expr = self.handle_expr(elem)
+
+                    if isinstance(elem, F23.Char_Literal_Constant):
+                        string_parts.append(expr)
+                    else:
+                        value_parts.append(expr)
+
+        return string_parts, value_parts
+    
+    def _build_logging_call(
+        self,
+        level: str,
+        string_parts: List[ast.AST] = None,
+        value_parts: List[ast.AST] = None,
+        raw_message: str = None,
+    ) -> ast.Call:
+        """
+        Build a ``logging.<level>(...)`` call covering three message
+        shapes.
+
+        When *raw_message* is given, it is logged directly as a single
+        string constant (used by :meth:`_build_call_logging`). When
+        *value_parts* is non-empty, the message is built as an f-string via
+        :meth:`_build_fstring_values` (used by :meth:`handle_print_stmt`
+        for ``PRINT`` statements with variables). Otherwise, *string_parts*
+        are passed as positional arguments directly.
+
+        Parameters
+        ----------
+        level : str
+            Logging level method name, e.g. ``'info'``, ``'error'``.
+        string_parts : List[ast.AST], optional
+            String-literal expressions to log.
+        value_parts : List[ast.AST], optional
+            Variable-value expressions to interpolate.
+        raw_message : str, optional
+            A raw string message to log directly, bypassing the
+            string/value-parts logic.
+
+        Returns
+        -------
+        ast.Call
+            The constructed ``logging.<level>(...)`` call.
+        """
+        func = ast.Attribute(
+            value=ast.Name(id='logging', ctx=ast.Load()),
+            attr=level,
+            ctx=ast.Load()
+        )
+
+        # Case 1: raw message (CALL)
+        if raw_message is not None:
+            return ast.Call(
+                func=func,
+                args=[ast.Constant(value=raw_message)],
+                keywords=[]
+            )
+
+        # Case 2: structured (PRINT with variables)
+        if value_parts:
+            values = self._build_fstring_values(string_parts, value_parts)
+
+            return ast.Call(
+                func=func,
+                args=[ast.JoinedStr(values=values)],
+                keywords=[]
+            )
+
+        # Case 3: only strings
+        return ast.Call(
+            func=func,
+            args=string_parts or [],
+            keywords=[]
+        )
+
+    def _build_fstring_values(
+        self,
+        string_parts: List[ast.AST],
+        value_parts: List[ast.AST],
+    ) -> List[ast.AST]:
+        """
+        Interleave string literals and formatted values into an f-string's
+        component list.
+
+        Pairs each string part with the following value part (formatted
+        via ``ast.FormattedValue``), inserting a ``", "`` separator between
+        successive value/string pairs. Used by :meth:`_build_logging_call`
+        to construct an ``ast.JoinedStr``.
+
+        Parameters
+        ----------
+        string_parts : List[ast.AST]
+            String-literal expressions.
+        value_parts : List[ast.AST]
+            Variable-value expressions to format.
+
+        Returns
+        -------
+        List[ast.AST]
+            Components suitable for ``ast.JoinedStr(values=...)``.
+        """
+        values = []
+
+        max_len = max(len(string_parts), len(value_parts))
+
+        for i in range(max_len):
+            if i < len(string_parts) and string_parts[i] is not None:
+                values.append(string_parts[i])
+
+            if i < len(value_parts) and value_parts[i] is not None:
+                values.append(
+                    ast.FormattedValue(
+                        value=value_parts[i],
+                        conversion=-1
+                    )
+                )
+                # Add separator if not last element
+                if i < max_len - 1:
+                    values.append(ast.Constant(value=", "))
+
+        return values
+
+    def handle_intrinsic_function_reference(
+        self,
+        intrinsic_function_reference: Union[F23.Intrinsic_Function_Reference, List],
+    ) -> ast.Call:
+        """
+        Convert a Fortran intrinsic function call into its NumPy/Python
+        equivalent.
+
+        Resolves the intrinsic name against :attr:`intrinsic_replacements`;
+        intrinsics with no direct mapping fall back to a small hardcoded
+        exception table (currently ``EPSILON`` → ``np.finfo(np.float64).eps``).
+        Arguments are split into positional and keyword form via
+        :meth:`handle_expr`, then normalised against a known call signature
+        (via ``normalize_intrinsic_call``/``intrinsic_signatures``) when
+        one exists for the intrinsic — this handles intrinsics whose
+        Fortran keyword names differ from their NumPy equivalents.
+        ``MIN``/``MAX`` with more than two operands are folded into a chain
+        of binary ``np.minimum``/``np.maximum`` calls, since Python's
+        NumPy equivalents only accept two array arguments at a time.
+
+        Parameters
+        ----------
+        intrinsic_function_reference : F23.Intrinsic_Function_Reference or List
+            The Fortran intrinsic function reference to convert.
+
+        Returns
+        -------
+        ast.Call
+            The constructed Python/NumPy equivalent call.
+
+        Raises
+        ------
+        NotImplementedError
+            If the intrinsic has no NumPy mapping and is not covered by
+            the hardcoded exception table.
+        Exception
+            Re-raises any unexpected error after logging.
+        """
+        try:
+            intrinsic_name = intrinsic_function_reference.items[0].string.upper()
+            pattern = rf'\b{intrinsic_name}\b'
+            func_name = self.intrinsic_replacements.get(pattern,None)
+            intrinsic_func = None 
+            if func_name is None:
+                # NOTE: https://www.intel.com/content/www/us/en/docs/fortran-compiler/developer-guide-reference/2025-0/epsilon.html
+                # it says that the x that enters must be real for epsilon
+                # but for some pythonic functions you might not need to send 
+                # an argument or any element such the case of epsilon, in python we 
+                # don't need argument as such, we can already predine the python AST for such case
+                instrinsic_exception = {
+                    r'\bEPSILON\b': ast.Attribute(
+                        value = ast.Call(func = ast.Attribute(value = ast.Name(id='np',ctx = ast.Load()),
+                                                            attr = 'finfo',
+                                                            ctx = ast.Load()),
+                                        args = [
+                                            ast.Attribute(value = ast.Name(id='np',ctx=ast.Load()),
+                                                        attr = 'float64',
+                                                        ctx = ast.Load())
+                                        ],
+                                        keywords = []),
+                        attr = 'eps',
+                        ctx = ast.Load())
+                }
+                intrinsic_func = instrinsic_exception.get(pattern,None)
+                if not intrinsic_func:
+                    raise NotImplementedError(f"Not implemented intrinsic exception:{pattern}")
+                    
+            if func_name:
+                # Once we retieve the function name we need to identify if the 
+                # it's just normal instrinics or numpy based intrinsic function
+                func = None 
+                if len(func_name.split(".")) > 1:
+                    mod, attr = func_name.split(".")
+                    func = ast.Attribute(value = ast.Name(id=mod,ctx=ast.Load()), attr = attr, ctx = ast.Load())
+                else:
+                    func = ast.Name(id=func_name.lower(), ctx=ast.Load())
+                    
+                # Find the intrinsic arguments, as such it would allow us 
+                # to retrieve the the actual arguments inside the intrinsic parameter
+                intrinsic_args = walk(intrinsic_function_reference,F23.Actual_Arg_Spec_List)[0]
+                positional_args = []
+                keyword_args = {}
+                for arg in intrinsic_args.children:
+                    if isinstance(arg, F23.Actual_Arg_Spec):
+                        kw = self.handle_expr(arg)
+                        keyword_args[kw.arg.lower()] = kw.value
+                    else:
+                        positional_args.append(self.handle_expr(arg))
+               
+                signature = intrinsic_signatures.get(intrinsic_name)
+                if signature:
+                    normalized = normalize_intrinsic_call(signature, positional_args, keyword_args)
+                    final_args = []
+                    final_keywords = []
+                    if "array" in normalized:
+                        final_args.append(normalized["array"])
+                    # keywords via arg_map
+                    for key, value in normalized.items():
+                        if key == "array" or value is None:
+                            continue
+                        py_name = signature.arg_map.get(key, key)
+                        if value is not None:
+                            final_keywords.append(ast.keyword(arg=py_name, value=value))
+                    if signature.name in ("MIN", "MAX"): 
+                        # NOTE: Fortran constructs may contain an arbitrary number of nested
+                        # elements or operands. In contrast, Python's AST often represents
+                        # binary operations using two operands at a time. Recursion is therefore
+                        # used to traverse and process all nested elements while preserving the
+                        # original Fortran semantics.
+                        values = normalized["values"]
+                        func = ast.Attribute(
+                            value=ast.Name(id="np", ctx=ast.Load()),
+                            attr="minimum" if signature.name == "MIN" else "maximum",
+                            ctx=ast.Load()
+                        )
+                        expr = values[0]
+                        for v in values[1:]:
+                            expr = ast.Call(func=func, args=[expr, v], keywords=[])
+                        return expr
+                    intrinsic_func = ast.Call(
+                            func=func,
+                            args=final_args,
+                            keywords=final_keywords
                         )
                 else:
-                    if hasattr(condition, 'children') and condition.children[0] is not None: # These cases corresponds to the IF/ELSE IF 
-                        if len(condition.children) == 1 and isinstance(condition.children[0],F23.Name): # This is for the logical case
-                            condition = self.handle_expr(condition.children[0])
-                            condition_stmt = ast.If(
-                                test = condition,
-                                body=[],
-                                orelse=[]
-                            )
-                        else:
-                            stmt = self.handle_assignment(condition)
-                            condition_stmt = ast.If(
-                                test = stmt,
-                                body=[],
-                                orelse=[]
-                            )
+                    intrinsic_func = ast.Call(
+                        func=func,
+                        args=positional_args,
+                        keywords=[
+                            ast.keyword(arg=k, value=v)
+                            for k, v in keyword_args.items()
+                        ]
+                    )
+                
+            return intrinsic_func
+        except Exception:
+            self.logger.exception(f'Exception in handle_intrinsic_function_reference')
+            raise
 
-                return condition_stmt
-            except Exception:
-                self.logger.exception(f'Exception in handle_if_condition')
-                raise
-
-    def handle_print_stmt(self, stmt) -> Union[str,ast.Expr]:
+    def handle_real_literal_constant(
+        self,
+        real_literal_constant: Union[F23.Real_Literal_Constant, List],
+    ) -> ast.Constant:
         """
-        Handles a Fortran PRINT statement, converting it into a Python print statement or the AST based on the `ast_mode` attribute.
+        Convert a Fortran real literal constant into a Python float
+        constant.
 
         Parameters
         ----------
-        stmt
-            A Fortran PRINT statement.
-        
+        real_literal_constant : F23.Real_Literal_Constant or List
+            The Fortran real literal constant node.
+
         Returns
         -------
-        str|ast.Expr
-            Python print statement equivalent to the Fortran PRINT or the AST based on the `ast_mode` attribute.
+        ast.Constant
+            Constant node holding the float value.
         """
-        if not self.ast_mode:
-            assert isinstance(stmt, F23.Print_Stmt), (
-                    f"Unexpected statement type: {type(stmt).__name__}. Expected one of: "
-                    f"Print_Stmt")
-            output_item_list = ''
-            for child in stmt.children:
-                if isinstance(child, F23.Output_Item_List):
-                    output_item_list = child.tostr()
-            return f"print({output_item_list})"
-        else:
-            try:
-                output_item_lists = []
-                str_print = []
-                for child in stmt.children:
-                    if isinstance(child, F23.Output_Item_List):
-                        for elements in child.children:
-                            if isinstance(elements,F23.Char_Literal_Constant):
-                                str_print.append(self.handle_expr(elements))
-                            else:
-                                output_item_lists.append(self.handle_expr(elements)) # THis to retrieve the elements that are not strings
-                if self.ast_mode:
-                    values = []
-                    print_call = None
-                    if output_item_lists:
-                        # By doing so will allows us to handle case when we have str,variable,variable, variable and str,variable,str,variable printing
-                        for i, element in enumerate(itertools.zip_longest(str_print,output_item_lists)):
-                            str_print, item_list = element
+        return ast.Constant(value=float(real_literal_constant.items[0]))
 
-                            if str_print is not None:
-                                values.append(str_print)
+    def handle_part_ref(self, part_ref: Union[List, F23.Part_Ref]) -> ast.AST:
+        """
+        Convert a Fortran part reference into either a function call or an
+        array subscript.
 
-                            if item_list is not None:
-                                values.append( ast.FormattedValue( value = item_list,
-                                        conversion= -1
-                                    ))
-                                if i < len(output_item_lists) - 1:
-                                    values.append(
-                                        ast.Constant(value=',')
-                                    )
-                        print_call = ast.Call(
-                            func = ast.Attribute(value = ast.Name(id = 'logging', ctx = ast.Load()),
-                                     attr = 'info',
-                                     ctx = ast.Load()),
-                            args=[ast.JoinedStr(values=values)],
+        Resolves the leading name via :meth:`_extract_name`, then uses
+        :meth:`_is_function_call` (consulting :attr:`extractor`'s array
+        metadata when available) to decide between the two. Function calls
+        are built via :meth:`_build_regular_call`. Array references with a
+        single nested ``Part_Ref`` go through :meth:`_handle_single_part_ref`;
+        references with multiple nested ``Part_Ref`` levels (e.g. derived
+        types or chained indexing) go through :meth:`_handle_nested_part_ref`.
+
+        Parameters
+        ----------
+        part_ref : List or F23.Part_Ref
+            The Fortran part reference to convert.
+
+        Returns
+        -------
+        ast.AST
+            Either an ``ast.Call`` (function call) or an ``ast.Subscript``
+            (array reference).
+        
+        Raises
+        ------
+        Exception
+            Re-raises any unexpected error after logging.
+        """
+        
+        try:
+            name = self._extract_name(part_ref)
+
+            if self._is_function_call(name):
+                _, args_spec_list = part_ref.children
+                return self._build_regular_call(func_name=name, args_spec_list=args_spec_list)
+
+            part_refs = walk(part_ref, F23.Part_Ref)
+
+            if len(part_refs) == 1:
+                return self._handle_single_part_ref(part_refs[0])
+
+            return self._handle_nested_part_ref(part_ref)
+
+        except Exception:
+            self.logger.exception("Exception in handle_part_ref")
+            raise
+
+    def _extract_name(self, part_ref: F23.Base) -> str:
+        """
+        Extract the first variable/function name from a part reference.
+
+        Parameters
+        ----------
+        part_ref : F23.Base
+            Fortran node representing a part reference.
+
+        Returns
+        -------
+        str
+            The first name found.
+
+        Raises
+        ------
+        ValueError
+            If no name is found in *part_ref*.
+        """
+
+        names = walk(part_ref, F23.Name)
+        if not names:
+            raise ValueError("No name found in part_ref")
+        return names[0].string
+
+    def _is_function_call(self, name: str) -> bool:
+        """
+        Determine whether *name* refers to a function call rather than an
+        array reference.
+
+        Consults :attr:`extractor`'s ``all_array_info`` (a per-routine map
+        of known array names); if *name* does not appear in any routine's
+        array set, it is treated as a function call. When no
+        :attr:`extractor` is configured, the conservative default is to
+        treat *name* as an array (``False``).
+
+        Parameters
+        ----------
+        name : str
+            The candidate name to classify.
+
+        Returns
+        -------
+        bool
+            ``True`` if *name* is judged to be a function call, ``False``
+            if it is an array reference.
+        """
+        extractor = getattr(self, "extractor", None)
+        if not extractor:
+            return False  # default: treat as array
+
+        return not any(
+            name in elements
+            for elements in extractor.all_array_info.values()
+        )
+        
+    def _handle_single_part_ref(self, part_ref) -> ast.Subscript:
+        """
+        Convert a simple (non-nested) part reference into a Python
+        subscript.
+
+        Dimensions are extracted via :meth:`_extract_dimensions` and each
+        converted to a slice or index expression via
+        :meth:`_build_slice_or_index`, then assembled into the final
+        subscript via :meth:`_make_subscript`.
+
+        Parameters
+        ----------
+        part_ref : F23.Base
+            Fortran node representing a single part reference.
+
+        Returns
+        -------
+        ast.Subscript
+            The subscripted variable reference.
+        """
+
+        name = part_ref.children[0].tostr()
+
+        dims = self._extract_dimensions(part_ref)
+        args = [self._build_slice_or_index(dim) for dim in dims]
+
+        return self._make_subscript(name, args)
+
+    def _extract_dimensions(self, part_ref: F23.Base) -> List[Tuple]:
+        """
+        Extract and pre-parse each dimension of a part reference's
+        subscript list.
+
+        Each dimension is parsed via :meth:`_parse_dimension`. Used by
+        :meth:`_handle_single_part_ref`.
+
+        Parameters
+        ----------
+        part_ref : F23.Base
+            Fortran node representing a part reference.
+
+        Returns
+        -------
+        List[Tuple]
+            One parsed-dimension tuple (see :meth:`_parse_dimension`) per
+            subscript dimension.
+        """
+        dims = []
+
+        for child in part_ref.children:
+            if isinstance(child, F23.Section_Subscript_List):
+                for dim in child.children:
+                    dims.append(self._parse_dimension(dim))
+
+        return dims
+
+    def _parse_dimension(self, dim: F23.Base) -> Tuple[str, Optional[str], Optional[str], F23.Base]:
+        """
+        Classify a single subscript dimension as a slice or a plain index.
+
+        Slice dimensions (``F23.Subscript_Triplet``) have their bounds
+        text-adjusted via :meth:`simplify_limits` (the lower bound shifted
+        by ``-1`` for 0-based indexing); index dimensions are returned with
+        their raw text. Used by :meth:`_extract_dimensions`.
+
+        Parameters
+        ----------
+        dim : F23.Base
+            Fortran node representing a single dimension.
+
+        Returns
+        -------
+        Tuple[str, Optional[str], Optional[str], F23.Base]
+            ``('slice', lower, upper, node)`` for slice dimensions, or
+            ``('index', value, None, node)`` for plain index dimensions.
+        """
+        text = dim.tostr()
+        limits = text.split(':')
+
+        # Slice case
+        if isinstance(dim, F23.Subscript_Triplet):
+            lb = limits[0].strip() if limits[0] else None
+            ub = limits[1].strip() if len(limits) > 1 else None
+
+            if lb:
+                lb = self.simplify_limits(lb + "-1")
+            if ub:
+                ub = self.simplify_limits(ub)
+
+            return ("slice", lb, ub, dim)
+
+        # Index case
+        return ("index", text.strip(), None, dim)
+
+    def _build_slice_or_index(self, parsed_dim: Tuple) -> ast.AST:
+        """
+        Convert a pre-parsed dimension tuple into an ``ast.Slice`` or a
+        plain index expression.
+
+        Bound text is resolved through :meth:`handle_expr` on the original
+        Fortran child nodes. Used by :meth:`_handle_single_part_ref`.
+
+        Parameters
+        ----------
+        parsed_dim : Tuple
+            A dimension tuple as produced by :meth:`_parse_dimension`.
+
+        Returns
+        -------
+        ast.AST
+            An ``ast.Slice`` for slice dimensions, or the resolved index
+            expression otherwise.
+        """
+
+        kind, lb, ub, node = parsed_dim
+
+        if kind == "slice":
+            return ast.Slice(
+                lower=self.handle_expr(node.children[0]) if lb else None,
+                upper=self.handle_expr(node.children[1]) if ub else None
+            )
+
+        # index
+        return self.handle_expr(node)
+
+    def _make_subscript(self, name: str, args: List[ast.AST]) -> ast.Subscript:
+        """
+        Assemble a name and a list of index/slice expressions into a
+        Python subscript.
+
+        A single index collapses to a bare slice/index; multiple indices
+        are wrapped in an ``ast.Tuple``. Used by
+        :meth:`_handle_single_part_ref`.
+
+        Parameters
+        ----------
+        name : str
+            The base variable name.
+        args : List[ast.AST]
+            Per-dimension index/slice expressions.
+
+        Returns
+        -------
+        ast.Subscript
+            The assembled subscript expression.
+        """
+
+        slice_node = (
+            args[0]
+            if len(args) == 1
+            else ast.Tuple(elts=args, ctx=ast.Load())
+        )
+
+        return ast.Subscript(
+            value=ast.Name(id=name, ctx=ast.Load()),
+            slice=slice_node,
+            ctx=ast.Load()
+        )
+
+    def _handle_nested_part_ref(self, part_ref: F23.Base) -> ast.Subscript:
+        """
+        Convert a part reference with nested structure (e.g. chained or
+        derived-type indexing) into a Python subscript.
+
+        Each subscript-list child is resolved via :meth:`handle_expr`;
+        results that are themselves subscripts with no slice component
+        (i.e. a fully-indexed sub-reference, used as an index into the
+        outer reference) are wrapped in ``int(...)`` to coerce them to a
+        scalar index. Used as the fallback path in :meth:`handle_part_ref`
+        when more than one nested ``Part_Ref`` level is present.
+
+        Parameters
+        ----------
+        part_ref : F23.Base
+            Fortran node representing the nested part reference.
+
+        Returns
+        -------
+        ast.Subscript
+            The assembled (possibly multi-index) subscript expression.
+        """
+
+        name_node = None
+        elts = []
+
+        for element in part_ref.children:
+
+            if isinstance(element, F23.Name):
+                name_node = ast.Name(id=element.tostr(), ctx=ast.Load())
+
+            elif isinstance(element, F23.Section_Subscript_List):
+                for child in element.children:
+                    node = self.handle_expr(child)
+
+                    # If it's a subscript without slices -> wrap in int()
+                    if isinstance(node, ast.Subscript) and not any(ast_walk(node, ast.Slice)):
+                        node = ast.Call(
+                            func=ast.Name(id="int", ctx=ast.Load()),
+                            args=[node],
                             keywords=[]
                         )
-                        # print(ast.unparse(ast.fix_missing_locations(print_call))) 
+
+                    if isinstance(node, list):
+                        elts.extend(node)
                     else:
-                        print_call = ast.Call(
-                            func = ast.Attribute(value = ast.Name(id = 'logging', ctx = ast.Load()),
-                                     attr = 'info',
-                                     ctx = ast.Load()),
-                            args=str_print,
-                            keywords=[])
-                        
-                    return ast.Expr(value=print_call)
-            except Exception:
-                self.logger.exception(f'Exception in handle_print_statement')
-                raise
+                        elts.append(node)
 
-    def handle_intrinsic_function_reference(self, stmt_str:str, intrinsic_function_reference:Union[F23.Intrinsic_Function_Reference, List]) -> Union[str,ast.Call]:
-        """
-        Handles a Fortran intrinsic function reference, converting it into a Python AST call or string representation.
+        slice_node = (
+            elts[0]
+            if len(elts) == 1
+            else ast.Tuple(elts=elts, ctx=ast.Load())
+        )
 
-        Parameters
-        ----------
-        stmt_str : str
-            The Fortran statement string for context or diagnostics.
-
-        intrinsic_function_reference : F23.Intrinsic_Function_Reference | list
-            The parsed Fortran intrinsic function reference.
-
-        Returns
-        -------
-        str | ast.Call
-            Python equivalent of the Fortran intrinsic function as a string or AST node.
-        """
-        if not self.ast_mode:
-            for func in intrinsic_function_reference:
-                for child in func.children:
-                    if child is None:
-                        continue 
-                    if isinstance(child, F23.Intrinsic_Name):
-                        intrinsic_name = child.tostr()
-                        pattern = rf'\b{intrinsic_name}\b'
-                        assert pattern in self.intrinsic_replacements, f"{intrinsic_name} is not in the intrinsic replacements!"
-                        np_func = self.intrinsic_replacements[pattern]
-                        stmt_str = re.sub(pattern, np_func, stmt_str, flags=re.IGNORECASE)
-            return stmt_str
-        else:
-            try:
-                pattern = rf'\b{intrinsic_function_reference.items[0].string}\b'
-                func_name = self.intrinsic_replacements.get(pattern,None) # THere are some intrinsic functions in python whose arguments might differ
-                # from that of the FORTRAN, thus we will handle them here
-                intrinsic_func = None 
-                if func_name is None:
-                    # in here : https://www.intel.com/content/www/us/en/docs/fortran-compiler/developer-guide-reference/2025-0/epsilon.html
-                    # it says that the x that enters must be real for epsilon
-                    # but for some pythonic functions you might not need to send an argument or any element such the case of epsilon, in python we 
-                    # don't need argument as such, we can already predine the python AST for such case
-                    instrinsic_exception = {
-                        r'\bEPSILON\b': ast.Attribute(
-                            value = ast.Call(func = ast.Attribute(value = ast.Name(id='np',ctx = ast.Load()),
-                                                                attr = 'finfo',
-                                                                ctx = ast.Load()),
-                                            args = [
-                                                ast.Attribute(value = ast.Name(id='np',ctx=ast.Load()),
-                                                            attr = 'float64',
-                                                            ctx = ast.Load())
-                                            ],
-                                            keywords = []),
-                            attr = 'eps',
-                            ctx = ast.Load())
-                    }
-                    intrinsic_func = instrinsic_exception.get(pattern,None)
-                    if not intrinsic_func:
-                        raise NotImplementedError(f"Not implemented intrinsic exception:{pattern}")
-                        
-                if func_name:
-                    # Once we retieve the function name we need to identify if the it's just normal instrinics or numpy based intrinsic function
-                    func = None 
-                    if len(func_name.split(".")) > 1:
-                        parts = func_name.split(".")
-                        func = ast.Attribute(value = ast.Name(id=parts[0],ctx=ast.Load()), attr = parts[1], ctx = ast.Load())
-                    else:
-                        func = ast.Name(id=func_name.lower(), ctx=ast.Load())
-                        
-                    # FInd the intrinsic arguments, as such it would allow us to retrieve the the actual arguments inside the intrinsic parameter
-                    intrinsic_args = walk(intrinsic_function_reference,F23.Actual_Arg_Spec_List)[0]
-                    args = []
-                    keywords = []
-                    # Since we do this,it will recuresively call the handle_expr
-                    # onto the elements inside the intrinsic function in question : max(mc[ji, jsl, ins] - mcr[ji,], zero), which will get transformed and
-                    # onto a binary operation 
-                    for iarg, arg in enumerate(intrinsic_args.children):
-                        if func_name == "np.sum":
-                            if isinstance(arg,F23.Actual_Arg_Spec): # THis is meant to work for the SUM since they might or not might have DIM as argument 
-                                keywords.append(self.handle_expr(arg))
-                            elif not isinstance(arg, F23.Actual_Arg_Spec) and iarg > 0: # THis is the case where it might not have the DIM as argument 
-                                expr = self.handle_expr(arg)
-                                if isinstance(arg, F23.Int_Literal_Constant):
-                                    adjusted_value = str(int(expr.value) - 1)
-                                    expr = F23.Int_Literal_Constant(adjusted_value, None)
-                                else:
-                                    expr = F23.Level_2_Expr((expr,'-','1'))
-                                
-                                expr = self.handle_expr(expr)
-                                keywords.append(ast.keyword(arg='axis',value = expr))
-
-                            else:
-                                args.append(self.handle_expr(arg))
-                        else:
-                            if isinstance(arg,F23.Actual_Arg_Spec): # THis is meant to retrieve the keywords(argument of instrinsic function) other than the variable
-                                keywords.append(self.handle_expr(arg))
-                            else:
-                                args.append(self.handle_expr(arg))
-
-                    intrinsic_func = ast.Call(
-                        func=func,  
-                        args=args,
-                        keywords=keywords
-                    )  
-                    
-                    
-                return intrinsic_func
-            except Exception:
-                self.logger.exception(f'Exception in handle_intrinsic_function_reference')
-                raise
-
-    def handle_real_literal_constant(self, stmt_str:str, real_literal_constant:Union[F23.Int_Literal_Constant,List]) -> Union[str,ast.Constant]:
-        """
-        Handles a Fortran real literal constant, converting it into a Python constant or its string representation.
-
-        Parameters
-        ----------
-        stmt_str : str
-            The Fortran statement string for context or diagnostics.
-
-        real_literal_constant : F23.Int_Literal_Constant | list
-            The parsed Fortran real literal constant.
-
-        Returns
-        -------
-        str | ast.Constant
-            Python equivalent of the Fortran real constant as a string or AST node.
-        """
-        if not self.ast_mode:
-            for item in real_literal_constant:
-                pre = item.children[1]
-                stmt_str = stmt_str.replace(f"_{pre}", '')
-            return stmt_str
-        else:
-            return ast.Constant(value=float(real_literal_constant.items[0]))
-
-    def handle_part_ref(self, stmt_str:str, part_ref:Union[List,F23.Part_Ref]) -> Union[str,ast.Subscript]:
-        """
-        Handles a Fortran part reference, converting it into a Python subscript or its string representation.
-
-        Parameters
-        ----------
-        stmt_str : str
-            The Fortran statement string for context or diagnostics.
-
-        part_ref : list | F23.Part_Ref
-            The parsed Fortran part reference.
-
-        Returns
-        -------
-        str | ast.Subscript
-            Python equivalent of the Fortran part reference as a string or AST subscript node.
-        """
-        if not self.ast_mode:
-            for array in part_ref:
-                name = array.children[0].tostr()
-                shape = []
-                for child in array.children:
-                    if isinstance(child, F23.Section_Subscript_List):
-                        for idim, dim in enumerate(child.children):
-                            limits = dim.tostr().split(':')
-                            lb = limits[0]
-                            if len(limits) > 1:
-                                ub = limits[1]
-                                if lb:
-                                    lb = lb + '-1'
-                                lb = self.simplify_limits(lb)
-                                ub = self.simplify_limits(ub)
-                                shape.append(f"{lb}:{ub}")
-                            elif len(limits)==1:
-                                shape.append(f"{lb}")
-                dimensions = ', '.join([sh for sh in shape])
-                numpy_ref_str = f"{name}[{dimensions}]"
-                stmt_str = stmt_str.replace(array.tostr(), numpy_ref_str)
-
-            return stmt_str
-        
-        else:
-            try:
-                name = walk(part_ref, F23.Name)[0].string
-                name_found = False
-
-                # Check if name doesn't exists in any of the keys from all_array_info then it's a function else an array
-                if getattr(self,"extractor", None):
-                    for elements in self.extractor.all_array_info.values():
-                        if name in elements.keys():
-                            name_found = True
-                            break
-                else:
-                    name_found = True
-
-                if not name_found:
-                    _,args_spec_list = part_ref.children
-                    # Name not found in any array info: which probabaly measn it's an functioin 
-                    args = []
-                    for arg in args_spec_list.children:
-                        args.append(self.handle_expr(arg))
-                        
-                    subscript = ast.Call(
-                                    func = ast.Name(id = name, ctx = ast.Load()),
-                                    args = args,
-                                    keywords = []
-                                )
-                else:
-                    part_refs = walk(part_ref,F23.Part_Ref)
-                    subscript = None
-                    args = []
-                    if len(part_refs) == 1:
-                        for array in part_refs:
-                            name = array.children[0].tostr()
-                            shape = []
-                            for child in array.children:
-                                if isinstance(child, F23.Section_Subscript_List):
-                                    for idim, dim in enumerate(child.children):                                        
-                                        limits = dim.tostr().split(':')
-                                        lb = limits[0]
-                                        if len(limits) > 1:
-                                            ub = limits[1]
-                                            if lb:
-                                                lb = lb + '-1'
-                                            lb = self.simplify_limits(lb)
-                                            ub = self.simplify_limits(ub)
-                                            
-                                            shape.append((f"{lb}:{ub}",dim))
-                                        elif len(limits)==1:
-                                            shape.append((f"{lb}",dim))
-
-                            for sh,node in shape:
-                                # print(sh,node)
-                                if ':' in sh and isinstance(node, F23.Subscript_Triplet):
-                                    # It's a slice
-                                    if sh == ':':
-                                        # Simple ':' slice
-                                        slice_node = ast.Slice()
-                                    else:
-                                        # Possibly lb:ub
-                                        lb_ub = sh.split(':')
-                                        lb = lb_ub[0].strip() or None
-                                        ub = lb_ub[1].strip() if len(lb_ub) > 1 else None
-                            
-                                        slice_node = ast.Slice(
-                                            lower=self.handle_expr(node.children[0]) if lb else None, # ast.Name(id=lb, ctx=ast.Load())
-                                            upper=self.handle_expr(node.children[1]) if ub else None # ast.Name(id=ub, ctx=ast.Load())
-                                        )
-                                        # if lb:  
-                                        #     adjust_loop_variables(slice_node.lower,self.loop_variables)
-                                        # if ub:
-                                        #     adjust_loop_variables(slice_node.upper,self.loop_variables)
-
-                                    args.append(slice_node)
-                                else:
-                                    # it's a direct index
-                                    # expr_node = ast.parse(sh, mode='eval').body
-                                    if isinstance(node,ast.AST):
-                                        expr_node = node
-                                        # if self.loop_variables:
-                                        #     adjust_loop_variables(expr_node,self.loop_variables)
-
-                                    else:
-                                        expr_node = self.handle_expr(node)
-                                        # if self.loop_variables:
-                                        #     adjust_loop_variables(expr_node,self.loop_variables)
-
-                                    args.append(expr_node)
-                            
-                            if len(args) == 1:
-                                subscript = ast.Subscript(
-                                    value=ast.Name(id=name, ctx=ast.Load()),
-                                    slice=args[0],
-                                    ctx=ast.Load()
-                                )
-                            else:
-                                subscript = ast.Subscript(
-                                    value=ast.Name(id=name, ctx=ast.Load()),
-                                    slice=ast.Tuple(elts=args, ctx=ast.Load()),
-                                    ctx=ast.Load()
-                                )
-                    else:
-                        name = None
-                        elts = []
-                        for elements in part_ref.children:
-                            if isinstance(elements,F23.Name):
-                                name = ast.Name(id=elements.tostr(),ctx =ast.Load())
-                            elif isinstance(elements,F23.Section_Subscript_List):
-                                for child in elements.children:
-                                    node = self.handle_expr(child)
-                                    if isinstance(node,ast.Subscript) and not any(ast_walk(node,ast.Slice)):
-                                        # Need to check if there is ast.Slice
-                                        elts.append(ast.Call(func=ast.Name(id='int',ctx=ast.Load()),
-                                                    args = [node],
-                                                    keywords = []))
-                                    else:
-                                        if not isinstance(node,list):
-                                            # adjust_loop_variables(node,self.loop_variables)
-                                            elts.append(node)
-                                        else:
-                                            # for elem in node:
-                                            #     adjust_loop_variables(elem,self.loop_variables)
-                                            elts.extend(node)
-
-                        subscript = ast.Subscript(
-                                    value=name,
-                                    slice=elts[0] if len(elts)== 1 else ast.Tuple(elts=elts,ctx=ast.Load()),
-                                    ctx=ast.Load()
-                                )
-                        # print(ast.unparse(ast.fix_missing_locations(subscript)))
-                return subscript
-            except Exception:
-                self.logger.exception(f'Exception in handle_part_ref')
-                raise 
+        return ast.Subscript(
+            value=name_node,
+            slice=slice_node,
+            ctx=ast.Load()
+        )  
     
-    def handle_level_4epr(self, stmt) -> Union[None,ast.Compare]:
+    def handle_level_4expr(self, stmt) -> ast.Compare:
         """
-        Handles a Fortran level-4 expression, converting it into a Python comparison AST node.
+        Convert a Fortran level-4 (relational) expression into a Python
+        comparison.
+
+        Resolves the left and right operands via :meth:`handle_expr`, maps
+        the Fortran relational operator token (``.LT.``, ``.EQ.``, etc.)
+        through :attr:`replacements` to its textual symbol and then through
+        :attr:`conditional_ops_map` to the corresponding ``ast`` operator
+        instance.
 
         Parameters
         ----------
         stmt
-            A parsed Fortran level-4 expression.
+            A parsed Fortran level-4 expression node.
 
         Returns
         -------
-        None | ast.Compare
-            Python AST comparison node or None if not applicable.
+        ast.Compare
+            The resolved comparison expression.
+
+        Raises
+        ------
+        ValueError
+            If either operand fails to resolve.
+        KeyError
+            If the relational operator has no entry in
+            :attr:`conditional_ops_map`.
+        Exception
+            Re-raises any unexpected error after logging.
         """
         try:
             level4_expr = walk(stmt,F23.Level_4_Expr)[0].children
@@ -1725,7 +2460,8 @@ class F2NP:
             pattern = rf'\.{op.strip(".")}\.'
                                 
             operator = self.replacements.get(pattern,None)
-            # We will check if the conditional operator is present in the self.replacements dict if it's None then we check directly into the conditional_op_map 
+            # We will check if the conditional operator is present in the self.replacements 
+            # dict if it's None then we check directly into the conditional_op_map 
             # which contains the ast format of each conditional operators directly.
             if operator is not None:
                 ast_op = self.conditional_ops_map.get(operator,None)
@@ -1751,223 +2487,529 @@ class F2NP:
             self.logger.exception(f'Exception in handle_level_4expr')
             raise
 
-    def handle_OR_AND_Operand(self, stmt) -> Union[None,ast.UnaryOp]:
+    def handle_OR_AND_Operand(self, stmt) -> Optional[ast.AST]:
         """
-        Handles a Fortran OR/AND operand, converting it into a Python unary operation AST node.
+        Convert a Fortran ``.AND.``/``.OR.``/``.NOT.`` expression into its
+        Python equivalent.
+
+        For binary forms (``a .AND. b``), resolves both operands via
+        :meth:`handle_expr` and the operator via
+        :meth:`_map_logical_operator`. If both operands are comparisons
+        over sliced (array) subscripts (detected via
+        :meth:`_contains_slice_subscript`), the result is built as an
+        element-wise ``ast.BinOp`` with a bitwise operator (via
+        :meth:`_to_bitwise_operator`) instead of an ``ast.BoolOp``, since
+        Python's ``and``/``or`` cannot be overloaded for NumPy arrays. For
+        unary forms (``.NOT. a``), the operator is resolved via
+        :meth:`_map_unary_operator` and the operand via :meth:`handle_expr`.
 
         Parameters
         ----------
         stmt
-            A parsed Fortran OR or AND operand expression.
+            A parsed Fortran ``.AND.``/``.OR.``/``.NOT.`` operand
+            expression.
 
         Returns
         -------
-        None | ast.UnaryOp
-            Python AST unary operation node or None if not applicable.
+        Optional[ast.AST]
+            ``ast.BinOp``, ``ast.BoolOp``, or ``ast.UnaryOp`` depending on
+            the input shape; ``None`` if *stmt* matches neither the binary
+            nor unary pattern.
+
+        Raises
+        ------
+        ValueError
+            If an operand fails to resolve.
+        Exception
+            Re-raises any unexpected error after logging.
         """
         try:
-            or_and_stmt = None
-            ast_stmt = None
-            if any(walk(stmt,F23.Or_Operand)):
-                or_and_stmt = walk(stmt,F23.Or_Operand)[0]
-            elif any(walk(stmt,F23.And_Operand)):
-                or_and_stmt = walk(stmt,F23.And_Operand)[0]
-            # We need to check the length of the stmt
+            or_and_stmt = self._extract_logical_operand(stmt)
+
+            # Binary logical case (e.g., a .AND. b)
             if len(stmt.children) > 2:
-                
                 left_ast = self.handle_expr(or_and_stmt.items[0])
                 op_token = or_and_stmt.items[1]
                 right_ast = self.handle_expr(or_and_stmt.items[2])
 
                 if left_ast is None or right_ast is None:
-                    raise ValueError(f'Either left or right part of handle_or_and_operand, left:{left_ast}, right:{right_ast}')
-                
-                op_str = op_token.strip().strip('.')  
-                op_map = {
-                    'AND': ast.And(),
-                    'OR': ast.Or(),
-                }            
-                op = op_map.get(op_str.upper())
-                if not op:
-                    raise NotImplementedError(f"Logical operator {op_token} not supported.")
-                
-                # Helper function to check if a node contains a Subscript with a Slice
-                def contains_subscript_with_slice(node):
-                    for sub_node in ast.walk(node):
-                        if isinstance(sub_node, ast.Subscript):
-                            if isinstance(sub_node.slice, ast.Slice):
-                                return True
-                    return False
-                
-                # When we an ast of type COmpare on either and both of them has an array with slice inside of them then we need to replace the operator AND/OR to bitwise comparaison
-                if (isinstance(left_ast, ast.Compare) and isinstance(right_ast, ast.Compare) and contains_subscript_with_slice(left_ast) and contains_subscript_with_slice(right_ast)):
-                    # Replace logical operator with bitwise equivalent
-                    if isinstance(op, ast.And):
-                        op = ast.BitAnd()
-                    elif isinstance(op, ast.Or):
-                        op = ast.BitOr()
+                    raise ValueError(
+                        f'Invalid operands: left={left_ast}, right={right_ast}'
+                    )
 
-                    ast_stmt = ast.BinOp(left=left_ast, op=op, right=right_ast)
+                op = self._map_logical_operator(op_token)
 
-                else:
-                    ast_stmt = ast.BoolOp(op=op, values=[left_ast, right_ast])
-                
-            elif len(stmt.children) == 2 : # We are in the case of element such as NOT ok_freeze_cwr
-                op,operand = stmt.children
-                pattern = rf'\.{op.strip(".")}\.'
-        
-                operator = self.replacements.get(pattern,None)
-                if operator is not None:
-                    ast_op = self.conditional_ops_map.get(operator,None)
-                else:
-                    ast_op = self.conditional_ops_map.get(op,None)
+                # Decide between BoolOp and BinOp (array-wise logic)
+                if (isinstance(left_ast, ast.Compare) and
+                    isinstance(right_ast, ast.Compare) and
+                    self._contains_slice_subscript(left_ast) and
+                    self._contains_slice_subscript(right_ast)
+                ):
+                    op = self._to_bitwise_operator(op)
+                    return ast.BinOp(left=left_ast, op=op, right=right_ast)
 
-                if ast_op is None:
-                    raise KeyError(f"Error in ast_mapping: {op} isn't available in the ast_map")
+                return ast.BoolOp(op=op, values=[left_ast, right_ast])
 
-                ast_stmt = ast.UnaryOp(
-                    op = ast_op,
-                    operand = self.handle_expr(operand)
-                )
-            
-            return ast_stmt
-            
+            # Unary case (e.g., .NOT. a)
+            elif len(stmt.children) == 2:
+                op_token, operand = stmt.children
+
+                ast_op = self._map_unary_operator(op_token)
+                operand_ast = self.handle_expr(operand)
+
+                if operand_ast is None:
+                    raise ValueError("Operand is None in unary operation")
+
+                return ast.UnaryOp(op=ast_op, operand=operand_ast)
+
+            return None
+
         except Exception:
-            self.logger.exception(f'Exception in handle_OR_AND_Operand')
-            raise 
-        
-    def handle_assignment(self, stmt) -> Union[str,ast.Assign]:
+            self.logger.exception('Exception in handle_OR_AND_Operand')
+            raise
+
+    def _extract_logical_operand(
+        self,
+        stmt: F23.Base,
+    ) -> Union[F23.Or_Operand, F23.And_Operand, F23.Equiv_Operand]:
         """
-        Handles a Fortran assignment statement, converting it into a Python assignment.
+        Find the first logical operand node within a statement.
+
+        Searches in order for ``F23.Or_Operand``, ``F23.And_Operand``, then
+        ``F23.Equiv_Operand``. Used by :meth:`handle_OR_AND_Operand`.
 
         Parameters
         ----------
-        stmt
-            A Fortran assignment statement.
-        
+        stmt : F23.Base
+            Fortran node representing a logical expression.
+
         Returns
         -------
-        str | ast.Assign
-            Python AST or Python string assignment equivalent to the Fortran statement.
+        F23.Or_Operand or F23.And_Operand or F23.Equiv_Operand
+            The first matching logical operand node.
+
+        Raises
+        ------
+        ValueError
+            If no logical operand is found.
         """
-        stmt_str = stmt.tostr()
-        part_ref = walk(stmt, F23.Part_Ref)
-        intrinsic_function_reference = walk(stmt, F23.Intrinsic_Function_Reference)
-        real_literal_constant = walk(stmt, F23.Real_Literal_Constant) 
 
-        if not self.ast_mode:
-            if intrinsic_function_reference:
-                stmt_str = self.handle_intrinsic_function_reference(stmt_str, intrinsic_function_reference)
+        for cls in (F23.Or_Operand, F23.And_Operand, F23.Equiv_Operand):
+            results = walk(stmt, cls)
+            if results:
+                return results[0]
+        raise ValueError("No logical operand found")
 
-            if real_literal_constant:
-                stmt_str = self.handle_real_literal_constant(stmt_str, real_literal_constant)
-
-            if part_ref:
-                stmt_str = self.handle_part_ref(stmt_str, part_ref)
-
-            return stmt_str
-
-        else:
-            try:
-                lhs_ast,rhs_ast = None,None 
-                ast_stmt = None
-                if len(stmt.children) == 3: # THese are usally meant for this such as a[i,j] = m[i,j] + ...
-                    lhs_node, eq_sign, rhs_node = stmt.children
-                    # Handle left side of the assignement
-                    if isinstance(lhs_node, F23.Name):
-                        # In some cases, we observed that arrays are assigned like this : a = TRUE within a function locally in this case
-                        # Python will create a new local variables with the same name thus could pose a problem further down the code that might use the actual variable 
-                        elem_found = None
-                        if getattr(self,"extractor", None):
-                            for key,value in self.extractor.all_array_info.items():
-                                if (lhs_node.string in value.keys()) and isinstance(rhs_node, (F23.Name,F23.Logical_Literal_Constant,F23.Real_Literal_Constant, F23.Int_Literal_Constant)):
-                                    elem_found = self.extractor.all_array_info[key][lhs_node.string]
-                        
-                        if elem_found:
-                            if len(elem_found) == 1:
-                                nb_slices = ast.Slice()
-                            elif len(elem_found) > 1:
-                                nb_slices = ast.Tuple(elts=[ast.Slice() for _ in range(len(elem_found))],ctx=ast.Load())
-                            lhs_ast = ast.Subscript(
-                                value=ast.Name(id=lhs_node.string,ctx = ast.Store()),
-                                slice=nb_slices
-                            )
-                        else:
-                            lhs_ast = ast.Name(id=lhs_node.string,ctx = ast.Store())
-                    elif isinstance(lhs_node,F23.Part_Ref):
-                        lhs_ast = self.handle_expr(lhs_node)
-                        if lhs_ast is None:
-                            raise ValueError(f'lhs_ast for handle assignement is None')
-            
-                    # Handle right side of the assignement
-                    rhs_ast = self.handle_expr(rhs_node)
-                    if rhs_ast is None:
-                        raise ValueError(f'rhs_ast for handle assignement is None')
-                    
-                    # We need to add another check that when we have an array(rhs) to another array in left hand side thus we need to create copy
-                    dim_found = None
-                    left_name = None
-                    right_name = None
-
-                    if isinstance(lhs_ast,ast.Name) and isinstance(rhs_ast,ast.Name):
-                        left_name = lhs_ast.id
-                        right_name = rhs_ast.id
-                    # Check if name exists in any of the keys from all_array_info
-                    if getattr(self,"extractor", None):
-                        for key,value in self.extractor.all_array_info.items():
-                            if (left_name in value.keys()) and (right_name in value.keys()):
-                                dim_found = self.extractor.all_array_info[key][left_name]
-                                break
-                    # If rhs is a known array, wrap with .copy() which creates a litteral new copy of the attributes thus we will go with the a[:,:] = b which copies onto the array
-                    if dim_found: # THIs is to ensrue that only the assignement of type a = b.copy() is affected 
-
-                        if len(dim_found) == 1:
-                            arg = ast.Slice()
-                        else:
-                            arg = ast.Tuple(elts=[])
-                            for _ in range(len(dim_found)):
-                                arg.elts.append(ast.Slice())
-
-                        lhs_ast = ast.Subscript(
-                            value = lhs_ast,
-                            slice=arg
-                        )
-                        pass
-
-                    ast_stmt = ast.Assign(
-                        targets = [lhs_ast],
-                        value = rhs_ast
-                    )
-                else:
-                    # THis is for the case that might have a and b type elements ex: humrel[ji, jv] > min_sechiba and soiltile[ji, jst] * vegtot[ji] > min_sechiba
-                    ast_stmt = self.handle_expr(stmt.items[0])
-                    if ast_stmt is None:
-                        raise ValueError(f'ast_stmt for handle assignement is None')
-                return ast_stmt
-            
-            except Exception:
-                self.logger.exception(f'Exception in handle_assignement')
-                raise 
-        
-    def build_binop(self, left, op_token, right) -> ast.BinOp:
+    def _map_logical_operator(self, op_token: str) -> ast.boolop:
         """
-        Builds a Python binary operation AST node from the given operands and operator token.
+        Map a Fortran ``.AND.``/``.OR.`` token to its ``ast`` operator
+        instance.
 
         Parameters
         ----------
-        left
-            The left-hand side operand.
+        op_token : str
+            The Fortran logical operator token.
 
-        op_token
-            The operator token representing the binary operation ('+', '-', '*', etc.).
+        Returns
+        -------
+        ast.boolop
+            ``ast.And()`` or ``ast.Or()``.
 
-        right
-            The right-hand side operand.
+        Raises
+        ------
+        NotImplementedError
+            If *op_token* is not ``AND`` or ``OR``.
+        """
+
+        op_str = op_token.strip().strip('.').upper()
+
+        op_map = {
+            'AND': ast.And(),
+            'OR': ast.Or(),
+        }
+
+        op = op_map.get(op_str)
+        if op is None:
+            raise NotImplementedError(f"Logical operator {op_token} not supported")
+
+        return op
+
+    def _map_unary_operator(self, op_token: str) -> ast.unaryop:
+        """
+        Map a Fortran unary operator token (e.g. ``.NOT.``) to its ``ast``
+        operator instance via :attr:`replacements` and
+        :attr:`conditional_ops_map`.
+
+        Parameters
+        ----------
+        op_token : str
+            The Fortran unary operator token.
+
+        Returns
+        -------
+        ast.unaryop
+            The resolved unary operator instance.
+
+        Raises
+        ------
+        KeyError
+            If *op_token* has no entry in :attr:`conditional_ops_map`.
+        """
+        pattern = rf'\.{op_token.strip(".").upper()}\.'
+        operator = self.replacements.get(pattern, op_token)
+
+        ast_op = self.conditional_ops_map.get(operator)
+        if ast_op is None:
+            raise KeyError(f"{op_token} not found in conditional_ops_map")
+
+        return ast_op
+
+    def _to_bitwise_operator(self, op: Union[ast.And, ast.Or]) -> ast.operator:
+        """
+        Convert a logical ``ast`` operator to its bitwise counterpart.
+
+        Used by :meth:`handle_OR_AND_Operand` when both operands of a
+        logical expression are array comparisons, since element-wise
+        boolean combination on NumPy arrays requires ``&``/``|`` rather
+        than ``and``/``or``.
+
+        Parameters
+        ----------
+        op : ast.And or ast.Or
+            The logical operator to convert.
+
+        Returns
+        -------
+        ast.operator
+            ``ast.BitAnd()`` for ``ast.And``, ``ast.BitOr()`` for
+            ``ast.Or``, or *op* unchanged if it is neither.
+        """
+        if isinstance(op, ast.And):
+            return ast.BitAnd()
+        if isinstance(op, ast.Or):
+            return ast.BitOr()
+        return op
+
+    def _contains_slice_subscript(self, node: ast.AST) -> bool:
+        """
+        Return ``True`` if *node* contains a subscript indexed by a slice
+        anywhere in its subtree.
+
+        Used by :meth:`handle_OR_AND_Operand` to detect array-valued
+        comparison operands.
+
+        Parameters
+        ----------
+        node : ast.AST
+            Subtree to inspect.
+
+        Returns
+        -------
+        bool
+            ``True`` if any descendant ``ast.Subscript`` has an
+            ``ast.Slice`` index.
+        """
+        return any(
+            isinstance(sub, ast.Subscript) and isinstance(sub.slice, ast.Slice)
+            for sub in ast.walk(node)
+        )
+        
+    def handle_assignment(self, stmt: Union[F23.Assignment_Stmt, F23.Part_Ref]) -> ast.AST:
+        """
+        Convert a Fortran assignment statement into a Python ``ast.Assign``.
+
+        For statements that don't have exactly three children (LHS,
+        ``=``, RHS) — for example a bare boolean expression used as an
+        ``IF`` condition — the node is instead resolved directly via
+        :meth:`handle_expr` and returned without wrapping in an
+        ``ast.Assign``. Otherwise, the LHS is built via :meth:`_build_lhs`,
+        the RHS via :meth:`_build_rhs`, and array-copy broadcasting
+        semantics (``a = b`` → ``a[:] = b`` when both are known arrays) are
+        applied via :meth:`_apply_array_copy_semantics`, using array
+        metadata from :meth:`_get_func_arrays`.
+
+        Parameters
+        ----------
+        stmt : F23.Assignment_Stmt or F23.Part_Ref
+            The Fortran assignment statement (or bare condition
+            expression) to convert.
+
+        Returns
+        -------
+        ast.AST
+            Either an ``ast.Assign`` node, or a bare expression node when
+            *stmt* was not a true three-part assignment.
+        
+        Raises
+        ------
+        Exception
+            Re-raises any unexpected error after logging.
+        """
+        try:
+            if len(stmt.children) != 3:
+                # This is for the case that might have a and b type elements 
+                # ex: humrel[ji, jv] > min_sechiba and soiltile[ji, jst] * vegtot[ji] > min_sechiba
+                ast_stmt = self.handle_expr(stmt.items[0])
+                if ast_stmt is None:
+                    raise ValueError(f'ast_stmt for handle assignement is None')
+                return ast_stmt
+
+            lhs_node, _, rhs_node = stmt.children
+            func_arrays = self._get_func_arrays()
+
+            lhs_ast = self._build_lhs(lhs_node, rhs_node, func_arrays)
+            rhs_ast = self._build_rhs(rhs_node)
+
+            lhs_ast = self._apply_array_copy_semantics(lhs_ast, rhs_ast, func_arrays)
+
+            return ast.Assign(targets=[lhs_ast], value=rhs_ast)
+
+        except Exception:
+            self.logger.exception(f'Exception in handle_assignment: {stmt}')
+            raise
+
+    def _get_func_arrays(self) -> Dict:
+        """
+        Look up the array-name → dimensions mapping for the routine
+        currently being translated.
+
+        Consults :attr:`extractor`'s ``all_array_info`` keyed by
+        :attr:`func_name`. Returns an empty dict if no extractor is
+        configured or no routine is currently set.
+
+        Returns
+        -------
+        Dict
+            Mapping of array names to their dimension metadata for the
+            current routine, or an empty dict.
+        """
+        if getattr(self, "extractor", None) and self.func_name:
+            return self.extractor.all_array_info.get(self.func_name, {})
+        return {}
+
+    def _build_lhs(self, lhs_node: F23.Base, rhs_node: F23.Base, func_arrays: Dict) -> ast.AST:
+        """
+        Build the left-hand side AST node for an assignment.
+
+        Plain-name LHS nodes are routed through :meth:`_handle_name_lhs`
+        (which detects implicit array-broadcast assignment); ``Part_Ref``
+        LHS nodes (already-subscripted targets) are resolved directly via
+        :meth:`handle_expr`. Used by :meth:`handle_assignment`.
+
+        Parameters
+        ----------
+        lhs_node : F23.Base
+            Fortran node representing the assignment's LHS.
+        rhs_node : F23.Base
+            Fortran node representing the assignment's RHS, passed through
+            for the implicit-broadcast check in
+            :meth:`_handle_name_lhs`.
+        func_arrays : Dict
+            Array metadata for the current routine, from
+            :meth:`_get_func_arrays`.
+
+        Returns
+        -------
+        ast.AST
+            The resolved LHS target node.
+
+        Raises
+        ------
+        TypeError
+            If *lhs_node* is neither an ``F23.Name`` nor an
+            ``F23.Part_Ref``.
+        ValueError
+            If conversion of a ``Part_Ref`` LHS yields ``None``.
+        """
+        if isinstance(lhs_node, F23.Name):
+            return self._handle_name_lhs(lhs_node, rhs_node, func_arrays)
+
+        if isinstance(lhs_node, F23.Part_Ref):
+            lhs_ast = self.handle_expr(lhs_node)
+            if lhs_ast is None:
+                raise ValueError("lhs_ast is None")
+            return lhs_ast
+
+        raise TypeError(f"Unsupported LHS node type: {type(lhs_node)}")
+
+    def _handle_name_lhs(
+        self,
+        lhs_node: F23.Name,
+        rhs_node: F23.Base,
+        func_arrays: Dict,
+    ) -> ast.AST:
+        """
+        Build the LHS target for a plain-name assignment, detecting
+        implicit array broadcasting.
+
+        When the target name is a known array (per *func_arrays*) and the
+        RHS is a scalar-shaped literal or name (``a = 1`` where ``a`` is
+        actually declared as an array), the target is rewritten to a
+        full-slice subscript (``a[:]``/``a[:, :]``, via
+        :meth:`_build_full_slice`) so the assignment broadcasts correctly
+        under NumPy semantics. Otherwise, a plain ``ast.Name`` store target
+        is returned. Used by :meth:`_build_lhs`.
+
+        Parameters
+        ----------
+        lhs_node : F23.Name
+            Fortran node for the assignment target name.
+        rhs_node : F23.Base
+            Fortran node for the RHS expression, used to detect the
+            broadcast-assignment pattern.
+        func_arrays : Dict
+            Array metadata for the current routine.
+
+        Returns
+        -------
+        ast.AST
+            An ``ast.Subscript`` (full-slice) target if broadcast
+            semantics apply, otherwise a plain ``ast.Name`` target.
+        """
+        name = lhs_node.string
+
+        # Detect case like: a = 1 or a = TRUE where a is actually an array
+        if (
+            name in func_arrays and
+            isinstance(rhs_node, (
+                F23.Name,
+                F23.Logical_Literal_Constant,
+                F23.Real_Literal_Constant,
+                F23.Int_Literal_Constant,
+            ))
+        ):
+            ndim = len(func_arrays[name])
+            slice_node = self._build_full_slice(ndim)
+
+            return ast.Subscript(
+                value=ast.Name(id=name, ctx=ast.Load()),
+                slice=slice_node,
+                ctx=ast.Store()
+            )
+
+        return ast.Name(id=name, ctx=ast.Store())
+
+    def _build_rhs(self, rhs_node: F23.Base) -> ast.AST:
+        """
+        Resolve an assignment's right-hand side via :meth:`handle_expr`.
+
+        Parameters
+        ----------
+        rhs_node : F23.Base
+            Fortran node for the RHS expression.
+
+        Returns
+        -------
+        ast.AST
+            The resolved RHS expression.
+
+        Raises
+        ------
+        ValueError
+            If resolution yields ``None``.
+        """
+
+        rhs_ast = self.handle_expr(rhs_node)
+        if rhs_ast is None:
+            raise ValueError("rhs_ast is None")
+        return rhs_ast
+
+    def _apply_array_copy_semantics(
+        self,
+        lhs_ast: ast.AST,
+        rhs_ast: ast.AST,
+        func_arrays: Dict,
+    ) -> ast.AST:
+        """
+        Rewrite a name-to-name array copy assignment to use full-slice
+        broadcasting.
+
+        When both *lhs_ast* and *rhs_ast* are plain ``ast.Name`` nodes
+        whose identifiers are both known arrays (per *func_arrays*), the
+        LHS is rewritten to a full-slice subscript via
+        :meth:`_build_full_slice` (``a = b`` → ``a[:] = b``), matching
+        Fortran's whole-array assignment semantics. Used by
+        :meth:`handle_assignment`.
+
+        Parameters
+        ----------
+        lhs_ast : ast.AST
+            The already-built LHS node.
+        rhs_ast : ast.AST
+            The already-built RHS node.
+        func_arrays : Dict
+            Array metadata for the current routine.
+
+        Returns
+        -------
+        ast.AST
+            The (possibly rewritten) LHS node.
+        """
+        if not isinstance(lhs_ast, ast.Name) or not isinstance(rhs_ast, ast.Name):
+            return lhs_ast
+
+        left_name = lhs_ast.id
+        right_name = rhs_ast.id
+        
+        if left_name in func_arrays and right_name in func_arrays:
+            ndim = len(func_arrays[left_name])
+            slice_node = self._build_full_slice(ndim)
+
+            return ast.Subscript(
+                value=ast.Name(id=left_name, ctx=ast.Load()),
+                slice=slice_node,
+                ctx=ast.Store()
+            )
+
+        return lhs_ast
+
+    def _build_full_slice(self, ndim: int) -> Union[ast.Slice, ast.Tuple]:
+        """
+        Build a full-slice index expression for an array of *ndim*
+        dimensions.
+
+        Parameters
+        ----------
+        ndim : int
+            Number of array dimensions.
+
+        Returns
+        -------
+        Union[ast.Slice, ast.Tuple]
+            A bare ``ast.Slice()`` for 1-D arrays, or an ``ast.Tuple`` of
+            ``ast.Slice()`` nodes for higher dimensions.
+        """
+        if ndim == 1:
+            return ast.Slice()
+
+        return ast.Tuple(
+            elts=[ast.Slice() for _ in range(ndim)],
+            ctx=ast.Load()
+        )
+        
+    def build_binop(self, left: ast.AST, op_token: str, right: ast.AST) -> ast.BinOp:
+        """
+        Build a Python binary operation from a Fortran arithmetic operator
+        token.
+
+        Parameters
+        ----------
+        left : ast.AST
+            Left operand.
+        op_token : str
+            Operator token (``'+'``, ``'-'``, ``'*'``, ``'/'``, ``'**'``).
+        right : ast.AST
+            Right operand.
 
         Returns
         -------
         ast.BinOp
-            Python AST node representing the binary operation.
+            The constructed binary operation.
+
+        Raises
+        ------
+        NotImplementedError
+            If *op_token* has no mapping to an ``ast`` operator.
         """
         # Get operator symbol from token or string
         op_str = str(op_token).strip()
@@ -1986,77 +3028,120 @@ class F2NP:
         
         return ast.BinOp(left=left, op=op, right=right)
     
-    def handle_expr(self,expr_node):
+    def _binop_from_items(self, items: List) -> ast.BinOp:
         """
-        Recursively handle and convert Fortran expression nodes into Python AST nodes.
+        Build a binary operation from a three-element
+        ``[left, operator, right]`` item list.
 
-        This function serves as a dispatcher that processes various types of
-        expression nodes from a parsed Fortran AST (using F23) and converts them into
-        corresponding Python `ast` nodes for code generation or analysis.
+        Both operands are resolved via :meth:`handle_expr`; the operator is
+        passed to :meth:`build_binop`. Used by :meth:`handle_expr` for
+        ``Level_2_Expr``, ``Mult_Operand``, and bare three-element tuple
+        nodes.
+
+        Parameters
+        ----------
+        items : List
+            ``[left_expr, operator_token, right_expr]``.
+
+        Returns
+        -------
+        ast.BinOp
+            The constructed binary operation.
+        """
+        left = self.handle_expr(items[0])
+        op_token = items[1]
+        right = self.handle_expr(items[2])
+        return self.build_binop(left, op_token, right)
+    
+    def handle_expr(self, expr_node) -> ast.AST:
+        """
+        Dispatch a Fortran expression node to its dedicated handler and
+        return the equivalent Python AST node.
+
+        The central expression-level dispatcher, mirroring
+        :meth:`recursive_ast`'s role at the statement level. Routes by
+        node type to (non-exhaustive):
+
+        - ``Real_Literal_Constant`` → :meth:`handle_real_literal_constant`.
+        - ``Int_Literal_Constant`` → a direct ``ast.Constant(int(...))``.
+        - ``Logical_Literal_Constant`` → a direct ``ast.Constant(bool)``.
+        - ``Char_Literal_Constant`` → a direct ``ast.Constant(str)`` with
+        quotes stripped.
+        - ``Part_Ref`` → :meth:`handle_part_ref`.
+        - ``Intrinsic_Function_Reference`` → :meth:`handle_intrinsic_function_reference`,
+        except ``MINLOC``/``MAXLOC`` nested inside a ``Level_2_Expr``,
+        which is unwrapped and re-dispatched directly.
+        - ``Level_2_Expr`` / ``Mult_Operand`` / bare 3-tuples →
+        :meth:`_binop_from_items`.
+        - ``Add_Operand`` → re-dispatched on its ``.items``.
+        - ``Level_2_Unary_Expr`` → ``ast.UnaryOp`` with ``+``/``-`` mapped
+        to ``ast.UAdd``/``ast.USub``.
+        - ``Level_4_Expr`` → :meth:`handle_level_4expr`.
+        - ``Parenthesis`` → re-dispatched on the contained expression.
+        - ``Name`` → a direct ``ast.Name`` load reference.
+        - ``And_Operand`` / ``Or_Operand`` → :meth:`handle_OR_AND_Operand`.
+        - ``Equiv_Operand`` → a direct ``ast.BoolOp`` built inline from its
+        ``AND``/``OR`` token.
+        - ``Actual_Arg_Spec`` → an ``ast.keyword`` for named call
+        arguments.
+        - ``Write_Stmt`` / ``Print_Stmt`` → :meth:`handle_print_stmt`.
+        - ``Call_Stmt`` → :meth:`handle_call_stmt`.
+        - ``Subscript_Triplet`` → a list of slice/index AST nodes built
+        inline (used when resolving multi-dimension subscript lists).
+        - ``Assignment_Stmt`` → :meth:`handle_assignment`.
 
         Parameters
         ----------
         expr_node : object
-            A node representing an expression from the Fortran AST.
-            Can be one of several F23 classes such as `Real_Literal_Constant`,
-            `Part_Ref`, `Intrinsic_Function_Reference`, `Level_2_Expr`, etc.
+            A Fortran expression-level AST node, or in some recursive
+            cases a plain ``tuple`` of sub-items.
 
         Returns
         -------
         ast.AST
-            A Python AST node representing the translated Fortran expression.
-            Types can include `ast.Constant`, `ast.Name`, `ast.BinOp`, `ast.BoolOp`,
-            `ast.UnaryOp`, or `ast.keyword`, depending on the type of the input node.
+            The translated Python expression node. Exact type depends on
+            the dispatched branch (``ast.Constant``, ``ast.Name``,
+            ``ast.BinOp``, ``ast.BoolOp``, ``ast.UnaryOp``,
+            ``ast.keyword``, etc.).
 
         Raises
         ------
         NotImplementedError
-            If the given `expr_node` is of a type that is not yet supported,
-            or if specific cases within supported types are not implemented.
-
-        Notes
-        -----
-        This method handles:
-            - Literal constants (integers, reals, logicals, characters)
-            - Binary operations (e.g., `+`, `-`, `*`, logical `AND`, `OR`)
-            - Unary operations (`+`, `-`)
-            - Intrinsic function references (e.g., `MINLOC`, `MAXLOC`)
-            - Nested expressions and parenthetical groupings
-            - Named references and argument specifications
+            If *expr_node* is of an unsupported type, or matches a
+            specifically unimplemented sub-case (e.g. a tuple of length
+            other than 1 or 3).
         """
         
         if isinstance(expr_node, F23.Real_Literal_Constant):
-            return self.handle_real_literal_constant(None, expr_node)
+            return self.handle_real_literal_constant(expr_node)
 
         elif isinstance(expr_node, F23.Part_Ref):
-            return self.handle_part_ref(None,expr_node)
+            return self.handle_part_ref(expr_node)
 
         elif isinstance(expr_node, F23.Intrinsic_Function_Reference):
-            return self.handle_intrinsic_function_reference(None,expr_node)
+            return self.handle_intrinsic_function_reference(expr_node)
 
-        elif isinstance(expr_node, F23.Level_2_Expr):  # Composite expression, which contains tuples of different other expressions 
-            if isinstance(expr_node.items[0], F23.Intrinsic_Function_Reference) and expr_node.items[0].items[0].string in ['MINLOC', 'MAXLOC']:
+        elif isinstance(expr_node, F23.Level_2_Expr):  
+            # Composite expression, which contains tuples of different other expressions 
+            if isinstance(expr_node.items[0], F23.Intrinsic_Function_Reference) \
+                and expr_node.items[0].items[0].string in ['MINLOC', 'MAXLOC']:
                 return self.handle_expr(expr_node.items[0])
             else:
-                left = self.handle_expr(expr_node.items[0])
-                op_token = expr_node.items[1] 
-                right = self.handle_expr(expr_node.items[2])
-                return self.build_binop(left, op_token, right)
+                return self._binop_from_items(expr_node.items)
 
         elif isinstance(expr_node, F23.Add_Operand):
             return self.handle_expr(expr_node.items)
 
-        elif isinstance(expr_node, tuple): # THese are mostly used for the assignement task used inside the intrinsic arg spec list
+        elif isinstance(expr_node, tuple): 
+            # These are mostly used for the assignement task used 
+            # inside the intrinsic_arg_spec list or that of 
+            # Level_1_expr or Level_3_expr
 
             if len(expr_node) == 1:
                 return self.handle_expr(expr_node[0])
 
             elif len(expr_node) == 3:
-                left, op_token, right = expr_node
-                # print(right)
-                left_ast = self.handle_expr(left)
-                right_ast = self.handle_expr(right)
-                return self.build_binop(left_ast, op_token, right_ast)
+                return self._binop_from_items(expr_node)
             else:
                 raise NotImplementedError(f'Not implemented for tuple with a size not equal to 1 or 3')
 
@@ -2079,19 +3164,17 @@ class F2NP:
             return ast.UnaryOp(op=op, operand=operand_ast)
 
         elif isinstance(expr_node,F23.Level_4_Expr):
-            return self.handle_level_4epr(expr_node)
+            return self.handle_level_4expr(expr_node)
         
         elif isinstance(expr_node,F23.Parenthesis):
-            return self.handle_expr(expr_node.items[1]) # we directly send the element inside the paranthesis 
+            # we directly send the element inside the paranthesis 
+            return self.handle_expr(expr_node.items[1]) 
             
         elif isinstance(expr_node, F23.Name):
             return ast.Name(id=expr_node.string, ctx=ast.Load())
 
         elif isinstance(expr_node,F23.Mult_Operand):
-            left_ast = self.handle_expr(expr_node.items[0])
-            op_token = expr_node.items[1] 
-            right_ast = self.handle_expr(expr_node.items[2])
-            return self.build_binop(left_ast, op_token, right_ast)
+            return self._binop_from_items(expr_node.items)
             
         elif isinstance(expr_node,(F23.And_Operand,F23.Or_Operand)):
             return self.handle_OR_AND_Operand(expr_node)
@@ -2099,7 +3182,7 @@ class F2NP:
         elif isinstance(expr_node, F23.Equiv_Operand):
             left = self.handle_expr(expr_node.items[0])
             op_token = expr_node.items[1] 
-            op_str = op_token.strip().strip('.')  
+            op_str = op_token.strip().strip('.').upper() 
             op_map = {
                 'AND': ast.And(),
                 'OR': ast.Or(),
@@ -2111,39 +3194,32 @@ class F2NP:
             
         elif isinstance(expr_node,F23.Logical_Literal_Constant):
             bool_val,_ = expr_node.children
-            return ast.Constant(value = False if bool_val.strip().strip('.')   == "FALSE" else True)
+            return ast.Constant(value = False if bool_val.strip().strip('.').upper() == "FALSE" else True)
 
-        elif isinstance(expr_node, (F23.Char_Literal_Constant,F23.Int_Literal_Constant)):
-            expr_node = expr_node.string.strip(" ' ")
+        elif isinstance(expr_node, F23.Char_Literal_Constant):
+            expr_node = expr_node.string.strip(" ' ").strip('"')
             return ast.Constant(value = expr_node)
 
-        elif isinstance(expr_node,F23.Actual_Arg_Spec): # THese sometimes corresponds to eleemnts from the 
-            # of instrinsic methods inner variables values 
-            if len(expr_node.children) > 1:
-                name, dim = expr_node.children
-                if name.string.lower() == "dim" and isinstance(dim,F23.Int_Literal_Constant):# THis case is valid only eleements
-                    # that use the axis argument but need to handle in which we might not need this but something else such as where etc... 
-                    # thus requires a verification in amont of before translating this
-                    if isinstance(dim, F23.Int_Literal_Constant):
-                        value = int(dim.children[0]) - 1
-                        return ast.keyword(arg='axis',value = ast.Constant(value = value ))
-                    else:
-                        raise NotImplementedError(f'The axis value for DIM is not implemeneted for :{type(dim)}')
-                else:
-                    if "=" in expr_node.tostr() and len(expr_node.children) == 2:
-                        rhs_ast = self.handle_expr(expr_node.children[1])
-                        if isinstance(expr_node.children[0], F23.Name) and expr_node.children[0].string.lower() == "mask":
-                            # THIS usually means that we have a case of np.sum(where=expr) case here the mask is the where
-                            name = "where"
-                        else:
-                            name = expr_node.children[0].string
-                        stmt = ast.keyword(
-                            arg = name,
-                            value = rhs_ast
-                        )
-                        return stmt
-                    else:
-                        raise NotImplementedError(f"not implemented handle_expr: actual_arg_spec for the expression_node:{expr_node}")
+        elif isinstance(expr_node,F23.Actual_Arg_Spec): 
+            if len(expr_node.children) == 2:
+                name_node, value_node = expr_node.children
+
+                if not isinstance(name_node, F23.Name):
+                    raise NotImplementedError(
+                        f"Unsupported arg name node: {type(name_node)}"
+                    )
+                arg_name = name_node.string.lower()
+                value_ast = self.handle_expr(value_node)
+
+                return ast.keyword(
+                    arg=arg_name,
+                    value=value_ast
+                )
+
+            else:
+                raise NotImplementedError(
+                    f"Unsupported Actual_Arg_Spec: {expr_node}"
+                )
                     
         elif isinstance(expr_node,(F23.Write_Stmt,F23.Print_Stmt)):
             if not any(walk(walk(expr_node,F23.Io_Control_Spec),F23.Int_Literal_Constant)):
@@ -2179,7 +3255,7 @@ class F2NP:
                         lb_ub = sh.split(':')
                         lb = lb_ub[0].strip() or None
                         ub = lb_ub[1].strip() if len(lb_ub) > 1 else None
-                        # print(ast.dump(self.handle_expr(node.children[1])))
+
                         slice_node = ast.Slice(
                             lower=self.handle_expr(node.children[0]) if lb else None,
                             upper=self.handle_expr(node.children[1]) if ub else None
@@ -2196,89 +3272,113 @@ class F2NP:
             return args 
         
         elif isinstance(expr_node,F23.Assignment_Stmt):
-            lhs = self.handle_expr(expr_node.children[0])
-            rhs = self.handle_expr(expr_node.children[2])
-            return ast.Assign(
-                targets = lhs,
-                value=rhs
-            )
+            return self.handle_assignment(expr_node)
 
         else:
-            raise NotImplementedError(f"Unsupported node type: {type(expr_node)}, for node:{expr_node}")
+            raise NotImplementedError(
+                f"Unsupported node type: {type(expr_node).__name__}\n"
+                f"Node content: {repr(expr_node)}"
+            )
         
-    def apply_mask_to_rhs(self, node):
+    def apply_mask_to_rhs(self, node: ast.AST) -> ast.AST:
         """
-        Recursively walk the RHS and apply `[mask]` to any variable or subscript
-        if it's listed in `self.extractor.all_array_info`.
+        Recursively apply a ``[mask]`` subscript to every array reference
+        in *node*.
 
-        Example transformations:
-            array     -> array[mask]
-            array[:]  -> array[:][mask]
-        """
+        Walks *node* and, for any ``ast.Name``, ``ast.Subscript``, or
+        ``ast.Attribute`` whose base name is a known array (per
+        :attr:`extractor`'s ``all_array_info``), wraps it in
+        ``...[mask]``. For already-subscripted references, the existing
+        slice is itself recursively masked first (so ``array[:]`` becomes
+        ``array[:][mask]`` rather than double-applying the mask), with the
+        mask only added when the (possibly tupled) slice actually contains
+        a real ``ast.Slice`` component. All other node kinds are walked
+        field-by-field and rebuilt with recursively masked children. Used
+        by :meth:`recursive_ast` for the RHS of assignments found inside a
+        ``WHERE``/``ELSEWHERE`` region.
+
+        Parameters
+        ----------
+        node : ast.AST
+            The expression subtree to mask.
+
+        Returns
+        -------
+        ast.AST
+            The mask-applied subtree (mutated and/or rebuilt as needed).
         
-        # Handle variable names like: array
-        if isinstance(node, ast.Name):
-            for elements in self.extractor.all_array_info.values():
-                if node.id in elements.keys():
-                    return ast.Subscript(
-                        value=ast.Name(id=node.id, ctx=ast.Load()),
-                        slice=ast.Name(id="mask", ctx=ast.Load()),
-                        ctx=ast.Load()
-                    )
-
-        # Handle subscript access like: array[:]
-        elif isinstance(node, ast.Subscript):
-            base = node.value
-            if isinstance(base, ast.Name):
+        Raises
+        ------
+        Exception
+            Re-raises any unexpected error after logging.
+        """
+        try:
+            # Handle variable names like: array
+            if isinstance(node, ast.Name):
                 for elements in self.extractor.all_array_info.values():
-                    if base.id in elements.keys():
-                        # Recursively apply masking to subscript slice
-                        node.slice = self.apply_mask_to_rhs(node.slice)
+                    if node.id in elements.keys():
+                        return ast.Subscript(
+                            value=ast.Name(id=node.id, ctx=ast.Load()),
+                            slice=ast.Name(id="mask", ctx=ast.Load()),
+                            ctx=ast.Load()
+                        )
 
-                        # Case 1: It's a full slice like [:]
-                        if isinstance(node.slice, ast.Slice):
-                            return ast.Subscript(
-                                value=node,
-                                slice=ast.Name(id="mask", ctx=ast.Load()),
-                                ctx=ast.Load()
-                            )
+            # Handle subscript access like: array[:]
+            elif isinstance(node, ast.Subscript):
+                base = node.value
+                if isinstance(base, ast.Name):
+                    for elements in self.extractor.all_array_info.values():
+                        if base.id in elements.keys():
+                            # Recursively apply masking to subscript slice
+                            node.slice = self.apply_mask_to_rhs(node.slice)
 
-                        # Case 2: It's a tuple like [:, 1]
-                        elif isinstance(node.slice, ast.Tuple):
-                            # Only apply mask if any element in the tuple is a slice
-                            if any(isinstance(elt, ast.Slice) for elt in node.slice.elts):
+                            # Case 1: It's a full slice like [:]
+                            if isinstance(node.slice, ast.Slice):
                                 return ast.Subscript(
                                     value=node,
                                     slice=ast.Name(id="mask", ctx=ast.Load()),
                                     ctx=ast.Load()
                                 )
 
+                            # Case 2: It's a tuple like [:, 1]
+                            elif isinstance(node.slice, ast.Tuple):
+                                # Only apply mask if any element in the tuple is a slice
+                                if any(isinstance(elt, ast.Slice) for elt in node.slice.elts):
+                                    return ast.Subscript(
+                                        value=node,
+                                        slice=ast.Name(id="mask", ctx=ast.Load()),
+                                        ctx=ast.Load()
+                                    )
+
+                            else:
+                                return node
+
+            # Optionally handle attribute access like obj.attr (if you want to mask those too)
+            elif isinstance(node, ast.Attribute):
+                # Check if this attribute is a known array (only if it's in tracking attributes in all_array_info)
+                attr_str = node.attr  # For example: "obj.attr"
+                for elements in self.extractor.all_array_info.values():
+                    if attr_str in elements.keys():
+                        return ast.Subscript(
+                            value=node,
+                            slice=ast.Name(id="mask", ctx=ast.Load()),
+                            ctx=ast.Load()
+                        )
+
+            # Recursively walk all child nodes
+            for field, value in ast.iter_fields(node):
+                if isinstance(value, list):
+                    new_values = []
+                    for item in value:
+                        if isinstance(item, ast.AST):
+                            new_values.append(self.apply_mask_to_rhs(item))
                         else:
-                            return node
+                            new_values.append(item)
+                    setattr(node, field, new_values)
+                elif isinstance(value, ast.AST):
+                    setattr(node, field, self.apply_mask_to_rhs(value))
 
-        # Optionally handle attribute access like obj.attr (if you want to mask those too)
-        elif isinstance(node, ast.Attribute):
-            # Check if this attribute is a known array (only if it's in tracking attributes in all_array_info)
-            attr_str = node.attr  # For example: "obj.attr"
-            for elements in self.extractor.all_array_info.values():
-                if attr_str in elements.keys():
-                    return ast.Subscript(
-                        value=node,
-                        slice=ast.Name(id="mask", ctx=ast.Load()),
-                        ctx=ast.Load()
-                    )
-
-        # Recursively walk all child nodes
-        for field, value in ast.iter_fields(node):
-            if isinstance(value, list):
-                new_values = []
-                for item in value:
-                    if isinstance(item, ast.AST):
-                        new_values.append(self.apply_mask_to_rhs(item))
-                    else:
-                        new_values.append(item)
-                setattr(node, field, new_values)
-            elif isinstance(value, ast.AST):
-                setattr(node, field, self.apply_mask_to_rhs(value))
-
-        return node
+            return node
+        except Exception as e:
+            self.logger.exception('Exception in apply_mask_to_rhs:', e)
+            raise
