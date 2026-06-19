@@ -1,13 +1,10 @@
 from __future__ import annotations
-from typing import Dict, List,Literal,Optional,Tuple,Union,TYPE_CHECKING
+from typing import Dict, List,Literal,Optional,Tuple,Union,TYPE_CHECKING,Any, Callable
 from fparser.two import Fortran2003 as F23
 from collections import defaultdict
-from itertools import zip_longest
 from fparser.two.utils import walk
 from string import Template
 import subprocess
-import logging
-import yaml
 import copy
 import stat
 import ast
@@ -23,8 +20,95 @@ from logger import Logger
 
 class Transformer:
     """
-    Transformer class responsible for converting FORTRAN code into Python code using Abstract Syntax Trees (AST) as the intermediate representation.
-    This class parses FORTRAN source code, constructs its corresponding AST, and then transforms that AST into a Python-compatible AST structure, which can be further compiled or interpreted in Python.
+    Convert Fortran source code into Python code via an AST-based pipeline.
+
+    The ``Transformer`` parses Fortran declarations and subroutines (with the
+    help of :class:`~isolator.Isolator` and :class:`~extractor.Extractor`),
+    builds an intermediate Python :class:`ast.Module` representation, and
+    emits either a class-based "global module" file or an executable "main"
+    script. It is the central orchestrator of the Fortran-to-Python
+    translation pipeline: declaration conversion, class/instance metadata
+    extraction, dependency resolution, function-call rewriting, array index
+    adjustment, and binary I/O code generation all happen here.
+
+    Parameters
+    ----------
+    benchmark_dir : str
+        Directory used to store per-subroutine benchmark artifacts (timing
+        files, binary dumps, etc.). If ``None``, a ``benchmark`` directory is
+        created under the current working directory.
+    isolator : Isolator
+        Instance providing access to isolated subroutine ASTs
+        (``working_subroutines``) and input ordering metadata
+        (``input_dict``), used e.g. in :meth:`retreive_variable_order`.
+    extractor : Extractor
+        Instance providing extracted Fortran metadata (array info, dummy
+        argument lists, call graphs, variable modification info, etc.)
+        consumed throughout the class, notably in :meth:`correct_function`
+        and :meth:`update_global_python`.
+    ignore_case : list of str
+        Names of variables or functions to be excluded from processing.
+    config_path : str
+        Path to the ``template.yaml`` configuration file containing the
+        Python code templates used by :func:`load_code_templates`.
+    logger : Logger, optional
+        Logger instance used for structured logging and exception
+        reporting. If ``None``, a default :class:`Logger` is created.
+
+    Attributes
+    ----------
+    benchmark_dir : str
+        Resolved benchmark directory path.
+    ignore_case : list of str
+        Names ignored during transformation.
+    isolator : Isolator
+        Reference to the isolator instance.
+    extractor : Extractor
+        Reference to the extractor instance.
+    cls_mode : bool
+        Whether the current output target is class-based.
+    config_path : str
+        Path to the template configuration file.
+    global_state : bool
+        Whether the current declaration set being processed is global
+        (module-level) rather than local to a subroutine.
+    logger : Logger
+        Logger instance used across the class.
+    f2np : F2NP
+        Helper responsible for translating individual Fortran expressions
+        and subroutines into Python AST nodes.
+    pre_init : list of str
+        Variable names already declared/initialized in the active code
+        template; populated by :meth:`pre_init_variables`.
+    dependant_variables : dict
+        Mapping of array variable names to the (uninitialized) variables
+        their shape bounds depend on; populated by
+        :meth:`search_dependant_variables`.
+    scalar : list of str
+        Scalar/logical variable names for the current subroutine context;
+        populated by :meth:`separate_scalar`.
+    variable_order : list of str
+        Order in which variables are read from the binary input file;
+        populated by :meth:`retreive_variable_order`.
+
+    Notes
+    -----
+    The typical pipeline driven by this class is:
+
+    1. :meth:`update_global_python` builds the class-based global module
+       AST for a subroutine, including nested child subroutines collected
+       via :meth:`collect_descendants_dfs`.
+    2. :meth:`update_main_python` builds the executable ``main()`` script
+       that instantiates the global module, reads binary inputs, calls the
+       translated subroutine, and optionally runs a generated comparison
+       test (see :meth:`create_test_function`).
+    3. :meth:`transfer_to_pyfile` writes the finalized AST to disk.
+    4. :meth:`run_python_scripts` executes and validates the generated
+       scripts against expected binary outputs.
+
+    ``update_global_python``, ``update_main_python``, and
+    ``run_python_scripts`` are wrapped with :meth:`Logger.log_event` at
+    construction time so their execution is automatically logged.
     """
 
     def __init__(self, benchmark_dir:str,
@@ -34,19 +118,18 @@ class Transformer:
                  config_path:str,
                  logger:Logger = None
                 ):
-        if benchmark_dir is None: # THe benchmark directory
+        if benchmark_dir is None:               # The benchmark directory
             current_dir = os.getcwd()
             self.benchmark_dir = os.path.join(current_dir, 'benchmark')
             os.makedirs(self.benchmark_dir, exist_ok=True)
         else:
             self.benchmark_dir = benchmark_dir      
-        # self.subroutine_name = None             # Subroutine that will be isolated 
+
         self.ignore_case = ignore_case          # List of string of variables or functions names that are to be ignored
-        self.isolator = isolator                # An instance of isolator class just used in the method retrieve_variable to retrieve variable order 
+        self.isolator = isolator                # An instance of isolator class just used to retrieve variable order  
         self.extractor = extractor              # An instance of extractor class 
         self.cls_mode = False                   # Defines if we should create a class global module or not
         self.config_path = config_path          # Path to the template.yaml file 
-        self.for_loop = False                   # If we want to create with either using using a for loop for the reading binary files 
         self.global_state = False               # Allows to define if the given code template is for global or not
 
         if logger is None:
@@ -56,66 +139,41 @@ class Transformer:
         self.logger.show_header("Transformer")
         
         self.f2np = F2NP(extractor)             # Class in charge of transforming a subroutine from fortran to python
-        self.f2np.ast_mode = True
-
-        # This meant to be done to ensure that we get the log events happening inside the function thus wraps the method itself upon the wrapper function
+        
+        # This meant to be done to ensure that we get the log events happening 
+        # inside the function thus wraps the method itself upon the wrapper function
         self.update_global_python = self.logger.log_event("Update_global_python")(self.update_global_python)
         self.update_main_python = self.logger.log_event('Update_main_python')(self.update_main_python)
         self.run_python_scripts = self.logger.log_event('Run python scripts')(self.run_python_scripts)
-
-    ################################################################################# Helper functions #################################################################################
-    @staticmethod
-    def load_code_templates(config_path:str) -> Dict | None:
-        """
-        Load code templates from a YAML configuration file.
-
-        This method reads a YAML file containing code templates and returns
-        them as a dictionary. It handles file not found, YAML parsing errors,
-        and any unexpected exceptions.
-
-        Parameters
-        ----------
-        config_path : str
-            Path to the YAML configuration file containing the templates.
-
-        Returns
-        -------
-        templates : dict or None
-            Dictionary of code templates if the file is successfully loaded,
-            otherwise `None` if an error occurs during file access or parsing.
-        """
-        try:
-            with open(config_path, 'r') as file:
-                templates = yaml.safe_load(file)
-        except FileNotFoundError:
-            logging.error(f"Error: The file '{config_path}' was not found.")
-            templates = None
-        except yaml.YAMLError as e:
-            logging.error(f"Error parsing YAML file: {e}")
-            templates = None
-        except Exception:
-            logging.exception(f"An unexpected error occurred in load_code_templates")
-            templates = None
-
-        return templates
     
-    def get_imports_from_specs(self,import_specs: List[Tuple[str, List[str]]]) -> List[ast.ImportFrom] | None:
+    def get_imports_from_specs(
+        self,
+        import_specs: List[Tuple[str, List[str]]],
+    ) -> List[ast.ImportFrom] | None:
         """
-        Generate AST `ImportFrom` nodes for the given import specifications.
+        Build ``ast.ImportFrom`` nodes from a list of ``(module, names)``
+        specifications.
 
-        If a class is being imported, it is assumed that the class name matches the
-        module file name.
+        Used by :meth:`create_cls_info` to generate the imports needed for
+        each discovered class (the convention being that a class
+        ``Foo`` lives in a module named ``foo``).
 
         Parameters
         ----------
-        import_specs : list of tuple
-            A list of tuples, where each tuple is of the form:
-            (module_name: str, names_to_import: list of str)
+        import_specs : List[Tuple[str, List[str]]]
+            Each tuple is ``(module_name, names_to_import)``. Specs with an
+            empty *names* list are skipped.
 
         Returns
         -------
-        import_nodes : list of ast.ImportFrom or None
-            A list of `ast.ImportFrom` nodes if successful, otherwise `None`.
+        List[ast.ImportFrom] or None
+            One ``ImportFrom`` node per non-empty spec, or ``None`` if
+            *import_specs* is empty or an error occurs.
+
+        Raises
+        ------
+        Exception
+            Re-raises any unexpected error after logging.
         """
 
         if not import_specs:
@@ -139,31 +197,43 @@ class Transformer:
             return import_nodes
 
         except Exception as e:
-            # Turns out https://stackoverflow.com/questions/5191830/how-do-i-log-a-python-error-with-debug-information using logging.exception is much better than just
-            # to use logging.error since it gives out the stack trace along side the error message
             self.logger.exception(f"Exception in get_imports_from_specs", e)
             return None 
     
-    def create_instances(self, nodes: List, self_mode: bool = False) -> List[ast.Assign]:
+    def create_instances(
+        self,
+        nodes: List,
+        self_mode: Optional[bool] = False,
+    ) -> List[ast.Assign] | None:
         """
-        Create instance assignment nodes for given class definitions.
+        Build ``ast.Assign`` nodes instantiating each given class.
 
-        Depending on `self_mode`, it generates either:
-        - `variable = Class()` or
-        - `self.variable = Class()`
+        Generates ``var = ClassName()`` (or ``self.var = ClassName()`` when
+        *self_mode* is ``True``), using :func:`get_instance_name` to derive
+        the variable name from the class name. Used by
+        :meth:`create_cls_info` to build the instance nodes paired with
+        each discovered ``ast.ClassDef``.
 
         Parameters
         ----------
-        nodes : list
-            List of AST nodes representing class definitions.
-        self_mode : bool
-            If True, generates `self.variable = Class()`.
-            If False, generates `variable = Class()`.
+        nodes : List
+            ``ast.ClassDef`` nodes to instantiate.
+        self_mode : bool, optional
+            If ``True``, targets are ``self.<name>`` attributes; otherwise
+            plain local names.
 
         Returns
         -------
-        instance_nodes: list
-            List of `ast.Assign` nodes representing the created class instances.
+        List[ast.Assign] or None
+            One instantiation assignment per class, or ``None`` if an
+            error occurs.
+
+        Raises
+        ------
+        ValueError
+            If any element of *nodes* is not an ``ast.ClassDef``.
+        Exception
+            Re-raises any unexpected error after logging.
         """
         instance_nodes = []
         try:
@@ -172,14 +242,13 @@ class Transformer:
                     raise ValueError(f"Node is not an ast.ClassDef: {node}")
 
                 instance_name = get_instance_name(node.name)
-
                 # Create Class() constructor call
                 constructor_call = ast.Call(
                     func=ast.Name(id=node.name, ctx=ast.Load()),
                     args=[],
                     keywords=[]
                 )
-
+                
                 # Choose target based on self_mode
                 if self_mode:
                     target = ast.Attribute(
@@ -204,339 +273,861 @@ class Transformer:
             return None
 
     
-    def create_cls_info(self, out_module: ast.Module,subroutine_key:str, instance_node:List = None, self_mode:bool = False) -> Dict:
+    def create_cls_info(
+        self,
+        out_module: ast.Module,
+        subroutine_key: str,
+        instance_node: Optional[List] = None,
+        self_mode: Optional[bool] = False,
+    ) -> Tuple[Dict, List, List]:
         """
-        Retrieve class information including attributes and methods from an AST module.
+        Build the nested class/instance metadata structure consumed
+        throughout the transformation pipeline.
 
-        Parses the provided `ast.Module` and extracts structured information about each class defined within it. The result is a nested dictionary where each key is a
-        class name (or instance identifier), and the value is another dictionary with two keys: `attributes` and `methods`. This also takes into account the other class
-        instances intialized inside the class itself. 
+        Walks *out_module* for ``ast.ClassDef`` nodes, extracts each
+        class's attributes/methods/instances via
+        :meth:`_extract_class_members`, generates the corresponding import
+        nodes via :meth:`get_imports_from_specs` and instance nodes via
+        :meth:`create_instances`, then assembles everything into the final
+        ``cls_info`` dict via :meth:`_assemble_cls_info`. ``cls_info`` is
+        the structure consumed by :meth:`correct_function`,
+        :meth:`add_instance`, :meth:`update_global_python`, and
+        :meth:`update_main_python`.
 
         Parameters
         ----------
         out_module : ast.Module
-            The abstract syntax tree (AST) of the Python module to analyze.
-        instance_node : List
-            Instances nodes of classes intialized inside the current class. 
+            Module AST to scan for class definitions.
+        subroutine_key : str
+            Identifier for the current subroutine, passed through to
+            :meth:`_extract_class_members` for array-info lookups.
+        instance_node : List, optional
+            Pre-existing instance creation nodes, used when classes
+            instantiate other classes internally.
+        self_mode : bool, optional
+            Whether the top-level instance should be bound to ``self``
+            rather than a plain local name.
 
         Returns
         -------
-        cls_info : dict of dict
-            A dictionary where each key represents a class instance, and the value is a dictionary with:
-            - 'attributes': list of attribute names
-            - 'methods': list of method names
+        Tuple[Dict, List, List]
+            ``(cls_info, import_nodes, instance_nodes)``.
+
+        Raises
+        ------
+        ValueError
+            if no class definitions are found, or instance/target nodes 
+            don't match expectations.
+        Exception
+            Re-raises any unexpected error after logging.
 
         Notes
         -----
         This function assumes standard class structure and may not detect dynamically defined
         attributes or methods.
         """
-        cls_info = {}
-        import_nodes,instance_nodes = None,None
         try:
             class_defs = list(ast_walk(out_module, ast.ClassDef))
-            # print(ast.unparse(ast.fix_missing_locations(out_module)))
-            if not class_defs:
-                raise ValueError("There are no class definition are in this module")
-            # Collect attributes and methods separately of a class 
-            class_members = {}
-            for class_def in class_defs:
-                class_name = class_def.name
-                attributes = {}
-                methods = {}
-                instances = {}
-        
-                # Collect instance attributes (self.x)
-                for assign in ast_walk(class_def, ast.Assign):
-                    for target in assign.targets:
-                        if (
-                            isinstance(target, ast.Attribute) and
-                            isinstance(target.value, ast.Name) and
-                            target.value.id == 'self'
-                        ):
-                            # attributes.add(target.attr)
-                            if isinstance(assign.value, ast.Call) and isinstance(assign.value.func, ast.Name) and instance_node:
-                                object_class_name = assign.value.func.id   # "Global_module_hydrol_vegupd"
-                                for instance in instance_node:
-                                    if instance.value.func.id == object_class_name:
-                                        instances[target.attr] = {
-                                            "class_name": instance.targets[0] ,
-                                            "attributes": {},  # will fill later
-                                            "methods": {} 
-                                        }
-                            # case: self.x = np.int32(val) or np.float64(val)
-                            if isinstance(assign.value, ast.Call) and isinstance(assign.value.func, ast.Attribute):
-                                if assign.value.func.attr in ['int32', 'float64']:
-                                    if isinstance(assign.value.args[0], (ast.BinOp,ast.Constant)):
-                                        
-                                        evaluated_value = safe_eval_expr(assign.value.args[0],attributes)
-                                        if evaluated_value is None:
-                                            raise ValueError(f'evaluated_value is None')
-                                        
-                                        attributes[target.attr] = [
-                                            evaluated_value,
-                                            assign.value.func.attr       # dtype
-                                        ]
-                                    else:
-                                        attributes[target.attr] = [
-                                            assign.value.args[0],
-                                            assign.value.func.attr       # dtype
-                                        ]
-                                        
-                                elif assign.value.func.attr in ['bool'] and isinstance(assign.value.args[0], ast.Constant):
-                                    attributes[target.attr] = [
-                                        assign.value.args[0].value,  # constant value
-                                        assign.value.func.attr       # dtype
-                                    ]
-                                # case: self.x = np.zeros([...], dtype=np.float64)
-                                elif assign.value.func.attr in ['zeros','array'] :
-                                    # using cls.all_array_info to retrieve all the array info for the global elements
-                                    arrays = self.extractor.all_array_info[subroutine_key]
-                                    normalized_arrays = {
-                                        k.casefold(): v
-                                        for k, v in arrays.items()
-                                    }
-                                    array_info = normalized_arrays.get(target.attr.casefold())
-                                    if array_info is None:
-                                        # Check within all of the call_within_sub dependencies which means that these arrays are from other subroutines 
-                                        for key in self.isolator.working_subroutines.keys():
-                                            arrays = self.extractor.all_array_info[key]
-                                            normalized_arrays = {
-                                                k.casefold(): v
-                                                for k, v in arrays.items()
-                                            }
-                                            array_info = normalized_arrays.get(target.attr.casefold())
-                                            if array_info is not None:
-                                                self.logger.info(f'Found array_info for {target.attr} in subroutine: {key}')
-                                                break 
+            class_members = {
+                cls.name: self._extract_class_members(cls, instance_node, subroutine_key)
+                for cls in class_defs
+            }
 
-                                    if array_info is None:
-                                        raise ValueError(
-                                            f'Information about the array is not present inside cls.all_array_info for the array: {target.attr}'
-                                        )
-                                    # extract dtype from keywords
-                                    dtype = None
-                                    for kw in assign.value.keywords:
-                                        if kw.arg == "dtype":
-                                            if isinstance(kw.value, ast.Attribute):
-                                                dtype = kw.value.attr
-                                            elif isinstance(kw.value, ast.Name):
-                                                dtype = kw.value.id
-
-                                    attributes[target.attr] = [array_info,dtype]
-                            # Case of self.x = self.y 
-                            if isinstance(assign.value,(ast.Attribute)):
-                                # First we verify that the value is that it's an attribute and not an array being affected
-                                for child in ast.walk(assign.value):
-                                    if isinstance(child,ast.Name):
-                                        dtype = attributes.get(assign.value.attr)
-                                        if dtype:
-                                            attributes[target.attr] = [
-                                                    assign.value.attr,  # constant value
-                                                    dtype[1] # THis is because we the self.y is usually present before the self.x thus the type of self.x is that of self.y
-                                               ]
-                # Collect methods (def method(self): ...)
-                for node in class_def.body:
-                    if isinstance(node, ast.FunctionDef):
-                        methods[node.name] = node
-
-                if not instance_node:
-                    class_members[class_name] = {
-                        'attributes': attributes,
-                        'methods': methods,
-                    }
-                else:
-                    class_members[class_name] = {
-                        'attributes': attributes,
-                        'methods': methods,
-                        'instances': instances
-                    }
-            
-            # Create imports
-            specs = [('module_global', [class_name]) for class_name in class_members]
-            # print(ast.unparse(ast.fix_missing_locations(import_nodes[0])))
+            specs = [(class_name.lower(), [class_name]) for class_name in class_members]
             import_nodes = self.get_imports_from_specs(specs)
-            if import_nodes is None:
-                raise ValueError("Import nodes are None")
-
-            # We could have also used the class definition present inside the out_module to create the instances
             instance_nodes = self.create_instances(class_defs)
-            if instance_nodes is None:
-                raise ValueError("Instance nodes are None")
-        
-            assert len(instance_nodes) == len(import_nodes), "Import nodes and instance nodes should match"
-        
-            # Match instance nodes to class names
-            for class_def, inst_node in zip(class_defs, instance_nodes):
-                class_name = class_def.name
-               
-                if isinstance(inst_node, ast.Assign):
-                    target = inst_node.targets[0]
-                    if isinstance(target, ast.Name):
-                        instance_name = target.id if not self_mode else 'self'
-                        if instance_node:
-                            cls_info[class_name] = {
-                                instance_name: {
-                                    'attributes': class_members[class_name]['attributes'],
-                                    'methods': class_members[class_name]['methods'],
-                                    'instances': class_members[class_name]['instances']
-                                }
-                            }
-                        else:
-                            cls_info[class_name] = {
-                                instance_name: {
-                                    'attributes': class_members[class_name]['attributes'],
-                                    'methods': class_members[class_name]['methods'],
-                                }
-                            }
-                    else:
-                        raise AttributeError(f"Unexpected target type in assignment: {ast.dump(target)}")
-                else:
-                    raise AttributeError(f"Unexpected instance node type: {type(inst_node)}")
-                
+            
+            cls_info = self._assemble_cls_info(
+                class_defs,
+                class_members,
+                instance_nodes,
+                instance_node,
+                self_mode
+            )
+
             return cls_info, import_nodes, instance_nodes
         
+        except ValueError as e:
+            self.logger.error("ValueError in create_cls_info.", e)
+            raise 
         except Exception as e:
-            self.logger.exception(f"An exception occurred in create_cls_info:", e)
-            return None,None,None
-
-    def add_instance(self,idx:int, instance_node:ast.Assign, cls_info:Dict,functions_def:ast.FunctionDef,method_name:List[str]) -> None:
+            self.logger.exception("Failed to create class dict.")
+            raise 
+    
+    def _extract_class_members(
+        self,
+        class_def: List,
+        instance_node: List,
+        subroutine_key: str,
+    ) -> Dict:
         """
-        Insert an instance and optional method calls into a given function definition.
+        Extract attributes, methods, and (optionally) instances from a
+        single class definition.
 
-        This method adds an instance (as an `ast.Assign` node) at a specified index inside a
-        function or method body. It also allows appending method calls to the instance after
-        initialization, based on the provided class information.
+        Every ``ast.Assign`` in *class_def* is classified via
+        :meth:`_handle_assignment`, mutating the *attributes*/*instances*
+        dicts in place; every ``ast.FunctionDef`` directly in the class
+        body is recorded as a method. Used by :meth:`create_cls_info`.
+
+        Parameters
+        ----------
+        class_def : List
+            The ``ast.ClassDef`` node to inspect.
+        instance_node : List
+            Known instance creation nodes; when non-empty, an
+            ``'instances'`` key is included in the result.
+        subroutine_key : str
+            Current subroutine identifier, forwarded to
+            :meth:`_handle_assignment` for array-info resolution.
+
+        Returns
+        -------
+        Dict
+            ``{'attributes': ..., 'methods': ..., 'instances': ...}``
+            (the last key present only when *instance_node* is non-empty).
+        """
+        
+        attributes = {}
+        methods = {}
+        instances = {}
+
+        for assign in ast_walk(class_def, ast.Assign):
+            self._handle_assignment(
+                assign,
+                attributes,
+                instances,
+                instance_node,
+                subroutine_key
+            )
+
+        for node in class_def.body:
+            if isinstance(node, ast.FunctionDef):
+                methods[node.name] = node
+
+        result = {
+            "attributes": attributes,
+            "methods": methods,
+        }
+
+        if instance_node:
+            result["instances"] = instances
+
+        return result
+    
+    def _handle_assignment(
+        self,
+        assign: ast.Assign,
+        attributes: Dict,
+        instances: Dict,
+        instance_node: List,
+        subroutine_key: str,
+    ) -> None:
+        """
+        Classify a single ``self.<attr> = ...`` assignment and record it
+        into *attributes* or *instances*.
+
+        Dispatches by RHS shape: a plain class-constructor call →
+        :meth:`_build_instance_entry`; ``np.int32``/``np.float64`` scalar →
+        :meth:`_get_scalar_info`; ``np.bool`` → recorded directly;
+        ``np.zeros``/``np.array`` → :meth:`_handle_array`; a bare
+        ``self.other`` reference → :meth:`_handle_attribute_copy`. Mutates
+        *attributes* and *instances* in place. Used by
+        :meth:`_extract_class_members`.
+
+        Parameters
+        ----------
+        assign : ast.Assign
+            A class-body assignment node.
+        attributes : Dict
+            Attribute metadata dict, mutated in place.
+        instances : Dict
+            Instance metadata dict, mutated in place.
+        instance_node : List
+            Known instance creation nodes, forwarded to
+            :meth:`_build_instance_entry`.
+        subroutine_key : str
+            Current subroutine identifier, forwarded to
+            :meth:`_handle_array`.
+
+        Notes
+        -----
+        - Detects and handles:
+            - instance creation
+            - numpy scalar attributes
+            - numpy boolean attributes
+            - numpy array attributes
+            - attribute copying (self.x = self.y)
+        - Mutates `attributes` and `instances` in-place.
+        """
+        for target in assign.targets:
+            if not (
+                isinstance(target, ast.Attribute)
+                and isinstance(target.value, ast.Name)
+                and target.value.id == "self"
+            ):
+                continue
+
+            name = target.attr
+
+            # Instance creation
+            if (instance_node is not None
+                and isinstance(assign.value, ast.Call)
+                and isinstance(assign.value.func, ast.Name)
+            ):
+                instances[name] = self._build_instance_entry(assign, instance_node)
+                return
+
+            # Scalar / dtype
+            if (isinstance(assign.value, ast.Call)
+                and isinstance(assign.value.func, ast.Attribute)
+                and assign.value.func.attr in ["int32", "float64"]
+            ):
+                attributes[name] = self._get_scalar_info(assign, attributes)
+                return
+
+            # Boolean
+            if (isinstance(assign.value, ast.Call)
+                and isinstance(assign.value.func, ast.Attribute)
+                and assign.value.func.attr in ['bool']
+            ):
+                attributes[name] = [assign.value.args[0].value, "bool"]
+                return
+
+            # Array
+            if (isinstance(assign.value, ast.Call)
+                and isinstance(assign.value.func, ast.Attribute)
+                and assign.value.func.attr in ["zeros", "array"]
+            ):
+                attributes[name] = self._handle_array(assign, name, subroutine_key)
+                return
+
+            # Attribute copy self.x = ... self.y = self.x 
+            if isinstance(assign.value, ast.Attribute):
+                self._handle_attribute_copy(assign, attributes)
+    
+    def _build_instance_entry(self, assign: ast.AST, instance_node: List) -> Dict:
+        """
+        Build the metadata entry for a ``self.<attr> = SomeClass()``
+        instance-creation assignment.
+
+        Matches *assign*'s constructor call against *instance_node* by
+        class name to confirm the instance is one of the already-known
+        instantiations. Used by :meth:`_handle_assignment`.
+
+        Parameters
+        ----------
+        assign : ast.AST
+            The instance-creation assignment.
+        instance_node : List
+            Known instance creation nodes to match against.
+
+        Returns
+        -------
+        Dict
+            ``{'class_name': <target node>, 'attributes': {}, 'methods': {}}``.
+
+        Raises
+        ------
+        ValueError
+            If no entry in *instance_node* matches *assign*'s class name.
+        """
+        class_name = assign.value.func.id  # Global_module_xxx
+
+        for instance in instance_node:
+            if (
+                isinstance(instance, ast.Assign)
+                and isinstance(instance.value, ast.Call)
+                and isinstance(instance.value.func, ast.Name)
+                and instance.value.func.id == class_name
+            ):
+                
+                return {
+                    "class_name": instance.targets[0],
+                    "attributes": {},
+                    "methods": {},
+                }
+
+        raise ValueError(f'Instance node and class name differ')  
+    
+    def _handle_attribute_copy(self, assign: ast.AST, attributes: Dict) -> None:
+        """
+        Propagate dtype metadata for a ``self.x = self.y`` attribute-copy
+        assignment.
+
+        No-ops unless both target and value are ``self.attr`` references
+        and the source attribute already has recorded dtype metadata in
+        *attributes* (relying on declaration order: the source is assumed
+        to have been processed earlier). Used by :meth:`_handle_assignment`.
+
+        Parameters
+        ----------
+        assign : ast.AST
+            The attribute-copy assignment.
+        attributes : Dict
+            Attribute metadata dict, mutated in place.
+
+        Raises
+        ------
+        KeyError
+            if *attributes* access patterns change to
+            require the source key to exist rather than tolerating its
+            absence.
+        Exception
+            Re-raises any unexpected error after logging.
+
+        Notes
+        -----
+        - Handles simple attribute copies only.
+        - Inherits dtype metadata from source attribute.
+        - Does nothing if source attribute metadata is missing.
+        """
+        try:
+            target = assign.targets[0]
+
+            if not isinstance(target, ast.Attribute):
+                return
+
+            value = assign.value
+
+            # Only handle simple attribute access like: self.x = self.y
+            if not isinstance(value, ast.Attribute):
+                return
+
+            source_name = value.attr
+            target_name = target.attr
+
+            if not isinstance(value.value, ast.Name):
+                return
+
+            # Lookup dtype from existing attributes
+            dtype_info = attributes.get(source_name)
+
+            if dtype_info:
+                attributes[target_name] = [
+                    source_name,
+                    dtype_info[1],  # inherit dtype This is because we the self.y is usually present 
+                                    # before the self.x thus the type of self.x is that of self.y
+                ]
+        except KeyError as e:
+            self.logger.error("KeyError in _handle_attribute_copy.", e)
+            raise 
+        except Exception as e:
+            self.logger.exception("Exception in _handle_attribute_copy.")
+            raise 
+    
+    def _get_scalar_info(self, assign: ast.AST, attributes: Dict) -> List:
+        """
+        Extract ``[value, dtype]`` metadata from a NumPy scalar assignment.
+
+        Constant or simple ``BinOp`` arguments are evaluated via
+        :func:`safe_eval_expr` against *attributes* (so expressions
+        depending on already-declared attributes can resolve); other
+        argument shapes are kept symbolic. Used by
+        :meth:`_handle_assignment`.
+
+        Parameters
+        ----------
+        assign : ast.AST
+            The scalar-constructor assignment (``np.int32(...)`` /
+            ``np.float64(...)``).
+        attributes : Dict
+            Existing attribute metadata, used for expression evaluation.
+
+        Returns
+        -------
+        List
+            ``[value, dtype]`` where *value* is the evaluated constant or
+            the raw AST argument.
+
+        Raises
+        ------
+        Exception
+            Propagated from :func:`safe_eval_expr` if
+            expression evaluation fails on a malformed ``BinOp``.
+        """
+        try:
+            arg = assign.value.args[0]
+            dtype = assign.value.func.attr
+
+            if isinstance(arg, (ast.BinOp, ast.Constant)):
+                value = safe_eval_expr(arg, attributes)
+                return [value, dtype]
+
+            return [arg, dtype]
+        except Exception as e:
+            self.logger.exception('Exception in _get_scalar_info:', e)
+            raise 
+    
+    def _handle_array(self, assign: ast.AST, name: str, subroutine_key: str) -> List:
+        """
+        Extract ``[array_info, dtype]`` metadata from a NumPy array
+        assignment.
+
+        Array shape/type metadata is resolved via
+        :meth:`_resolve_array_info`; *dtype* is read from the assignment's
+        ``dtype`` keyword if present. Used by :meth:`_handle_assignment`.
+
+        Parameters
+        ----------
+        assign : ast.AST
+            The array-constructor assignment (``np.zeros(...)`` /
+            ``np.array(...)``).
+        name : str
+            Name of the array attribute.
+        subroutine_key : str
+            Current subroutine identifier, forwarded to
+            :meth:`_resolve_array_info`.
+
+        Returns
+        -------
+        List
+            ``[array_info, dtype]``; *dtype* may be ``None`` if no
+            ``dtype`` keyword was present.
+
+        Raises
+        ------
+        ValueError
+            if array metadata cannot be found in any context.
+        """
+        try:
+            array_info = self._resolve_array_info(name, subroutine_key)
+
+            dtype = None
+            for kw in assign.value.keywords:
+                if kw.arg == "dtype":
+                    dtype = getattr(kw.value, "attr", getattr(kw.value, "id", None))
+
+            return [array_info, dtype]
+        except ValueError as e:
+            self.logger.error('ValueError in _handle_array:', e)
+            raise
+    
+    def _resolve_array_info(self, name: str, subroutine_key: str) -> Dict:
+        """
+        Look up array shape/type metadata for *name*, searching the
+        current subroutine first and falling back to other isolated
+        subroutines.
+
+        Case-insensitive lookup against :attr:`extractor`'s
+        ``all_array_info``. Used by :meth:`_handle_array`.
+
+        Parameters
+        ----------
+        name : str
+            Array variable name to resolve.
+        subroutine_key : str
+            Primary subroutine context to search first.
+
+        Returns
+        -------
+        Dict
+            The array's metadata dictionary.
+
+        Raises
+        ------
+        ValueError
+            If *name* is not found in the current subroutine's array info
+            nor in any of :attr:`isolator`'s ``working_subroutines``.
+        """
+        def lookup(arrays):
+            return {k.casefold(): v for k, v in arrays.items()}.get(name.casefold())
+
+        # current subroutine
+        arrays = self.extractor.all_array_info[subroutine_key]
+        result = lookup(arrays)
+
+        if result:
+            return result
+
+        # fallback search
+        for key in self.isolator.working_subroutines:
+            arrays = self.extractor.all_array_info[key]
+            result = lookup(arrays)
+            if result:
+                self.logger.info(f"Found array_info for {name} in {key}")
+                return result
+
+        raise ValueError(f"Array info not found for {name}")
+    
+    def _assemble_cls_info(
+        self,
+        class_defs: List,
+        class_members: Dict,
+        instance_nodes: List,
+        instance_node: ast.AST,
+        self_mode: bool,
+    ) -> Dict:
+        """
+        Combine per-class member dicts and instance nodes into the final
+        ``class_name -> instance_name -> metadata`` structure.
+
+        Used by :meth:`create_cls_info` as the final assembly step.
+
+        Parameters
+        ----------
+        class_defs : List
+            ``ast.ClassDef`` nodes, in the same order as *instance_nodes*.
+        class_members : Dict
+            Per-class ``{'attributes': ..., 'methods': ..., 'instances': ...}``
+            from :meth:`_extract_class_members`, keyed by class name.
+        instance_nodes : List
+            Instance creation nodes, in the same order as *class_defs*.
+        instance_node : ast.AST
+            Truthy when nested instance metadata should be included in the
+            assembled entry.
+        self_mode : bool
+            Whether the instance name should be forced to ``"self"``.
+
+        Returns
+        -------
+        Dict
+            ``{class_name: {instance_name: {'attributes': ..., 'methods': ..., ['instances': ...]}}}``.
+
+        Raises
+        ------
+        TypeError
+            If a corresponding instance node is not an ``ast.Assign``, or
+            its target is not an ``ast.Name``.
+        """
+        cls_info = {}
+
+        for cls, inst in zip(class_defs, instance_nodes):
+            class_name = cls.name
+
+            if not isinstance(inst, ast.Assign):
+                raise TypeError("Invalid instance node")
+
+            target = inst.targets[0]
+            if not isinstance(target, ast.Name):
+                raise TypeError("Invalid instance target")
+
+            instance_name = target.id if not self_mode else "self"
+
+            entry = {
+                "attributes": class_members[class_name]["attributes"],
+                "methods": class_members[class_name]["methods"],
+            }
+
+            if instance_node:
+                entry["instances"] = class_members[class_name]["instances"]
+
+            cls_info[class_name] = {instance_name: entry}
+
+        return cls_info
+
+    def add_instance(
+        self,
+        idx: int,
+        instance_node: ast.AST,
+        cls_info: Dict,
+        functions_def: ast.FunctionDef,
+        method_names: List[str],
+    ) -> None:
+        """
+        Insert an instance-creation node, plus optional follow-up method
+        calls, into a function body.
+
+        The insertion index is first resolved via
+        :meth:`_resolve_insert_index` and adjusted to respect existing
+        dependency ordering via :meth:`_adjust_for_dependencies`. After
+        inserting the instance, requested method calls are built via
+        :meth:`_build_method_calls` and inserted immediately after.
 
         Parameters
         ----------
         idx : int
-            The index at which the instance node should be inserted in the function body.
-
-        instance_nodes : ast.Assign
-            The AST assignment node representing the instance to be inserted.
-
-        cls_info : dict
-            Dictionary containing class-related metadata, used to determine if methods should
-            be called after initialization.
-
+            Desired insertion index (passed through to
+            :meth:`_resolve_insert_index`).
+        instance_node : ast.AST
+            The instance-creation ``ast.Assign`` to insert.
+        cls_info : Dict
+            Class metadata used to resolve method ASTs in
+            :meth:`_build_method_calls`.
         functions_def : ast.FunctionDef
-            The function or method definition (`ast.FunctionDef`) where the instance is to be added.
+            Function whose body is mutated in place.
+        method_names : List[str]
+            Names of methods to call on the new instance, in order.
 
-        method_name : list of str
-            List of method names that should be called on the instance after initialization.
+        Raises
+        ------
+        NotImplementedError
+            If *functions_def* is falsy (insertion outside a function body
+            is unsupported).
+        """
+
+        if not functions_def:
+            raise NotImplementedError(
+                "add_instance only supports insertion inside functions"
+            )
+
+        try:
+            insert_idx = self._resolve_insert_index(idx, functions_def)
+            insert_idx = self._adjust_for_dependencies(insert_idx, functions_def)
+
+            # Insert instance
+            functions_def.body.insert(insert_idx, instance_node)
+            insert_idx += 1
+
+            # Add method calls
+            calls = self._build_method_calls(
+                instance_node, cls_info, method_names
+            )
+
+            for call in calls:
+                functions_def.body.insert(insert_idx, call)
+                insert_idx += 1
+
+        except Exception:
+            self.logger.exception("Exception in add_instance")
+            raise
+    
+    def _resolve_insert_index(self, idx: int, func_def: ast.FunctionDef) -> int:
+        """
+        Resolve a clamped insertion index, defaulting to just after the
+        last ``ast.Assign`` in the function body when *idx* is ``None``.
+
+        Used by :meth:`add_instance`.
+
+        Parameters
+        ----------
+        idx : int or None
+            Caller-supplied index, or ``None`` for the default heuristic.
+        func_def : ast.FunctionDef
+            Function whose body length bounds the result.
 
         Returns
         -------
-        None
-            This method modifies the `functions_def` node in place.
+        int
+            A valid index in ``[0, len(func_def.body)]``.
+
+        Notes
+        -----
+        - If `idx` is provided, it is clamped to valid bounds.
+        - If `idx` is None, the index is set after the last assignment.
+        - Falls back to appending at the end if no assignments are found.
         """
-        try:
-            if functions_def:
-                # Determine the correct insert position
-                insert_idx = idx
-            
-                if insert_idx is None:
-                    # Look for the last assignment in the function body
-                    last_assign_idx = -1
-                    for i, stmt in enumerate(functions_def.body):
-                        if isinstance(stmt, ast.Assign):
-                                last_assign_idx = i
-                    if last_assign_idx != -1:
-                        insert_idx = last_assign_idx + 1
-                    else:
-                        insert_idx = len(functions_def.body)
-                else:
-                    # Need to test the case where the idx might be out of range or if the variables that might be dependant on this instances are 
-                    # declared beforehand, to do so, we retrieve the first variables which is dependant on the instance itself, most of the time,
-                    # these aren't scalar or logical variables but arrays espcially their shape
-                    var_pos = [i for i, stmt in enumerate(functions_def.body) if isinstance(stmt,ast.Assign) and isinstance(stmt.value, ast.Call)]
-                    var_pos = var_pos[0] if var_pos else None
-                    if var_pos and insert_idx < var_pos:
-                        self.logger.info(f"Given idx:{insert_idx} is smaller that the variables that depends on this, placing the instance before it")
-                        insert_idx = var_pos
-                    
-                functions_def.body.insert(insert_idx, instance_node)
-                insert_idx += 1  # We add the +1 for the method call such as declaration_initialization to be append just after
-            
-                # Handle optional method call like :instance.declaration_initialization() or any other methods and also need to check the case whether these require values or such
-                if method_name:
-                    if isinstance(instance_node.value, ast.Call) and isinstance(instance_node.value.func, ast.Name):
-                        class_name = instance_node.value.func.id
-                        instance_method = None
-                        instance_name = instance_node.targets[0].id if isinstance(instance_node.targets[0], ast.Name) else instance_node.targets[0].attr
-                        if isinstance(instance_node.targets[0], ast.Name):
-                            instance_method = instance_name
-                        elif isinstance(instance_node.targets[0], ast.Attribute):
-                            instance_method = instance_node.targets[0] # this is for the cases of self.gm.method_name() or self.method_name()
+        if idx is not None:
+            return max(0, min(idx, len(func_def.body)))
 
-                        methods = cls_info.get(class_name, {}).get(instance_name, {}).get("methods", None)
-                        
-                        if methods:
-                            for method in method_name:
-                                method_ast = methods.get(method) # THis is to check if the method to be added is present inside the class methods, thus avoiding to call ghost methods
-                                if method_ast:
-                                    expression = self.create_call_statements(method_ast,instance_method)
-                                    functions_def.body.insert(insert_idx, expression)
-                                    insert_idx += 1
-                                else:
-                                    # raise ValueError(f'Given method name:{method} is not present among the methods of this class:{class_name}')
-                                    self.logger.warning(f'Given method name:{method} is not present among the methods of this class:{class_name} skipping....')
-                                    continue
+        # default: after last assignment
+        for i in reversed(range(len(func_def.body))):
+            if isinstance(func_def.body[i], ast.Assign):
+                return i + 1
 
-                        elif method_name and not methods:
-                            self.logger.info(f"This class:{class_name} doesn't have any methods so no possibility of adding given method name")
-            else:
-                raise NotImplementedError(f'add_instance is not implemented for adding instances outside of functions')
-        except Exception:
-            self.logger.exception(f'Exception Error in add_instance')
-            raise
+        return len(func_def.body)
+
+    def _adjust_for_dependencies(self, idx: int, func_def: ast.FunctionDef) -> int:
+        """
+        Push an insertion index forward past the first "complex"
+        assignment (one whose RHS is a call, attribute, or subscript) if
+        *idx* would otherwise precede it.
+
+        Used by :meth:`add_instance` to avoid inserting an instance
+        creation before a statement that might already depend on
+        constructs the instance provides.
+
+        Parameters
+        ----------
+        idx : int
+            Initial insertion index.
+        func_def : ast.FunctionDef
+            Function whose body is scanned.
+
+        Returns
+        -------
+        int
+            The original *idx*, or the index of the first complex
+            assignment if that comes later than *idx*.
+
+        Notes
+        -----
+        - Moves the insertion point forward if it precedes a "complex" assignment.
+        - Complex assignments include calls, attributes, or subscript expressions.
+        - Ensures dependent computations are not bypassed.
+        """
+        for i, stmt in enumerate(func_def.body):
+            if isinstance(stmt, ast.Assign):
+                # heuristic: first "complex" assignment
+                if isinstance(stmt.value, (ast.Call, ast.Attribute, ast.Subscript)):
+                    if idx < i:
+                        self.logger.info(
+                            f"Adjusting insert index from {idx} -> {i}"
+                        )
+                        return i
+                    break
+        return idx
+
+    def _get_instance_info(
+        self,
+        instance_node: ast.AST,
+    ) -> Union[Tuple[str, ast.Name], Tuple[str, ast.Attribute]]:
+        """
+        Extract an instance's name and a load-context reference node from
+        its creation assignment.
+
+        Used by :meth:`_build_method_calls`.
+
+        Parameters
+        ----------
+        instance_node : ast.AST
+            The instance-creation ``ast.Assign``.
+
+        Returns
+        -------
+        Union[Tuple[str, ast.Name], Tuple[str, ast.Attribute]]
+            ``(name, reference_node)``, where *reference_node* is a fresh
+            ``ast.Name`` (for plain-name targets) or the original
+            ``ast.Attribute`` target (for ``self.attr`` targets).
+
+        Raises
+        ------
+        TypeError
+            If the assignment's target is neither an ``ast.Name`` nor an
+            ``ast.Attribute``
+
+        Notes
+        -----
+        - Supports simple names and attribute-based targets.
+        """
+        target = instance_node.targets[0]
+
+        if isinstance(target, ast.Name):
+            return target.id, ast.Name(id=target.id, ctx=ast.Load())
+
+        if isinstance(target, ast.Attribute):
+            return target.attr, target
+
+        raise TypeError("Unsupported instance target")
+    
+    def _build_method_calls(
+        self,
+        instance_node: ast.AST,
+        cls_info: Dict,
+        method_names: List,
+    ) -> List:
+        """
+        Build call statements for each requested method on a newly created
+        instance.
+
+        Resolves each method's AST via *cls_info*, builds the call via
+        :meth:`create_call_statements`. Methods not found are skipped with
+        a warning rather than raising, since some requested method names
+        may legitimately not exist for a given class. Used by
+        :meth:`add_instance`.
+
+        Parameters
+        ----------
+        instance_node : ast.AST
+            The instance-creation assignment.
+        cls_info : Dict
+            Class metadata used to resolve method definitions.
+        method_names : List
+            Method names to build calls for, in order.
+
+        Returns
+        -------
+        List
+            Call statement AST nodes (``ast.Expr``/``ast.Assign``), one per
+            successfully resolved method.
+
+        Notes
+        -----
+        - Only processes instances created via direct class calls.
+        - Skips methods not found in the class metadata.
+        - Returns an empty list if no valid methods are available.
+        """
+        if not method_names:
+            return []
+
+        if not isinstance(instance_node.value, ast.Call):
+            return []
+
+        if not isinstance(instance_node.value.func, ast.Name):
+            return []
+
+        class_name = instance_node.value.func.id
+        instance_name, instance_ref = self._get_instance_info(instance_node)
+
+        methods = cls_info.get(class_name, {}).get(instance_name, {}).get("methods")
+
+        if not methods:
+            self.logger.info(f"Class {class_name} has no methods")
+            return []
+
+        calls = []
+
+        for method in method_names:
+            method_ast = methods.get(method)
+
+            if not method_ast:
+                self.logger.warning(
+                    f"Method '{method}' not found in class '{class_name}' skipping..."
+                )
+                continue
+
+            calls.append(self.create_call_statements(method_ast, instance_ref))
+
+        return calls
         
-    def create_call_statements(self, function_ast: ast.FunctionDef, instance:Optional[Union[str,ast.AST]]=None) -> ast.Expr | ast.Assign:
+    def create_call_statements(
+        self,
+        function_ast: ast.FunctionDef,
+        instance: Optional[Union[str, ast.AST]] = None,
+    ) -> Union[ast.Expr, ast.Assign]:
         """
-        Generate a function or method call AST node with appropriate arguments and return handling.
+        Build a call statement for *function_ast*, choosing between a bare
+        expression and an assignment based on whether the function returns
+        a value.
 
-        Creates an `ast.Expr` or `ast.Assign` node representing a call to the given function, based on its arguments and return values. If the function has return values, the result
-        will be wrapped in an `ast.Assign` node; otherwise, it returns an `ast.Expr` node.
+        Detects method-vs-function calling convention from whether the
+        first argument is named ``self``. Arguments are built via
+        :meth:`_build_args`. If the function contains a non-``None``
+        ``return``, the call is wrapped in an assignment via
+        :meth:`_build_assignment`; otherwise a bare ``ast.Expr`` is
+        returned. Used throughout the pipeline (:meth:`_build_method_calls`,
+        :meth:`update_main_python`) to synthesise call sites for already-
+        translated functions/methods.
 
         Parameters
         ----------
         function_ast : ast.FunctionDef
-            The AST node representing the function for which the call statement should be generated.
-
-        instance_name : str, optional
-            The name of the instance from which the method is called, if applicable
-            (i.e., `instance_name.method_name()`). If `None`, assumes a standalone function call.
+            The function/method definition to call.
+        instance : str or ast.AST, optional
+            The instance to call the method on (a name string, an AST
+            reference node, or ``None`` to default to ``self``). Ignored
+            for non-method functions.
 
         Returns
         -------
-        ast.Expr or ast.Assign
-            An `ast.Expr` node if the function returns nothing, or an `ast.Assign` node if it has one
-            or more return values.
+        Union[ast.Expr, ast.Assign]
+            The constructed call statement.
+
+        Raises
+        ------
+        ValueError
+            If *instance* is given but the function is not a method (its
+            first argument is not ``self``).
+        TypeError
+            If *instance* is neither ``None``, a ``str``, nor an
+            ``ast.AST``.
+        Exception
+            Re-raises any unexpected error after logging.
         """
         try:
-            # Get the function definition
-            function_def = next(iter(ast_walk(function_ast, ast.FunctionDef)),None)
-
-            if function_def is None:
-                raise ValueError(f'Value error: function_def is None')
-            
+            function_def = function_ast
             function_name = function_def.name
-            class_method = any(arg for arg in function_def.args.args if arg.arg == 'self') # This is case we need to handle cases like
-            # self.method_name() or gm.method_name instances
 
-            args = [ast.Name(id=arg.arg, ctx=ast.Load()) for arg in function_def.args.args if arg.arg != 'self']
-            # Look for a return statement
-            return_stmt = next(ast_walk(function_def, ast.Return), None)
+            is_method = (
+                function_def.args.args
+                and function_def.args.args[0].arg == "self"
+            )
 
-            # Create a function call expression(ex: read_dummy())
-            if not class_method:
-                call_expr = ast.Call(
-                    func=ast.Name(id=function_name, ctx=ast.Load()),
-                    args=args,
-                    keywords=[]
-                )
-            else:
+            if instance and not is_method:
+                raise ValueError(f'If instance node given and is_method=False `self` argument not present inside the method')
+
+            args = self._build_args(function_def=function_def)
+            # Build call target
+            if is_method:
                 if instance is None:
                     value = ast.Name(id="self", ctx=ast.Load())
                 elif isinstance(instance, str):
@@ -545,63 +1136,165 @@ class Transformer:
                     value = instance
                 else:
                     raise TypeError(f"Unexpected type for instance: {type(instance)}")
-                
-                call_expr = ast.Call(
-                    func = ast.Attribute(
-                        value = value,
-                        attr = function_name,
-                        ctx = ast.Load()
-                    ),
-                    args = args,
-                    keywords = []
-                )
 
-            # If function returns something(ex: ins = read_dummy(), ins,mcr = read_dummy)
-            if return_stmt and return_stmt.value: 
-                return_val = return_stmt.value
-
-                if isinstance(return_val, ast.Name): # This means we return only one element
-                    target = ast.Name(id=return_val.id, ctx=ast.Store())
-                    call_stmt = ast.Assign(
-                        targets=[target],
-                        value=call_expr
-                    )
-
-                elif isinstance(return_val, ast.Tuple): # This means we return multiple elements
-                    targets = [
-                        ast.Name(id=elt.id, ctx=ast.Store())
-                        for elt in return_val.elts if isinstance(elt, ast.Name)
-                    ]
-                    call_stmt = ast.Assign(
-                        targets=[ast.Tuple(elts=targets, ctx=ast.Store())],
-                        value=call_expr
-                    )
-                else:
-                    raise AttributeError(f'Unexcpected return_val type:{type(return_val)}')
+                func = ast.Attribute(value=value, attr=function_name, ctx=ast.Load())
             else:
-                call_stmt = ast.Expr(value=call_expr)
+                func = ast.Name(id=function_name, ctx=ast.Load())
 
-            return call_stmt
+            call_expr = ast.Call(func=func, args=args, keywords=[])
+
+            # Detect return
+            return_stmt = next(
+                (n for n in ast.walk(function_def)
+                if isinstance(n, ast.Return) and n.value is not None),
+                None
+            )
+
+            if return_stmt:
+                return self._build_assignment(return_stmt, call_expr)
+
+            return ast.Expr(value=call_expr)
         
-        except Exception:
-            self.logger.exception(f'Exception in create_call_statements')
-            return None  
+        except Exception as e:
+            self.logger.exception(f'Exception in create_call_statements', e)
+            raise 
     
-    def get_timer(self,subroutine_key:str) -> ast.FunctionDef|None:
+    def _build_assignment(
+        self,
+        return_node: ast.AST,
+        call_expr: ast.Call
+    ) -> ast.Assign | None:
         """
-        Retrieve the Python `@timer` decorator function definition.
+        Build an assignment mapping a function's return targets to a call
+        expression.
 
-        Returns the `ast.FunctionDef` node representing the `timer` decorator function, which can be used to measure the execution time of a function. If the decorator cannot be generated
-        or an error occurs, returns `None`.
+        Handles single-name returns (``a = func(...)``) and tuple returns
+        (``(a, b) = func(...)``, with non-``Name`` tuple elements silently
+        dropped). Used by :meth:`create_call_statements`.
+
+        Parameters
+        ----------
+        return_node : ast.AST
+            The function's ``ast.Return`` node.
+        call_expr : ast.Call
+            The call expression to assign.
 
         Returns
         -------
-        parsed_ast : ast.FunctionDef or None
-            The AST node representing the `@timer` decorator function, or `None` if retrieval fails.
+        Optional[ast.Assign]
+            The constructed assignment, or ``None`` if a tuple return
+            contained no ``ast.Name`` elements.
 
+        Raises
+        ------
+        AttributeError
+            If the return value is neither an ``ast.Tuple`` nor an
+            ``ast.Name``.
+
+        Notes
+        -----
+        - Supports single variable returns and tuple unpacking.
+        - Ignores non-name elements in tuple returns.
+        - Produces assignments of the form:
+            - `a = func(...)`
+            - `(a, b) = func(...)`
+        """
+        value = return_node.value
+
+        if isinstance(value, ast.Tuple):
+            targets = [
+                ast.Name(id=elt.id, ctx=ast.Store())
+                for elt in value.elts
+                if isinstance(elt, ast.Name)
+            ]
+            if targets:
+                return ast.Assign(
+                    targets=[ast.Tuple(elts=targets, ctx=ast.Store())],
+                    value=call_expr
+                )
+
+        elif isinstance(value, ast.Name):
+            return ast.Assign(
+                targets=[ast.Name(id=value.id, ctx=ast.Store())],
+                value=call_expr
+            )
+
+        else:
+            raise AttributeError(f'Unexcpected return_node value type:{type(value)}')
+    
+    def _build_args(self, function_def: ast.FunctionDef) -> List:
+        """
+        Build the positional/keyword/starred argument list for a call to
+        *function_def*, excluding ``self``.
+
+        Used by :meth:`create_call_statements`.
+
+        Parameters
+        ----------
+        function_def : ast.FunctionDef
+            Function whose signature determines the call arguments.
+
+        Returns
+        -------
+        List
+            Argument expression nodes (``ast.Name``/``ast.Starred``) in
+            signature order: positional-only and regular args, then
+            ``*args``, then keyword-only args.
+
+        Notes
+        -----
+        - Excludes the 'self' argument.
+        - Includes positional, keyword-only, and variadic (*args) arguments.
+        """
+        args = []
+
+        for arg in function_def.args.posonlyargs + function_def.args.args:
+            if arg.arg != "self":
+                args.append(ast.Name(id=arg.arg, ctx=ast.Load()))
+
+        if function_def.args.vararg:
+            args.append(ast.Starred(
+                value=ast.Name(id=function_def.args.vararg.arg, ctx=ast.Load()),
+                ctx=ast.Load()
+            ))
+
+        for arg in function_def.args.kwonlyargs:
+            args.append(ast.Name(id=arg.arg, ctx=ast.Load()))
+
+        return args
+
+    def get_timer(self, subroutine_key: str) -> Optional[ast.FunctionDef]:
+        """
+        Build the ``@timer`` decorator function from the configured
+        template.
+
+        Substitutes *subroutine_key* into the benchmark output path before
+        parsing. Used by :meth:`update_global_python` to attach timing to
+        the outermost translated subroutine.
+
+        Parameters
+        ----------
+        subroutine_key : str
+            Current subroutine identifier, used to build the benchmark
+            output path.
+
+        Returns
+        -------
+        Optional[ast.FunctionDef]
+            The parsed timer function, or ``None`` if templates fail to
+            load or parsing fails.
+
+        Raises
+        ------
+        ValueError
+            if templates could not be loaded.
+        SyntaxError
+            if the rendered template is not valid Python.
+        Exception
+            Re-raises any unexpected error after logging.
         """
         try:
-            templates = self.load_code_templates(self.config_path)
+            templates = load_code_templates(self.config_path)
             if templates is None:
                 raise ValueError("Templates could not be loaded due to a prior error.")
             
@@ -620,264 +1313,587 @@ class Transformer:
             self.logger.exception(f"Exception occurred in get_timer")
             return None
     
-    def correct_function(self, function_def:ast.FunctionDef,cls_info:Dict,subroutine_key:str=None,main_file_attributes:List = None) -> None:
+    def correct_function(
+        self,
+        function_def: ast.FunctionDef,
+        cls_info: Dict,
+        subroutine_key: Optional[str] = None,
+        main_file_attributes: Optional[List] = None,
+    ) -> None:
         """
-        Update a translated Python function (from Fortran) by applying argument, decorator, and return modifications.
+        Normalise a freshly translated function: fix its argument list,
+        rewrite nested calls, compute and insert return values, and adjust
+        array indices.
 
-        This method performs the following operations on a given `ast.FunctionDef` node:
+        Five-step pipeline, each delegated to a dedicated helper:
 
-        1. **Argument Replacement for Global Instances**  
-        Replaces any global variable names (from a global module) found in the function's arguments
-        with an instance of the class that holds those attributes.
+        1. :meth:`_get_primary_instance` resolves the function's owning
+        module/instance.
+        2. :meth:`_fix_function_arguments` strips global/instance-bound
+        arguments and ensures ``self``/instance is present when needed.
+        3. :meth:`_fix_function_calls` rewrites nested calls to known
+        internal subroutines with correctly mapped arguments.
+        4. :meth:`_compute_return_variables` determines which scalar
+        OUT/INOUT variables must be returned.
+        5. :meth:`_adjust_function_indices` applies Fortran→Python index
+        correction via ``AdjustIndices``.
 
-        3. **Return Statement Insertion for Modified Output Variables**  
-        - Inspects the dummy variables from the original Fortran subroutine.
-        - Identifies variables marked as `OUT` or `INOUT`.
-        - Filters those that are **scalars**, **modified**, and **not part of a global class instance**.
-        - Appends a `return` statement to return these variables (as a tuple or single return).
+        A return statement is appended via :meth:`_insert_return` if
+        step 4 produced any return variables. Used by
+        :meth:`_process_procedures` for every translated subroutine.
 
         Parameters
         ----------
         function_def : ast.FunctionDef
-            The function definition in Python AST format, translated from Fortran.
+            The translated function to normalise, mutated in place.
+        cls_info : Dict
+            Class metadata for the owning module/instance.
+        subroutine_key : str, optional
+            Current subroutine identifier.
+        main_file_attributes : List, optional
+            Attribute names defined at the main-file level, excluded from
+            scalar return consideration.
+        """
 
-        cls_info : dict
-            Information about the class whose attributes/methods might be referenced within the function. This corresponds to the parent class but also contains information on the object
-            instances called with the class(composition), it also sometimes corresponds to the global attribute class when we don't create class for the main. 
+        try:
+            module_name, instance_name, instance_data = self._get_primary_instance(cls_info)
 
-        timer_tree : ast.AST
-            The AST subtree representing the `@timer` decorator to be optionally inserted.
+            global_attr = instance_data["attributes"]
 
-        subroutine_key : Optional[str]
-            Name of the subroutine/function that we will work upon
+            # 1. Fix arguments
+            self._fix_function_arguments(
+                function_def,
+                instance_name,
+                global_attr,
+                instance_data,
+            )
 
-        main_file_info: Optional[dict]
-            Main file infor is a dict contating information on the functions/subroutines that are present in the file that is not in class as well as attributes 
-        
+            # 2. Fix nested function calls
+            self._fix_function_calls(
+                function_def,
+                cls_info,
+                subroutine_key,
+                module_name,
+                instance_name,
+            )
+
+            # 3. Compute return variables
+            return_list, scalar_variables = self._compute_return_variables(
+                function_def,
+                cls_info,
+                subroutine_key,
+                main_file_attributes,
+                module_name,
+                instance_name,
+            )
+
+            # 4. Adjust indices (Fortran -> Python)
+            self._adjust_function_indices(
+                function_def,
+                cls_info,
+                subroutine_key,
+                scalar_variables,
+                module_name,
+                instance_name,
+            )
+
+            # 5. Insert return
+            if return_list:
+                self._insert_return(function_def, return_list)
+
+        except Exception:
+            self.logger.exception("Exception in correct_function")
+            raise
+    
+    def _get_primary_instance(self, cls_info: Dict) -> Tuple:
+        """
+        Extract the first ``(module_name, instance_name, instance_data)``
+        triple from a ``cls_info`` structure.
+
+        Used by :meth:`correct_function`.
+
+        Parameters
+        ----------
+        cls_info : Dict
+            Nested ``module -> instance -> metadata`` structure.
+
         Returns
         -------
-        None
-            The input `function_def` is modified in place.
+        Tuple
+            ``(module_name, instance_name, instance_data)``.
 
+        Raises
+        ------
+        StopIteration
+            if *cls_info* is empty.
+        """
+        try:
+            module_name = next(iter(cls_info))
+            instance_name = next(iter(cls_info[module_name]))
+            instance_data = cls_info[module_name][instance_name]
+            return module_name, instance_name, instance_data
+        except StopIteration:
+            raise 
+    
+    def _fix_function_arguments(
+        self,
+        function_def: ast.FunctionDef,
+        instance_name: str,
+        global_attr: Dict,
+        instance_data: Dict,
+    ) -> None:
+        """
+        Remove arguments that duplicate global or instance attributes, and
+        ensure the function still has a way to reach them (via ``self`` or
+        the instance name).
+
+        Used by :meth:`correct_function` (step 1).
+
+        Parameters
+        ----------
+        function_def : ast.FunctionDef
+            Function whose argument list is mutated in place.
+        instance_name : str
+            Name to (re-)insert as an argument if global/instance
+            references remain inside the body — ``"self"`` for class
+            methods, otherwise the bare instance variable name.
+        global_attr : Dict
+            Global attribute names to strip from the argument list.
+        instance_data : Dict
+            Metadata for nested instances, whose attributes are also
+            stripped from the argument list.
+        """
+
+        args = function_def.args.args
+        arg_names = [a.arg for a in args]
+
+        global_args = set(arg_names) & set(global_attr)
+
+        other_args = set()
+        for inst in instance_data.get("instances", {}).values():
+            other_args |= set(arg_names) & set(inst.get("attributes", []))
+
+        to_remove = global_args | other_args
+
+        function_def.args.args = [
+            a for a in args if a.arg not in to_remove and a.arg != "self"
+        ]
+
+        used_globals = find_used_globals(function_def, global_attr)
+
+        if to_remove or used_globals:
+            if instance_name == "self":
+                if not any(a.arg == "self" for a in function_def.args.args):
+                    function_def.args.args.insert(0, ast.arg(arg="self"))
+            else:
+                if not any(a.arg == instance_name for a in function_def.args.args):
+                    function_def.args.args.append(ast.arg(arg=instance_name))
+
+    def _fix_function_calls(
+        self,
+        function_def: ast.FunctionDef,
+        cls_info: Dict,
+        subroutine_key: str,
+        module_name: str,
+        instance_name: str,
+    ) -> None:
+        """
+        Rewrite arguments of nested calls to other internal subroutines so
+        they match the callee's resolved dummy-argument mapping.
+
+        Only calls whose target name appears in :attr:`extractor`'s
+        ``call_within_sub`` for *subroutine_key* are touched; arguments are
+        resolved per call via :meth:`_resolve_call_arguments`. Used by
+        :meth:`correct_function` (step 2).
+
+        Parameters
+        ----------
+        function_def : ast.FunctionDef
+            Function whose nested calls are rewritten in place.
+        cls_info : Dict
+            Class metadata used to resolve the callee's method AST.
+        subroutine_key : str
+            Current subroutine identifier.
+        module_name : str
+            Owning module name, used to index into *cls_info*.
+        instance_name : str
+            Owning instance name, used to index into *cls_info*.
+        """
+        call_indices = defaultdict(int)
+
+        for node in ast_walk(function_def, ast.Call):
+            if not isinstance(node.func, ast.Name):
+                continue
+
+            func_name = node.func.id
+
+            if func_name not in self.extractor.call_within_sub[subroutine_key]:
+                continue
+            
+            method = cls_info[module_name][instance_name]['methods'].get(func_name)
+
+            new_args = self._resolve_call_arguments(func_name, call_indices, method)
+            if new_args:
+                node.args = new_args
+    
+    def _resolve_call_arguments(
+        self,
+        func_name: str,
+        call_indices: Dict,
+        method: ast.FunctionDef,
+    ) -> List:
+        """
+        Resolve the actual argument expressions for one call to
+        *func_name*, mapping the callee's dummy-argument positions back to
+        the call site recorded by :attr:`extractor`.
+
+        Tracks per-function call occurrence counts in *call_indices* (since
+        a routine may be called multiple times and each call's actual
+        arguments must be matched independently). Falls back from
+        subroutine-style ``Call_Stmt`` argument lists to function-style
+        ``Part_Ref``/``Assignment_Stmt`` parsing when no ``Call_Stmt`` is
+        found. Used by :meth:`_fix_function_calls`.
+
+        Parameters
+        ----------
+        func_name : str
+            Name of the called function/subroutine.
+        call_indices : Dict
+            Mutable per-function call-occurrence counter.
+        method : ast.FunctionDef
+            The callee's already-translated signature, used to determine
+            which dummy-argument positions are needed.
+
+        Returns
+        -------
+        List
+            Resolved argument expression nodes, or an empty list if
+            resolution fails.
+
+        Raises
+        ------
+        AssertionError
+            if the actual-argument count for a
+            function-style call doesn't match the expected dummy-argument
+            count.
+        IndexError
+        KeyError 
+        """
+        # This retrieves all the call entries of the called function
+        i = call_indices[func_name] 
+        call_indices[func_name] += 1  
+        # Clamp i so it doesn’t exceed available subroutine entries
+        i = min(i, len(self.extractor.call_subroutines.get(func_name, [])) - 1) 
+        indexes = []
+        dummy_args_list = self.extractor.dummy_arg_list[func_name]
+        folded_args = [a.casefold() for a in dummy_args_list]
+        for arg in method.args.args:
+            key = arg.arg.casefold()
+            if key in folded_args:
+                indexes.append(folded_args.index(key))
+                                
+        try:
+            actual_args_list = None
+            part_ref = None
+            if walk(self.extractor.call_subroutines[func_name],F23.Call_Stmt):
+                # Subroutines
+                actual_args_list = walk(self.extractor.call_subroutines[func_name], F23.Actual_Arg_Spec_List)  
+            if actual_args_list:
+                args = [
+                    self.f2np.handle_expr(actual_args_list[i].children[idx])
+                    for idx in indexes
+                ]
+                return args
+            else:
+                # Fall back to another parsing route which usually means 
+                # we are in the case of Functions 
+                # Functions in most cases, seems to appear as either 
+                # Part ref or just as an assign statement like that of def in Python
+                if isinstance(self.extractor.call_subroutines[func_name][i], F23.Part_Ref): 
+                    part_ref = walk(self.extractor.call_subroutines[func_name][i], F23.Part_Ref)
+                else:
+                    if isinstance(self.extractor.call_subroutines[func_name][i],F23.Assignment_Stmt):
+                        _,_,func = self.extractor.call_subroutines[func_name][i].children
+                        part_ref = walk(func,F23.Part_Ref)
+                
+                if part_ref:
+                    actual_args_list = walk(part_ref, F23.Section_Subscript_List)[0]
+                assert len(actual_args_list.children) == len(indexes), f"The actual arguments for the funciton and \
+                    that of the dummy arg list of function: {func_name} should match"
+                args = []
+                for idx in indexes:
+                    if idx < len(actual_args_list.children):
+                        args.append(self.f2np.handle_expr(actual_args_list.children[idx]))
+                    else:
+                        self.logger.warning(
+                            f"Skipping missing actual argument at index {idx} for {func_name}: "
+                            f"{len(actual_args_list.children)} actual args found."
+                        )
+                return args
+        except (IndexError, KeyError) as e:
+            self.logger.error(f"Error mapping arguments for expr to '{func_name}' at index {i}:", e)
+            return []
+        except AssertionError as e:
+            self.logger.error(f"if the actual-argument count for a \
+            function-style call doesn't match the expected dummy-argument \
+            count.", e)
+        
+    def _compute_return_variables(
+        self,
+        function_def: ast.FunctionDef,
+        cls_info: Dict,
+        subroutine_key: str,
+        main_file_attributes: List,
+        module_name: str,
+        instance_name: str,
+    ) -> Tuple[List, Set]:
+        """
+        Determine which scalar variables must be returned from a
+        translated function.
+
+        A variable qualifies when it is declared ``OUT``/``INOUT``, is
+        recorded as modified by :attr:`extractor`, is not a global
+        attribute, and is not an array (arrays are passed/modified by
+        reference and don't need explicit returning). Existing
+        ``ast.Return`` statements suppress this computation entirely. Used
+        by :meth:`correct_function` (step 3).
+
+        Parameters
+        ----------
+        function_def : ast.FunctionDef
+            Function being analysed.
+        cls_info : Dict
+            Class metadata for the owning instance.
+        subroutine_key : str
+            Current subroutine identifier.
+        main_file_attributes : List
+            Attribute names defined at main-file level, excluded from
+            the scalar-variable set.
+        module_name : str
+            Owning module name.
+        instance_name : str
+            Owning instance name.
+
+        Returns
+        -------
+        Tuple[List, Set]
+            ``(return_list, scalar_variables)`` — names to return, and the
+            set of scalar dummy-argument names (used later for index
+            adjustment exclusion).
         """
         return_list = []
+        scalar_variables = set()
+
+        instance_data = cls_info[module_name][instance_name]
+        global_attr = instance_data["attributes"]
+
+        func_name = function_def.name
+        method = instance_data["methods"].get(func_name)
+        if not method:
+            return return_list, scalar_variables
+
+        scalars = [s.string for s in self.extractor.scalar_variables[func_name]]
+
+        for arg in method.args.args:
+            if arg.arg in scalars and arg.arg not in main_file_attributes:
+                scalar_variables.add(arg.arg)
+
         variables_output = []
-        
-        module_names = list(cls_info.keys())
-        try:
-            for module_name in module_names:
-                common_args = set()
-                instance_name = list(cls_info[module_name].keys())[0]
-                global_attr = cls_info[module_name][instance_name]["attributes"]
+        for variables in self.extractor.var_dummy[subroutine_key]: 
+            if any([var for var in walk(variables,F23.Intent_Spec) if var.tostr() in ["OUT","INOUT"]]):
+                name = walk(walk(variables,F23.Entity_Decl),F23.Name)[0].string
+                variables_output.append(name)
 
-                return_present = any(ast_walk(function_def,ast.Return)) # This allows us to differentiate between return that is already present for the functions and not for the subrotuines
+        # Retreive the output variables that might be modified
+        var_modified = set(variables_output) & set(self.extractor.var_modif[subroutine_key])
 
-                # Step 1: Prepare for filtering arguments from function_def
-                args_list = [arg.arg for arg in function_def.args.args]
-                common_global_args = set(args_list) & set(global_attr) # we first retrieve the common global args ffrom the class attributes itself thus removing these to keep only the 
-                # the arguments need to be sent as arguments 
-                # Then check for the atttributes coming form the object classes 
-                common_other_object_args = set()
-                other_object_instances = cls_info[module_name][instance_name].get('instances', {}) # We check if the the actual class has any other attributes
-                if other_object_instances:
-                    for _, instance in other_object_instances.items():
-                        other_attrs = set(instance.get('attributes', []))
-                        matching_args = set(args_list) & other_attrs
-                        if matching_args:
-                            common_other_object_args |= matching_args
+        non_global = var_modified - set(global_attr) # Filter out global variables 
 
-                common_args = common_global_args | common_other_object_args
-                function_def.args.args = [arg for arg in function_def.args.args if arg.arg not in common_args and arg.arg != 'self']
+        # Filter out arrays (those with 'DIMENSION' in their type info) which allows us to return only the scalars
+        # since arrays are sent as reference arguments and doesn't need to be returned to be updated 
+        scalars_to_return = {
+            var for var in non_global
+            if 'DIMENSION' not in self.extractor.var_modif_info[subroutine_key].get(var, [])
+        }
 
-                # This is to check that even if we don't need to send the instance names as arguments we will need to ensure that the instances are added in the case that their 
-                # attributes are used inside
-                used_globals = find_used_globals(function_def,global_attr)
-                if common_args or used_globals:
-                    if instance_name == 'self' and not any(arg.arg == 'self' for arg in function_def.args.args): # Self should always be placed first 
-                        function_def.args.args.insert(0,ast.arg(arg=instance_name))
-                    else:
-                        if not any(arg.arg == instance_name for arg in function_def.args.args):
-                            function_def.args.args.append(ast.arg(arg=instance_name))
+        if scalars_to_return and not any(ast_walk(function_def, ast.Return)):
+            return_list.extend(scalars_to_return)
 
-                call_indices = defaultdict(int) 
-                # walk through and modify function call nodes(subroutines that are called inside other subroutines/functions) if present inside the current subroutine since the 
-                # called subrotuine has been already modified
-                for node in ast_walk(function_def, ast.Call):
-                    if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)):
-                        func_name = node.func.id
-                        if func_name not in self.extractor.call_within_sub[subroutine_key]:
-                            continue
-                        method = cls_info[module_name][instance_name]['methods'].get(func_name)
-                        
-                        i = call_indices[func_name] # since by default all the elements are at 0 
-                        call_indices[func_name] += 1  # increment for next time when we encounter the function itself
-                        i = min(i, len(self.extractor.call_subroutines.get(func_name, [])) - 1) # # Clamp i so it doesn’t exceed available subroutine entries
-                        indexes = []
-                        # print(ast.unparse(ast.fix_missing_locations(method)))
-                        dummy_args_list = self.extractor.dummy_arg_list[func_name]
-                        folded_args = [a.casefold() for a in dummy_args_list]
-                        for arg in method.args.args:
-                            key = arg.arg.casefold()
-                            if key in folded_args:
-                                indexes.append(folded_args.index(key))
-                                
-                        try:
-                            actual_args_list = None
-                            part_ref = None
-                            if walk(self.extractor.call_subroutines[func_name],F23.Call_Stmt):
-                                actual_args_list = walk(self.extractor.call_subroutines[func_name], F23.Actual_Arg_Spec_List) # Subroutines 
-                            if actual_args_list:
-                                args = [
-                                    self.f2np.handle_expr(actual_args_list[i].children[idx])
-                                    for idx in indexes
-                                ]
-                            else:
-                                # Fall back to another parsing route which usually means we are in the case of Functions 
-                                # Functions in most cases, seems to appear as either Part ref or just as an assign statement like that of def in Python
-                                if isinstance(self.extractor.call_subroutines[func_name][i], F23.Part_Ref): 
-                                    part_ref = walk(self.extractor.call_subroutines[func_name][i], F23.Part_Ref)
-                                else:
-                                    if isinstance(self.extractor.call_subroutines[func_name][i],F23.Assignment_Stmt):
-                                        _,_,func = self.extractor.call_subroutines[func_name][i].children
-                                        part_ref = walk(func,F23.Part_Ref)
-                                
-                                if part_ref:
-                                    actual_args_list = walk(part_ref, F23.Section_Subscript_List)[0]
-                                assert len(actual_args_list.children) == len(indexes), f"The actual arguments for the funciton and that of the dummy arg list of function: {func_name} should match"
-                                args = []
-                                for idx in indexes:
-                                    if idx < len(actual_args_list.children):
-                                        args.append(self.f2np.handle_expr(actual_args_list.children[idx]))
-                                    else:
-                                        self.logger.warning(
-                                            f"Skipping missing actual argument at index {idx} for {func_name}: "
-                                            f"{len(actual_args_list.children)} actual args found."
-                                        )
-                            node.args = args
-                        except (IndexError, KeyError) as e:
-                            self.logger.error(f"Error mapping arguments for expr to '{func_name}' at index {i}:", e)
-                            
-                scalar_variables = set()
-                func_name = function_def.name 
-                method = cls_info[module_name][instance_name]['methods'].get(func_name)
-                if not method:
-                    continue
-                scalars = [elem.string for elem in self.extractor.scalar_variables[func_name]]
-                # These 'main_file_attributes' corresponds to the scalars that are sent as arguments from the main file 
-                # where in the case of the children isolation these arguments need to be modified since their values comes directly from the values that are read directly and enusre that we
-                # keep only the elements that are not necessary to be changed.
-                for arg in method.args.args:
-                    if arg.arg in scalars and arg.arg not in main_file_attributes:
-                        scalar_variables.add(arg.arg)
+        return return_list, scalar_variables
 
-                # Return list: we need to verify if the function def requires a return stmt since the function defintion has been converted from 
-                # fortran directly the return could not have been added as such we need to add it inside. To do so we directly use the var_dummy
-                # to scout out the output variables.            
-                for variables in self.extractor.var_dummy[subroutine_key]: # We use var_dummy which contains the arguments sent to the subroutine 
-                    if any([var for var in walk(variables,F23.Intent_Spec) if var.tostr() in ["OUT","INOUT"]]):
-                        name = walk(walk(variables,F23.Entity_Decl),F23.Name)[0].string
-                        variables_output.append(name)
-            
-                if variables_output: # If THERE ARE variable output send as arguments
-                    var_modified = set(variables_output) & set(self.extractor.var_modif[subroutine_key]) # Retreive the output variables that might be modified
-                    if var_modified: # This is to find if the variables modified need to have a return statement
-                        # Filter out global variables
-                        non_global_vars = var_modified - set(global_attr)
-                            
-                        # Filter out arrays (those with 'DIMENSION' in their type info) which allows us to return only the scalars
-                        # And arrays that are present locally within the main file and not the global attribute file will not be returned 
-                        # but will still be updated due to the fact that these variables are sent as arguments and the instance of the global
-                        # module being sent as arguments
-                        scalars_to_return = {
-                            var for var in non_global_vars
-                            if 'DIMENSION' not in self.extractor.var_modif_info[subroutine_key].get(var, [])
-                        }
-                        
-                        if scalars_to_return and not return_present:
-                            return_list.extend(scalars_to_return)
-                            
-            # Now we need to take care of the subscript element so that we don't have a index error ex:mc[:,nlsm,ins] here ins is 3 and nslm 11
-            # Thus ins and nslm makes it go out of bounds since python use zero based indexation,
-            # First retrieve all the loop variables within the for loop usually present in cls.loop_dict si that we don't modify them
-            cons_var = set()
-            loop_dict_values = self.extractor.loop_dict.get(subroutine_key,{})
-            if loop_dict_values: 
-                for values in loop_dict_values.values():
-                    value = sorted(values)
-                    if len(value)>1:
-                        cons_var.add(value[0])
-                        cons_var.add(value[1])
-                    else:
-                        cons_var.add(value[0])
-                # Sometimes the loop dict doesn't go onto enough depth that it leaves out some for loop target vairables due to the fact that loop dict only 
-                # looks upon the end loop range(max) and is known during processing time and not runtime variables like arrays
-                # THUS WE will retrieve the rest of the loop target variables
-                for loop_var in ast_walk(function_def, ast.For):
-                    if isinstance(loop_var.target, ast.Name) and loop_var.target.id not in cons_var:
-                        cons_var.add(loop_var.target.id)
-            # cons_var.add('jsl')
-            # cons_var.add('jjj')
-
-            # Now we visit each node and adjust the subscripts 
-            # We need to send the all_array_info for two reasons: one being the fact that it also contains the local prsent arrays and the dimesnion info
-            # and the second being that these arrays are sent as another when we call the anotehr function locally inside another function thus ru_infilt becomes ru_infilt_ns when 
-            # we call hydrol_soil_infilt inside the hydrol_soil
-            kwargs = {"exclude_index": scalar_variables} if scalar_variables else {} # This is to exclude the variables that are sent as arguments(scalars) and don't need to be modified
-            # But when we isolate only the children only then we need to ensure that we the arguments which might be used inside the arguments
-
-            # This search convenational variables like jj,ji etc... are sometimes are affected to another variables that requires to be verified 
-            adjusted_vars = search_convar_dependencies(cons_var,function_def)
-            if adjusted_vars:
-                kwargs['adjusted_vars'] = adjusted_vars
-
-            adjust_indices = AdjustIndices(cons_var,self.extractor.all_array_info[subroutine_key],cls_info[module_names[-1]][instance_name],**kwargs)
-            for element in function_def.body:
-                adjust_indices.visit(element)
-
-            if return_list:
-                ret_stmts = []
-                    
-                for ret_stmt in return_list:
-                    ret_stmts.append(ast.Name(id = ret_stmt,ctx = ast.Load()))
-                # print(ast.dump(ret_stmts[0],indent=4))
-                return_node = ast.Return()
-                    
-                if len(return_list) > 1:
-                    return_node.value = ast.Tuple(
-                                            elts = ret_stmts,
-                                            ctx = ast.Load()
-                                        )
-                    function_def.body.append(return_node)
-                else:
-                    return_node.value = ret_stmts[0]
-                    function_def.body.append(return_node)
-        except Exception:
-            self.logger.exception(f'Exception in correct_function')
-            raise
-
-    def out_module_python(self) -> ast.Module:
+    def _adjust_function_indices(
+        self,
+        function_def: ast.FunctionDef,
+        cls_info: Dict,
+        subroutine_key: str,
+        scalar_variables: List,
+        module_name: str,
+        instance_name: str,
+    ) -> None:
         """
-        In charge of retrieving the python global module template on either the simple python type or in class format based on the self.cls_mode
+        Apply Fortran-to-Python array index correction to a function body
+        via ``AdjustIndices``.
+
+        Loop variables are collected via :meth:`_collect_loop_variables`;
+        additional adjusted-variable dependencies are resolved via
+        :func:`search_convar_dependencies`. Used by :meth:`correct_function`
+        (step 4).
+
+        Parameters
+        ----------
+        function_def : ast.FunctionDef
+            Function whose body is visited and mutated in place by
+            ``AdjustIndices``.
+        cls_info : Dict
+            Class metadata for the owning instance.
+        subroutine_key : str
+            Current subroutine identifier.
+        scalar_variables : List
+            Scalar variable names excluded from index adjustment.
+        module_name : str
+            Owning module name.
+        instance_name : str
+            Owning instance name.
+        """
+        cons_var = self._collect_loop_variables(function_def, subroutine_key)
+
+        kwargs = {"exclude_index": scalar_variables} if scalar_variables else {}
+
+        adjusted = search_convar_dependencies(cons_var, function_def)
+        if adjusted:
+            kwargs["adjusted_vars"] = adjusted
+
+        adjuster = AdjustIndices(
+            cons_var,
+            self.extractor.all_array_info[subroutine_key],
+            cls_info[module_name][instance_name],
+            **kwargs
+        )
+
+        for stmt in function_def.body:
+            adjuster.visit(stmt)
+
+    def _collect_loop_variables(
+        self,
+        function_def: ast.FunctionDef,
+        subroutine_key: str,
+    ) -> Set:
+        """
+        Collect the set of variable names used as loop-control indices,
+        from both :attr:`extractor`'s ``loop_dict`` and the function body's
+        actual ``ast.For`` targets.
+
+        Used by :meth:`_adjust_function_indices`.
+
+        Parameters
+        ----------
+        function_def : ast.FunctionDef
+            Function whose ``ast.For`` nodes are scanned.
+        subroutine_key : str
+            Current subroutine identifier, used to look up
+            :attr:`extractor`'s ``loop_dict``.
 
         Returns
         -------
-        code : ast.Module
-            AST of the global code template either in normal python script or class format
+        Set
+            Loop-index variable names.
+        """
+        cons_var = set()
+        loop_dict_values = self.extractor.loop_dict.get(subroutine_key, {})
+
+        for values in loop_dict_values.values():
+            if not values:
+                continue
+
+            for v in values:
+                cons_var.add(v)
+
+        for loop in ast_walk(function_def, ast.For):
+            cons_var.update(self._extract_loop_targets(loop.target))
+
+        return cons_var
+    
+    def _extract_loop_targets(self, target: ast.AST) -> Set:
+        """
+        Recursively extract variable names from a ``for`` loop's target
+        expression, handling tuple/list unpacking.
+
+        Used by :meth:`_collect_loop_variables`.
+
+        Parameters
+        ----------
+        target : ast.AST
+            A loop's ``target`` node.
+
+        Returns
+        -------
+        Set
+            Variable names found in *target*.
+        """
+        names = set()
+
+        if isinstance(target, ast.Name):
+            names.add(target.id)
+
+        elif isinstance(target, (ast.Tuple, ast.List)):
+            for elt in target.elts:
+                names.update(self._extract_loop_targets(elt))
+
+        return names
+    
+    def _insert_return(self, function_def: ast.FunctionDef, return_list: List) -> None:
+        """
+        Append a ``return`` statement to a function body, returning a
+        single value or a tuple depending on *return_list*'s length.
+
+        Used by :meth:`correct_function` (step 5).
+
+        Parameters
+        ----------
+        function_def : ast.FunctionDef
+            Function whose body is mutated in place.
+        return_list : List
+            Variable names to return.
+        """
+        values = [ast.Name(id=v, ctx=ast.Load()) for v in return_list]
+
+        return_node = ast.Return(
+            value=values[0] if len(values) == 1 else ast.Tuple(elts=values, ctx=ast.Load())
+        )
+
+        function_def.body.append(return_node)
+
+    def out_module_python(self) -> Optional[ast.Module]:
+        """
+        Load and parse the configured global-module Python code template.
+
+        Used as the starting point for both
+        :meth:`transform_to_class` (class-based global module) consumers.
+
+        Returns
+        -------
+        Optional[ast.Module]
+            The parsed template AST, or ``None`` if loading or parsing
+            fails.
+
+        Raises
+        ------
+        ValueError
+            if templates fail to
+            load, the global-class template entry is missing, or parsing
+            returns ``None``.
         """
         try:
-            templates = self.load_code_templates(self.config_path)
+            templates = load_code_templates(self.config_path)
             if templates is None:
                 raise ValueError("Templates could not be loaded due to a prior error.")
             
-            if self.cls_mode:
-                code = templates["Python_templates"]["Python_global_class_template"]["template"]
-            else:
-                code = templates["Python_templates"]["Python_global_normal_template"]["template"] 
+            code = templates["Python_templates"]["Python_global_class_template"]["template"]
 
             if code is None:
                 raise ValueError(f"The code template for out_module_python wasn't retreived")
                 
-            parsed_ast = self.python_parser(code)
+            parsed_ast = python_parser(code)
             if parsed_ast is None:
                 raise ValueError(f'Parsed AST is None due to prior error')
             
@@ -887,17 +1903,27 @@ class Transformer:
             self.logger.exception(f"Exception occurred while loading out_module_python")
             return None
     
-    def out_main_python(self) -> ast.Module:
+    def out_main_python(self) -> Optional[ast.Module]:
         """
-        In charge of retrieving the python main module template. 
+        Load and parse the configured main-script Python code template.
+
+        Used as the starting point for :meth:`update_main_python`.
 
         Returns
         -------
-        code : ast.Module
-            AST of the main empty code template 
+        Optional[ast.Module]
+            The parsed template AST, or ``None`` if loading or parsing
+            fails.
+
+        Raises
+        ------
+        ValueError
+            if templates fail to
+            load, the main template entry is missing, or parsing returns
+            ``None``.
         """
         try:
-            templates = self.load_code_templates(self.config_path)
+            templates = load_code_templates(self.config_path)
             if templates is None:
                 raise ValueError("Templates could not be loaded due to a prior error.")
             
@@ -905,8 +1931,7 @@ class Transformer:
             if code is None:
                 raise ValueError(f"The code template for out_main_python wasn't retreived")
 
-           
-            parsed_ast =  self.python_parser(code)
+            parsed_ast =  python_parser(code)
             if parsed_ast is None:
                 raise ValueError(f'Parsed AST is None due to prior error')
             
@@ -918,17 +1943,21 @@ class Transformer:
 
     def retreive_variable_order(self) -> None:
         """
-        Retrieve the access order of variables from binary files.
+        Determine the order in which dummy-argument variables are laid out
+        in the binary input file, populating :attr:`variable_order`.
 
-        Determines the sequence in which variables are accessed or stored in the binary
-        file format. This order is important as it reflects how data is laid out in the binary.
+        Reads from :attr:`isolator`'s ``input_dict`` (combining
+        ``reads_non_allocatables`` and ``reads_allocatables``). Used by
+        :meth:`update_global_python`, :meth:`update_main_python`, and
+        :meth:`prepare_read_code_for_main_template`, since the binary
+        layout determines both read order and which variables can be
+        grouped into a single read loop.
 
-        The resulting order is stored in the `variable_order` attribute of the instance.
-
-        Returns
-        -------
-        None
-            This method updates the `variable_order` attribute in place.
+        Raises
+        ------
+        KeyError
+            if :attr:`isolator`'s ``input_dict`` is missing
+            the expected keys.
         """
         self.variable_order = []
         try:
@@ -940,1203 +1969,2135 @@ class Transformer:
         except Exception:
             self.logger.exception(f'Exception in retrieve_variable_order')
             raise
+        except KeyError as e:
+            self.logger.error(f'Expected key missing in input_dict', e)
+            raise 
 
-    def convert_SPECIFICATION_PART(self,declaration_stmts:List,fix_loc:bool=False, cls_mode:bool=False) -> List:
+    def convert_SPECIFICATION_PART(
+        self,
+        declaration_stmts: List,
+        fix_loc: bool = False,
+        cls_mode: bool = False,
+    ) -> List:
         """
-        Convert FORTRAN specification statements into Python assignment statements.
+        Convert a list of Fortran declaration blocks into Python AST
+        assignment/import nodes.
 
-        This method transforms FORTRAN declaration statements (e.g., variable types and initializations)
-        into corresponding Python `ast.Assign` nodes. It also handles `use` statements by generating
-        appropriate `Procedure` or import-related nodes.
-
-        Parameters
-        ----------
-        declaration_stmts : list
-            A list of FORTRAN AST nodes representing declaration statements to be converted.
-
-        fix_loc : bool, optional
-            If True, adjusts location info to enable the use of `ast.unparse` on the resulting AST nodes.
-            Useful when calling this method independently.
-
-        cls_mode : bool, optional
-            If True, generates assignment statements suitable for inclusion within a class context.
-
-        Returns
-        -------
-        ast_nodes : list of ast.AST
-            A list of Python AST nodes including assignment statements and, if applicable, procedure/import nodes.
-        
-        """
-        ast_nodes = []
-
-        kind_map = {
-            'REAL': 'np.float64',  
-            'INTEGER': 'np.int32',
-            'LOGICAL': 'np.bool'
-        }
-
-        target = None
-        try:
-            for declarations in declaration_stmts:
-                # First is that we verify if we have a type declaration stmt and it's allocation stmt -> requires combine_allocate_declarations
-                # in order to retrieve a combined and a proper allocation table variable
-
-                # ANOTHER possibility with the first condition is that if we have intent within the declarations and also a length of 2 the
-                # combine_allocate_declaration method will just remove it since and return a new formatted variable( look at the return value
-                # of the method)
-                if any(walk(decl, F23.Function_Subprogram) for decl in declarations):
-                    continue
-
-                if len(declarations) == 2:
-                    declarations = self.isolator.processor.combine_allocate_declaration(declarations)
-                    # print(declarations)
-                else: 
-                    # Need to verify if the one of the declarations has an INTENT/SAVE/PUBLIC among them thus we need to remove it before
-                    # transformation.
-                    declarations = self.isolator.processor.remove_intent_and_save(declarations)
-                    # print(declarations[0])
-
-                # cls.dec_global finds not only the retreives the variables but also procedures, found case: hydrol_split_soil
-                # Which means they might have use statements as well.
-                for nodes in walk(declarations, (F23.Type_Declaration_Stmt,F23.Use_Stmt)):
-                    if isinstance(nodes,F23.Use_Stmt): # THESE are for the procedure call
-                        # Transform onto the python ast and add it to ast_nodes
-                        # The first three elements of the use stmt gives out the module name which we nned to import
-                        _,_,module_name,_,only_stmt = nodes.children
-                        
-                        if only_stmt:
-                            # We need to see if we have an instance where we have something similar to this : USE my_module, ONLY : func,var1,var2
-                            names_ast_list = []
-                            for elements in only_stmt.children:
-                                if isinstance(elements,F23.Name):
-                                    if elements.string in self.extractor.allowed_external_subroutines:
-                                        continue
-                                    names_ast_list.append(ast.alias(name=elements.string)) 
-                                elif isinstance(elements,F23.Rename):
-                                    _,name, asname = elements.children
-                                    if name.string in self.extractor.allowed_external_subroutines or asname.string in self.extractor.allowed_external_subroutines:
-                                        continue
-                                    names_ast_list.append(ast.alias(name=name.string,asname=asname.string))
-                            if names_ast_list:
-                                import_node = ast.ImportFrom(
-                                    module=module_name.string,
-                                    names = names_ast_list,
-                                    level=0
-                                )
-                                ast_nodes.append(import_node)
-                        else:
-                            import_node = ast.ImportFrom(
-                                module=module_name.string,
-                                names = ast.alias(name='*'),
-                                level=0
-                            )
-                            ast_nodes.append(import_node)
-
-                    elif isinstance(nodes,F23.Type_Declaration_Stmt): # These are for the variables 
-
-                        value = None
-                        np_dtype = None
-                        idx,attr = None, None
-                        
-                        attr_spec = [param.string for param in walk(nodes,F23.Attr_Spec)] # This looks for the Attr specification such as ALLOCATBLE or PARAMETER or SAVE 
-                        allocation_spec = [param.children[0] for param in walk(nodes,F23.Dimension_Attr_Spec) if param.children[0] == 'DIMENSION']
-                        # print(allocation_spec)
-                        kind_selec = any([param.string for param in walk(nodes, F23.Kind_Selector)])
-
-                        # print(kind_selec)
-                        intrinsic_type_spec,_,entity_decl_list = nodes.children # This gives out a tuple
-                        entity_decls = entity_decl_list.children
-
-                        # Allows us to create the numpy type based on the intrinisic type specification part 
-                        np_dtype = kind_map.get(intrinsic_type_spec.children[0], 'np.float64')
-                        idx,attr = np_dtype.split('.')
-
-                        for entity_decl in entity_decls:
-                            var_name, _,_, initialization = entity_decl.children
-
-                            if cls_mode:
-                                target = ast.Attribute(
-                                        value = ast.Name(id="self",ctx=ast.Load()),
-                                        attr = var_name.string.lower() if var_name.string.isupper() else var_name.string, ctx = ast.Store()
-                                )
-                            else:
-                                target = ast.Name(id=var_name.string, ctx=ast.Store())
-                            
-                            if initialization is not None:
-                                _,value = initialization.children
-
-                            if 'PARAMETER' in attr_spec:
-                                if intrinsic_type_spec.children[0] in ['INTEGER', 'REAL'] and not kind_selec: 
-                                    # These are only for element thats has parameters and 
-                                    # has no kind(KIND argument) inside
-                                    # Example case : INTEGER, PARAMETER :: a = 6
-                                    # Perhaps removable since even with/without PARAMETER argument in attribute specification this will changed similarly to INTEGER :: a = 6
-                                    if value is not None:
-                                        if not isinstance(value,F23.Name):
-                                            num_var = self.f2np.handle_expr(value)
-                                            assign = ast.Assign(
-                                                        targets=[target],
-                                                        value=ast.Call( func=ast.Attribute(value=ast.Name(id=idx, ctx=ast.Load()), attr=attr, ctx=ast.Load()),
-                                                                    args=[num_var],
-                                                                    keywords = []
-                                                                )
-                                                    )
-                                        else:
-                                            name_val = self.f2np.handle_expr(value)
-                                            if cls_mode:
-                                                name_val = attach_instance(name_val,instance_name='self')
-
-                                            assign = ast.Assign(
-                                                        targets=[target],
-                                                        value= name_val
-                                                    )
-                                    else:
-                                        
-                                        assign = ast.Assign(
-                                                    targets=[target],
-                                                    value=ast.Call( func=ast.Attribute(value=ast.Name(id=idx, ctx=ast.Load()), attr=attr, ctx=ast.Load()),
-                                                                args=[ast.Constant(value=0)],
-                                                                keywords = []
-                                                            )
-                                                )
-                                    ast_nodes.append(assign)
-                                    # print(f'Dtype:{intrinsic_type_spec}, value:{entity_decl_list}')
-                                elif intrinsic_type_spec.children[0] in ['INTEGER', 'REAL'] and kind_selec: # IF the keyword KIND is present  
-                                    # np_dtype = kind_map.get(intrinsic_type_spec.children[0], 'np.float64') 
-                                    # Create: var = np.array(value, dtype=np_dtype)
-                                    # idx,attr = np_dtype.split('.')
-                                    value_ = None
-                                    val = None
-                                    if value is not None:
-                                        if 'DIMENSION' in allocation_spec:
-                                            # Parse array constructor
-                                            elements = []
-
-                                            array_list = walk(walk(value,F23.Array_Constructor),F23.Ac_Value_List)[0]
-                                            for val in array_list.children: 
-                                                elements.append(self.f2np.handle_expr(val))
-                                            val = ast.Call(
-                                                func=ast.Attribute(value=ast.Name(id='np', ctx=ast.Load()), attr='array', ctx=ast.Load()),
-                                                args=[ast.List(elts=elements, ctx=ast.Load())],
-                                                keywords=[ast.keyword(arg='dtype',
-                                                        value=ast.Attribute(value=ast.Name(id=idx, ctx=ast.Load()), attr=attr, ctx=ast.Load()))]
-                                            )
-                                            assign = ast.Assign(
-                                                targets=[target],
-                                                value=val
-                                            )
-
-                                        else:
-                                            if len(value.children) > 2:                        
-                                                # num1,_, num2 = value.children
-                                                value_ = self.f2np.handle_expr(value)
-                                                if cls_mode:
-                                                    value_ = attach_instance(value_,instance_name='self')
-                                            else: 
-                                                if not isinstance(value,F23.Name):
-                                                    value_ = self.f2np.handle_expr(value)
-                                                else:
-                                                    val = self.f2np.handle_expr(value)
-                                                    if cls_mode:
-                                                        val = attach_instance(val,instance_name='self')
-                                            val = ast.Call(
-                                                func=ast.Attribute(value=ast.Name(id=idx, ctx=ast.Load()), attr=attr, ctx=ast.Load()),
-                                                args=[value_],
-                                                keywords = []
-                                            )
-                                    else:
-                                        val = ast.Call(func=ast.Attribute(value=ast.Name(id=idx, ctx=ast.Load()), attr=attr, ctx=ast.Load()),
-                                                        args=[ast.Constant(value=0)],
-                                                        keywords = []
-                                                    )
-                                    
-                                    assign = ast.Assign(
-                                        targets=[target],
-                                        value=val
-                                    )
-                                    
-                                ast_nodes.append(assign)
-
-                            elif 'DIMENSION' in allocation_spec:
-                                # dimensions_spec_list = walk(walk(nodes,F23.Dimension_Attr_Spec),F23.Explicit_Shape_Spec_List)
-
-                                if walk(value,F23.Array_Constructor):
-                                    elements = []
-                                    array_list = walk(walk(value,F23.Array_Constructor),F23.Ac_Value_List)[0]
-                                    for val in array_list.children: 
-
-                                        elements.append(self.f2np.handle_expr(val))
-                                        
-                                    val = ast.Call(
-                                        func=ast.Attribute(value=ast.Name(id='np', ctx=ast.Load()), attr='array', ctx=ast.Load()),
-                                        args=[ast.List(elts=elements, ctx=ast.Load())],
-                                        keywords=[ast.keyword(arg='dtype',
-                                                value=ast.Attribute(value=ast.Name(id=idx, ctx=ast.Load()), attr=attr, ctx=ast.Load()))]
-                                    )
-                                    assign = ast.Assign(
-                                        targets=[target],
-                                        value=val
-                                    )
-                                else:
-                                    shape = []
-                                    left,right = None,None
-                                    # constant_right = None
-                                    arg_shape = None
-                                    for dim in walk(nodes,F23.Explicit_Shape_Spec):
-                                        left,right = None,None
-                                        lb,ub = dim.children[0],dim.children[1]
-                                        if lb and ub:
-                                            right = self.f2np.handle_expr(lb)
-                                            left = self.f2np.handle_expr(ub)
-                                            
-                                            if cls_mode:
-                                                right = attach_instance(right)
-                                                left = attach_instance(left)
-
-                                            arg_shape = ast.BinOp(
-                                                    left = ast.BinOp(
-                                                        left = left,
-                                                        op = ast.Sub(),
-                                                        right = right),
-                                                    op = ast.Add(),
-                                                    right = ast.Constant(1))
-                                            
-                                            shape.append(arg_shape)
-                                        
-                                        elif lb:
-                                            lb_ast = self.f2np.handle_expr(lb)
-                                            if cls_mode:
-                                                lb_ast = attach_instance(lb_ast)
-                                            shape.append(lb_ast)
-                                        elif ub:
-                                            ub_ast = self.f2np.handle_expr(ub)
-                                            if cls_mode:
-                                                ub_ast = attach_instance(ub_ast)
-                                            
-                                            shape.append(ub_ast)
-                                        else:
-                                            raise ValueError(f'Both of the, lower bound:{lb}, upper bound:{ub}')
-                                    # Why are we doing np.empty is due to the fact that empty doesn't intialize the arrays but keeps in memory (randomly created values) which might be really small 1e-300
-                                    # to really large but also these values are not random but values what was present in the memory: https://www.reddit.com/r/learnpython/comments/wgexrf/comment/iizmx5d/?utm_source=share&utm_medium=web3x&utm_name=web3xcss&utm_term=1&utm_content=share_button
-                                    # Thus using np.zeros better use case than the np.empty since this also helpful in the case we have logical arrays which means it has either zeros or one we use zeros dimensions
-                                    np_call = ast.Call(  
-                                        func=ast.Attribute(value=ast.Name(id='np', ctx=ast.Load()), attr='zeros', ctx=ast.Load()),
-                                        args=[ast.Tuple(elts=shape, ctx=ast.Load())],
-                                        keywords=[ ast.keyword(arg='dtype', value = ast.Attribute(value=ast.Name(id=idx, ctx=ast.Load()), attr=attr, ctx=ast.Load()))]
-                                    )
-                                        
-                                    assign = ast.Assign(
-                                        targets=[target],
-                                        value=np_call
-                                    )
-                                ast_nodes.append(assign)
-
-                            else: # Cases where the variable is not a PARAMETER nor ALLOCATABLE present, either just a INTEGER, LOGICAL
-                                bool_val = False
-                                if intrinsic_type_spec.children[0] == 'LOGICAL' and not kind_selec: # SET AS AN EXCEPTIONAL CASE 
-                                    if value is not None:
-                                        if value.string.split(".")[1] == "TRUE":
-                                            bool_val = True
-                                        
-                                        bool_call = ast.Call(
-                                                        func=ast.Attribute(value=ast.Name(id='np', ctx=ast.Load()), attr='bool', ctx=ast.Load()),
-                                                        args=[ast.Constant(value=bool_val)],
-                                                        keywords=[]
-                                                    )
-                                    else:
-                                        bool_call = ast.Call(
-                                                        func=ast.Attribute(value=ast.Name(id='np', ctx=ast.Load()), attr='bool', ctx=ast.Load()),
-                                                        args=[ast.Constant(value=False)],
-                                                        keywords=[]
-                                                    )
-                                    assign = ast.Assign(
-                                                    targets=[target],
-                                                    value=bool_call
-                                                )
-                                    ast_nodes.append(assign)
-                                
-                                # Need to handle case where there could be a value if the kind_selec is None but still has a value
-                                elif not kind_selec:
-                                    
-                                    if value is None: # Example cases : INTEGER :: ier 
-                                        assign = ast.Assign(
-                                                targets=[target],
-                                                value=ast.Call( func=ast.Attribute(value=ast.Name(id=idx, ctx=ast.Load()), attr=attr, ctx=ast.Load()),
-                                                                args=[ast.Constant(value=0)],
-                                                                keywords = []
-                                                            )
-                                                )
-                                    
-                                    else:
-                                        if not isinstance(value, F23.Name):
-                                            arg = self.f2np.handle_expr(value)
-                                            assign = ast.Assign(
-                                                targets=[target],
-                                                value=ast.Call( func=ast.Attribute(value=ast.Name(id=idx, ctx=ast.Load()), attr=attr, ctx=ast.Load()),
-                                                                args=[arg],
-                                                                keywords = []
-                                                            )
-                                            )
-                                        else:
-                                            name_val = self.f2np.handle_expr(value)
-                                            if cls_mode:
-                                                name_val = attach_instance(name_val,instance_name='self')
-                                            assign = ast.Assign(
-                                                targets=[target],
-                                                value=name_val
-                                                )
-                                        
-                                    ast_nodes.append(assign)
-                
-                                else:
-                                    if value is None:
-                                        assign = ast.Assign(
-                                                targets=[target],
-                                                value=ast.Call( func=ast.Attribute(value=ast.Name(id=idx, ctx=ast.Load()), attr=attr, ctx=ast.Load()),
-                                                                args=[ast.Constant(value=0)],
-                                                                keywords = []
-                                                            )
-                                                )
-                                    else:
-                                        # Verify that the value is a string
-                                        if not isinstance(value, F23.Name):
-                                            num_val = self.f2np.handle_expr(value)
-                                            assign = ast.Assign(
-                                                    targets=[target],
-                                                    value=ast.Call( func=ast.Attribute(value=ast.Name(id=idx, ctx=ast.Load()), attr=attr, ctx=ast.Load()),
-                                                                    args=[num_val],
-                                                                    keywords = []
-                                                                )
-                                                    )
-                                        else:
-                                            name_val = self.f2np.handle_expr(value)
-                                            if cls_mode:
-                                                name_val = attach_instance(name_val,instance_name='self')
-                                            assign = ast.Assign(
-                                                    targets=[target],
-                                                    value=name_val
-                                                    )
-                                        
-                                    ast_nodes.append(assign)
-            if fix_loc:    
-                ast_nodes = [ast.fix_missing_locations(node) for node in ast_nodes]
-
-            return ast_nodes
-        
-        except Exception:
-            self.logger.exception(f'Exception error in convert_Specification_part',)
-            return None
-
-    def pre_init_variables(self,code_template:ast.Module) -> None:
-        """
-        Extract variables that are pre-declared and initialized within the given code template.
-
-        This method identifies all variables that have both been declared and initialized in the input code template.
-        It stores their names in the `pre_init` attribute as a list.
-
-        Parameters
-        ----------
-        code_template : ast.Module
-            Code template upon which variables or other elements will be added.
-
-        Returns
-        -------
-        None
-            This method modifies the `pre_init` attribute directly.
-        """
-        
-        self.pre_init = []
-        class_exist = any(ast_walk(code_template,ast.ClassDef))
-        try:
-            if class_exist:
-                functions_spec = ast_walk(code_template,ast.FunctionDef)
-                for functions in functions_spec:
-                    if functions.name == "__init__":
-                        assign_stmt = ast_walk(functions,ast.Assign)
-                        for assign_ in assign_stmt:
-                            if isinstance(assign_.targets[0],ast.Name):
-                                self.pre_init.append(assign_.targets[0].id)
-                            elif isinstance(assign_.targets[0],ast.Attribute):
-                                self.pre_init.append(assign_.targets[0].attr)
-                            
-            else:
-                nodes = ast_walk(code_template,ast.Assign)
-                for node in nodes:
-                    self.pre_init.append(node.targets[0].id)
-        except Exception:
-            self.logger.exception(f'Exception in pre_init_variables')
-            raise
-
-    def search_dependant_variables(self,declaration_stmts:List) -> None:
-        """
-        Analyze dependencies between arrays and scalars using the FORTRAN AST.
-
-        This method identifies which variables (dependents) rely on others (dependees) by traversing the FORTRAN AST.
-        It creates an attribute `dependant_variables`, a dictionary where each key is a dependent variable and the corresponding value is a list of its dependees.
+        Each block is first checked via :meth:`_contains_function` (blocks
+        containing nested function subprograms are skipped entirely), then
+        normalised via :meth:`_preprocess_declarations`. ``Use_Stmt`` nodes
+        are routed to :meth:`_handle_use_stmt`; ``Type_Declaration_Stmt``
+        nodes are routed to :meth:`_handle_type_decl`. Used by
+        :meth:`update_global_python` and :meth:`update_main_python` as the
+        entry point for translating a routine's declaration section.
 
         Parameters
         ----------
         declaration_stmts : List
-            List of declaration statements within which to find dependents and dependees.
+            Fortran declaration block lists to convert.
+        fix_loc : bool, optional
+            If ``True``, calls ``ast.fix_missing_locations`` on each
+            resulting node — needed when the nodes will be unparsed
+            independently of a parent tree that already has locations.
+        cls_mode : bool, optional
+            Whether the resulting assignments target ``self.<attr>``
+            (class context) or plain module-level names.
 
         Returns
         -------
-        None
-            This method modifies the `dependant_variables` attribute directly.
+        List
+            The converted AST nodes (assignments and/or imports).
         """
-        
-        self.dependant_variables = {} # THe variable that is the dependant of the other which has the key as the dependant and the values 
-        # the different dependees 
-        combined_stmt = None
+
+        ast_nodes = []
         try:
             for declarations in declaration_stmts:
-                dependees = []
-                alloc_spec = any(alloc for alloc in walk(declarations, F23.Attr_Spec) if alloc.string == "ALLOCATABLE")
-                if len(declarations) == 2 and alloc_spec:
-                    combined_stmt = self.isolator.processor.combine_allocate_declaration(declarations)
-                else:
-                    combined_stmt = declarations
-                
-                if combined_stmt and alloc_spec:
-                    dimensions_spec_list = walk(walk(combined_stmt,F23.Dimension_Attr_Spec),F23.Explicit_Shape_Spec_List) 
-                    entity_dec_name = walk(combined_stmt,F23.Entity_Decl)[0].children[0]
-                    
-                    # Now we verify if one of these variables has initialization as None
-                    for arg in dimensions_spec_list[0].children: # This allows to handle cases such as imax:imin type 
-                        
-                        limits = arg.tostr().split(' : ')
-                        lb = limits[0] 
-                        
-                        ub = limits[1] if len(limits) > 1 else None
-                        # print(lb,ub)
-                        # we now verify that the upper bound/lower bound 's shape is present within the pre init variables and the declarations
-                        if lb is not None:
-                            dec = [elements for elements in declaration_stmts 
-                                if walk(walk(elements,F23.Entity_Decl),F23.Name) and walk(walk(elements,F23.Entity_Decl),F23.Name)[0].string == lb ]
-                            if not dec and lb in self.pre_init: # This means that the variables is present in the pre init variables
-                                continue 
-                            elif dec and lb not in self.pre_init:
-                                # we verify the initalization of these shapes
-                                for elements in dec:
-                                    entity_decl_list = walk(elements,F23.Entity_Decl_List)[0]
-                                    for entity_dec in entity_decl_list.children:
-                                        _, _,_, initialization = entity_dec.children
-                                        if initialization is None:
-                                            dependees.append(lb)
 
-                        if ub is not None:
-                            dec = [elements for elements in declaration_stmts 
-                                if walk(walk(elements,F23.Entity_Decl),F23.Name) and walk(walk(elements,F23.Entity_Decl),F23.Name)[0].string == ub ]
-                            if not dec and ub in self.pre_init: # This means that the variables is present in the pre init variables
-                                continue 
-                            elif dec and ub not in self.pre_init:
-                                # we verify the initalization of these shapes
-                                for elements in dec:
-                                    entity_decl_list = walk(elements,F23.Entity_Decl_List)[0]
-                                    for entity_dec in entity_decl_list.children:
-                                        _, _,_, initialization = entity_dec.children
-                                        if initialization is None:
-                                            dependees.append(ub)
-                                
-                    if len(dependees) > 0:
-                        self.dependant_variables[entity_dec_name.string] = dependees
+                if self._contains_function(declarations):
+                    continue
+
+                declarations = self._preprocess_declarations(declarations)
+
+                for node in walk(declarations, (F23.Type_Declaration_Stmt, F23.Use_Stmt)):
+
+                    if isinstance(node, F23.Use_Stmt):
+                        ast_nodes.extend(self._handle_use_stmt(node))
+
+                    elif isinstance(node, F23.Type_Declaration_Stmt):
+                        ast_nodes.extend(self._handle_type_decl(node, cls_mode))
+
+            if fix_loc:
+                ast_nodes = [ast.fix_missing_locations(n) for n in ast_nodes]
+
+            return ast_nodes
+
         except Exception:
-            self.logger.exception(f'Exception in search dependant variable')
+            self.logger.exception("Error in convert_SPECIFICATION_PART")
+            raise
+
+    def _contains_function(self, declarations: List) -> bool:
+        """
+        Return ``True`` if any declaration block contains a nested
+        ``F23.Function_Subprogram``.
+
+        Used by :meth:`convert_SPECIFICATION_PART` to skip blocks that
+        define internal functions, which are not handled by this
+        declaration-conversion path.
+
+        Parameters
+        ----------
+        declarations : List
+            Fortran declaration block to inspect.
+
+        Returns
+        -------
+        bool
+            ``True`` if a nested function subprogram is present.
+        """
+        return any(walk(decl, F23.Function_Subprogram) for decl in declarations)
+    
+    def _preprocess_declarations(self, declarations: List) -> Any:
+        """
+        Normalise a declaration block before AST conversion, delegating to
+        :attr:`isolator`'s processor.
+
+        Two-element blocks are merged via ``combine_allocate_declaration``
+        (handling split ``ALLOCATABLE`` + dimension declarations); other
+        blocks have ``INTENT``/``SAVE`` attributes stripped via
+        ``remove_intent_and_save``. Used by
+        :meth:`convert_SPECIFICATION_PART` and
+        :meth:`search_dependant_variables`.
+
+        Parameters
+        ----------
+        declarations : List
+            Raw Fortran declaration block.
+
+        Returns
+        -------
+        Any
+            The preprocessed declaration node.
+        """
+        if len(declarations) == 2:
+            return self.isolator.processor.combine_allocate_declaration(declarations)
+        return self.isolator.processor.remove_intent_and_save(declarations)
+    
+    def _is_array_declaration(self, decl: Union[ast.AST, List]) -> bool:
+        """
+        Return ``True`` if *decl* declares an array (has a dimension
+        attribute or an explicit shape specification).
+
+        Used by :meth:`_handle_type_decl` and
+        :meth:`search_dependant_variables`.
+
+        Parameters
+        ----------
+        decl : Union[ast.AST, List]
+            A declaration statement or list of statements.
+
+        Returns
+        -------
+        bool
+            ``True`` if a dimension/shape specifier is present.
+        """
+        return (
+            any(walk(decl, F23.Dimension_Attr_Spec)) or
+            any(walk(decl, F23.Explicit_Shape_Spec))
+        )
+    
+    def _handle_use_stmt(self, node: Any) -> List:
+        """
+        Convert a Fortran ``USE`` statement into one or more
+        ``ast.ImportFrom`` nodes.
+
+        Selective imports (``USE mod, ONLY: a, b``) are resolved via
+        :meth:`_extract_use_names`; unrestricted ``USE`` statements are
+        converted to a wildcard import. Used by
+        :meth:`convert_SPECIFICATION_PART`.
+
+        Parameters
+        ----------
+        node : Any
+            Fortran ``F23.Use_Stmt`` node.
+
+        Returns
+        -------
+        List
+            Zero or one ``ast.ImportFrom`` node, depending on whether
+            :meth:`_extract_use_names` yields any names.
+        """
+        _, _, module_name, _, only_stmt = node.children
+
+        if only_stmt:
+            names = self._extract_use_names(only_stmt)
+            if not names:
+                return []
+            return [ast.ImportFrom(module=module_name.string, names=names, level=0)]
+
+        return [ast.ImportFrom(module=module_name.string,
+                               names=[ast.alias(name='*')],
+                               level=0)]
+
+    def _extract_use_names(self, only_stmt: Any) -> List:
+        """
+        Extract import aliases from a Fortran ``USE ... ONLY:`` clause.
+
+        Names matching :attr:`extractor`'s ``allowed_external_subroutines``
+        are skipped (these are handled separately as logging calls rather
+        than real imports — see :meth:`F2NP._build_call_logging`). Used by
+        :meth:`_handle_use_stmt`.
+
+        Parameters
+        ----------
+        only_stmt : Any
+            Fortran ``ONLY:`` clause node.
+
+        Returns
+        -------
+        List
+            ``ast.alias`` nodes for each retained imported name, with
+            renames (``USE mod, ONLY: a => b``) preserved via the
+            ``asname`` field.
+        """
+        names = []
+
+        for el in only_stmt.children:
+            if isinstance(el, F23.Name):
+                if el.string in self.extractor.allowed_external_subroutines:
+                    continue
+                names.append(ast.alias(name=el.string))
+
+            elif isinstance(el, F23.Rename):
+                _, name, asname = el.children
+                if name.string in self.extractor.allowed_external_subroutines:
+                    continue
+                names.append(ast.alias(name=name.string, asname=asname.string))
+
+        return names
+
+    def _handle_type_decl(self, node: Any, cls_mode: bool) -> List:
+        """
+        Lower a Fortran type declaration statement into one or more Python
+        assignment nodes.
+
+        Dispatches per declared entity based on the declaration's
+        attributes: ``PARAMETER`` declarations go through
+        :meth:`_handle_parameter`; array declarations (per
+        :meth:`_is_array_declaration`) go through :meth:`_handle_dimension`;
+        everything else goes through :meth:`_handle_scalar`. Used by
+        :meth:`convert_SPECIFICATION_PART`.
+
+        Parameters
+        ----------
+        node : Any
+            Fortran ``F23.Type_Declaration_Stmt`` node.
+        cls_mode : bool
+            Whether targets should be ``self.<attr>`` or plain names.
+
+        Returns
+        -------
+        List
+            One assignment node per declared entity in *node*.
+        """
+        intrinsic_type_spec, _, entity_decl_list = node.children
+
+        dtype = self._get_dtype(intrinsic_type_spec)
+        attr_specs = [p.string for p in walk(node, F23.Attr_Spec)]
+        has_dimension = self._is_array_declaration(node)
+        has_kind = any(walk(node, F23.Kind_Selector))
+
+        ast_nodes = []
+
+        for entity in entity_decl_list.children:
+            target = self._make_target(entity, cls_mode)
+            _, _, _, init = entity.children
+            value = init.children[1] if init else None
+
+            if 'PARAMETER' in attr_specs:
+                ast_nodes.append(self._handle_parameter(target, value, dtype, has_kind, has_dimension, cls_mode))
+
+            elif has_dimension:
+                ast_nodes.append(self._handle_dimension(node, target, value, dtype, cls_mode))
+
+            else:
+                ast_nodes.append(self._handle_scalar(target, value, dtype, intrinsic_type_spec, has_kind, cls_mode))
+
+        return ast_nodes
+    
+    def _make_target(self, entity: Any, cls_mode: bool) -> ast.Attribute | ast.Name:
+        """
+        Build the assignment target for a single declared entity.
+
+        In class mode, uppercase Fortran names are lowercased for the
+        Python attribute name (matching the convention used elsewhere in
+        the pipeline). Used by :meth:`_handle_type_decl`.
+
+        Parameters
+        ----------
+        entity : Any
+            Fortran ``F23.Entity_Decl`` node.
+        cls_mode : bool
+            Whether to build ``self.<attr>`` or a plain ``ast.Name``.
+
+        Returns
+        -------
+        ast.Attribute or ast.Name
+            The store-context target node.
+        """
+        var_name = entity.children[0].string
+
+        if cls_mode:
+            return ast.Attribute(value=ast.Name(id="self", ctx=ast.Load()),
+                                 attr=var_name.lower() if var_name.isupper() else var_name,
+                                 ctx=ast.Store())
+
+        return ast.Name(id=var_name, ctx=ast.Store())
+
+    def _get_dtype(self, intrinsic: Any) -> Tuple[str, str]:
+        """
+        Map a Fortran intrinsic type to its ``(module, attribute)`` NumPy
+        dtype pair, defaulting to ``('np', 'float64')`` for unrecognised
+        types.
+
+        Used by :meth:`_handle_type_decl`.
+
+        Parameters
+        ----------
+        intrinsic : Any
+            Fortran intrinsic type specification node.
+
+        Returns
+        -------
+        Tuple[str, str]
+            ``(module, attribute)``, e.g. ``('np', 'int32')``.
+        """
+        kind_map = {
+            'REAL': ('np', 'float64'),
+            'INTEGER': ('np', 'int32'),
+            'LOGICAL': ('np', 'bool')
+        }
+        return kind_map.get(intrinsic.children[0], ('np', 'float64'))
+
+    def _dtype_call(self, dtype: Tuple[str, str], value: ast.AST) -> ast.Call:
+        """
+        Wrap *value* in a NumPy dtype constructor call, e.g.
+        ``np.float64(value)``.
+
+        Used by :meth:`_handle_parameter` and :meth:`_handle_scalar`.
+
+        Parameters
+        ----------
+        dtype : Tuple[str, str]
+            ``(module, attribute)`` dtype pair from :meth:`_get_dtype`.
+        value : ast.AST
+            The value expression to cast.
+
+        Returns
+        -------
+        ast.Call
+            The constructor call.
+        """
+        return ast.Call(
+            func=self._dtype_attr(dtype=dtype),
+            args=[value],
+            keywords=[]
+        )
+
+    def _assign(self, target: ast.AST, value: ast.AST) -> ast.Assign:
+        """
+        Build a single-target ``ast.Assign`` node.
+
+        Parameters
+        ----------
+        target : ast.AST
+            The assignment target.
+        value : ast.AST
+            The value expression.
+
+        Returns
+        -------
+        ast.Assign
+            ``target = value``.
+        """
+        return ast.Assign(targets=[target], value=value)
+
+    def _maybe_attach(self, node: ast.AST, cls_mode: bool) -> ast.AST:
+        """
+        Conditionally qualify *node* with instance context via
+        :func:`attach_instance`.
+
+        No-op when *cls_mode* is ``False``. Used throughout
+        :meth:`_handle_parameter`, :meth:`_handle_scalar`, and
+        :meth:`_extract_shape` to ensure bare-name references inside
+        initial-value expressions resolve correctly once embedded in a
+        class.
+
+        Parameters
+        ----------
+        node : ast.AST
+            Expression to possibly qualify.
+        cls_mode : bool
+            Whether class-context qualification should be applied.
+
+        Returns
+        -------
+        ast.AST
+            *node*, possibly wrapped via :func:`attach_instance`.
+        """
+        return attach_instance(node) if cls_mode else node
+    
+    def _handle_parameter(
+        self,
+        target: ast.AST,
+        value: ast.AST,
+        dtype: Tuple[str, str],
+        has_kind: bool,
+        has_dimension: bool,
+        cls_mode: bool,
+    ) -> ast.Assign:
+        """
+        Convert a Fortran ``PARAMETER`` declaration into an initialising
+        assignment.
+
+        Handles four shapes: no initial value (defaults to dtype-cast
+        zero); an array constructor (built via :meth:`_build_array`); a
+        bare name/attribute reference (assigned directly, untyped); and a
+        general expression (wrapped in ``np.zeros``-style array
+        construction if *has_dimension*, otherwise dtype-cast). Used by
+        :meth:`_handle_type_decl`.
+
+        Parameters
+        ----------
+        target : ast.AST
+            The assignment target.
+        value : ast.AST
+            The initial-value expression node, or ``None``.
+        dtype : Tuple[str, str]
+            Dtype pair from :meth:`_get_dtype`.
+        has_kind : bool
+            Whether the declaration specifies a kind (currently unused in
+            the body but kept for signature symmetry with
+            :meth:`_handle_scalar`).
+        has_dimension : bool
+            Whether the declaration is array-shaped.
+        cls_mode : bool
+            Whether to attach instance context to resolved expressions.
+
+        Returns
+        -------
+        ast.Assign
+            The constructed assignment.
+        """
+        if value is None:
+            return self._assign(target, self._dtype_call(dtype, ast.Constant(0)))
+
+        if walk(value, F23.Array_Constructor):
+            elements = self._extract_array_elements(value)
+            return self._assign(target, self._build_array(elements, dtype, raw_list=True))
+
+        expr = self.f2np.handle_expr(value)
+        expr = self._maybe_attach(expr, cls_mode)
+
+        if isinstance(expr, ast.Name) or isinstance(expr, ast.Attribute):
+            return self._assign(target, expr)
+        
+        if has_dimension:
+            return self._assign(target, self._build_array(expr, dtype))
+
+        return self._assign(target, self._dtype_call(dtype, expr))
+
+    def _handle_dimension(
+        self,
+        node: ast.AST,
+        target: ast.AST,
+        value: ast.AST,
+        dtype: Tuple[str, str],
+        cls_mode: bool,
+    ) -> ast.Assign:
+        """
+        Convert a Fortran array declaration (with explicit dimensions)
+        into an initialising assignment.
+
+        An explicit array constructor takes priority (built via
+        :meth:`_build_array`); otherwise a ``np.zeros((...), dtype=...)``
+        call is built with the shape resolved via :meth:`_extract_shape`.
+        Used by :meth:`_handle_type_decl`.
+
+        Parameters
+        ----------
+        node : ast.AST
+            The Fortran declaration node, used to extract shape
+            specifications.
+        target : ast.AST
+            The assignment target.
+        value : ast.AST
+            The initial-value expression node, or ``None``.
+        dtype : Tuple[str, str]
+            Dtype pair from :meth:`_get_dtype`.
+        cls_mode : bool
+            Whether to attach instance context to shape expressions.
+
+        Returns
+        -------
+        ast.Assign
+            The constructed assignment.
+        """
+        if value and walk(value, F23.Array_Constructor):
+            elements = self._extract_array_elements(value)
+            return self._assign(target, self._build_array(elements, dtype, raw_list=True))
+
+        shape = self._extract_shape(node, cls_mode)
+
+        return self._assign(
+            target,
+            ast.Call(
+                func=ast.Attribute(value=ast.Name(id='np', ctx=ast.Load()), attr='zeros', ctx=ast.Load()),
+                args=[ast.Tuple(elts=shape, ctx=ast.Load())],
+                keywords=[ast.keyword(arg='dtype', value=self._dtype_attr(dtype))]
+            )
+        )
+
+    def _handle_scalar(
+        self,
+        target: ast.AST,
+        value: ast.AST,
+        dtype: Tuple[str, str],
+        intrinsic: Any,
+        has_kind: bool,
+        cls_mode: bool,
+    ) -> ast.Assign:
+        """
+        Convert a non-parameter, non-array Fortran scalar declaration into
+        an initialising assignment.
+
+        ``LOGICAL`` declarations without a kind are special-cased into
+        ``np.bool(True/False)``; declarations with no initial value
+        default to a dtype-cast zero; bare name/attribute initial values
+        are assigned directly (untyped); other expressions are dtype-cast.
+        Used by :meth:`_handle_type_decl`.
+
+        Parameters
+        ----------
+        target : ast.AST
+            The assignment target.
+        value : ast.AST
+            The initial-value expression node, or ``None``.
+        dtype : Tuple[str, str]
+            Dtype pair from :meth:`_get_dtype`.
+        intrinsic : Any
+            Fortran intrinsic type node, inspected for the ``LOGICAL``
+            special case.
+        has_kind : bool
+            Whether a kind is specified (suppresses the ``LOGICAL``
+            special case if ``True``).
+        cls_mode : bool
+            Whether to attach instance context to resolved expressions.
+
+        Returns
+        -------
+        ast.Assign
+            The constructed assignment.
+        """
+        if intrinsic.children[0] == 'LOGICAL' and not has_kind:
+            val = False
+            if value and value.string.upper() == '.TRUE.':
+                val = True
+            return self._assign(target, self._dtype_call(dtype, ast.Constant(val)))
+
+        if value is None:
+            return self._assign(target, self._dtype_call(dtype, ast.Constant(0)))
+
+        expr = self.f2np.handle_expr(value)
+        expr = self._maybe_attach(expr, cls_mode)
+
+        if isinstance(expr, ast.Name) or isinstance(expr, ast.Attribute):
+            return self._assign(target, expr)
+
+        return self._assign(target, self._dtype_call(dtype, expr))
+
+    def _build_array(self, elements: List, dtype: Tuple[str, str], raw_list: bool = False) -> ast.Call:
+        """
+        Build a ``np.array(elements, dtype=...)`` call.
+
+        Used by :meth:`_handle_parameter` and :meth:`_handle_dimension`.
+
+        Parameters
+        ----------
+        elements : List
+            Element expressions, or a single expression when *raw_list* is
+            ``False``.
+        dtype : Tuple[str, str]
+            Dtype pair from :meth:`_get_dtype`.
+        raw_list : bool, optional
+            If ``True``, *elements* is wrapped in an ``ast.List`` before
+            being passed as the array constructor's argument; if ``False``,
+            *elements* is passed through directly (already an expression).
+
+        Returns
+        -------
+        ast.Call
+            The ``np.array(...)`` call.
+        """
+        if raw_list:
+            elements = ast.List(elts=elements, ctx=ast.Load())
+
+        return ast.Call(
+            func=ast.Attribute(value=ast.Name(id='np', ctx=ast.Load()), attr='array', ctx=ast.Load()),
+            args=[elements],
+            keywords=[ast.keyword(arg='dtype', value=self._dtype_attr(dtype))]
+        )
+
+    def _dtype_attr(self, dtype: Tuple[str, str]) -> ast.Attribute:
+        """
+        Build the AST node for a NumPy dtype reference, e.g. ``np.float64``.
+
+        Used throughout this class and :class:`F2NP` wherever a ``dtype=``
+        keyword value is needed.
+
+        Parameters
+        ----------
+        dtype : Tuple[str, str]
+            ``(module, attribute)`` pair.
+
+        Returns
+        -------
+        ast.Attribute
+            The dtype reference expression.
+        """
+        mod, attr = dtype
+        return ast.Attribute(value=ast.Name(id=mod, ctx=ast.Load()), attr=attr, ctx=ast.Load())
+
+    def _extract_array_elements(self, value: Any) -> List:
+        """
+        Extract element expressions from a Fortran array constructor via
+        :attr:`f2np`'s expression handler.
+
+        Used by :meth:`_handle_parameter` and :meth:`_handle_dimension`.
+
+        Parameters
+        ----------
+        value : Any
+            Fortran node containing an ``F23.Array_Constructor``.
+
+        Returns
+        -------
+        List
+            Converted element expressions.
+        """
+        elements = []
+        array_list = walk(walk(value, F23.Array_Constructor), F23.Ac_Value_List)[0]
+        for val in array_list.children:
+            elements.append(self.f2np.handle_expr(val))
+        return elements
+
+    def _extract_shape(self, node: Any, cls_mode: bool) -> List:
+        """
+        Compute per-dimension size expressions from an array declaration's
+        explicit shape specification.
+
+        Mirrors :meth:`F2NP._extract_shapes` but additionally applies
+        :meth:`_maybe_attach` to each bound for class-context resolution.
+        Used by :meth:`_handle_dimension`.
+
+        Parameters
+        ----------
+        node : Any
+            Fortran node containing explicit shape specifications.
+        cls_mode : bool
+            Whether to attach instance context to bound expressions.
+
+        Returns
+        -------
+        List
+            One size expression per dimension.
+
+        Raises
+        ------
+        ValueError
+            If a dimension has neither a lower nor an upper bound.
+        """
+        shape = []
+
+        for dim in walk(node, F23.Explicit_Shape_Spec):
+            lb, ub = dim.children
+
+            if lb and ub:
+                l = self._maybe_attach(self.f2np.handle_expr(lb), cls_mode)
+                u = self._maybe_attach(self.f2np.handle_expr(ub), cls_mode)
+
+                shape.append(ast.BinOp(
+                    left=ast.BinOp(left=u, op=ast.Sub(), right=l),
+                    op=ast.Add(),
+                    right=ast.Constant(1)
+                ))
+
+            elif lb:
+                shape.append(self._maybe_attach(self.f2np.handle_expr(lb), cls_mode))
+
+            elif ub:
+                shape.append(self._maybe_attach(self.f2np.handle_expr(ub), cls_mode))
+
+            else:
+                raise ValueError("Invalid dimension spec")
+
+        return shape
+    
+    def _collect_target_names(self, target: ast.AST) -> None:
+        """
+        Recursively collect assignment target names into :attr:`pre_init`.
+
+        Handles plain names, ``self.attr`` attributes, and tuple/list
+        unpacking. Used by :meth:`pre_init_variables`.
+
+        Parameters
+        ----------
+        target : ast.AST
+            An assignment target (LHS) node.
+        """
+
+        if isinstance(target, ast.Name):
+            self.pre_init.add(target.id)
+
+        elif isinstance(target, ast.Attribute):
+            self.pre_init.add(target.attr)
+
+        elif isinstance(target, (ast.Tuple, ast.List)):
+            for elt in target.elts:
+                self._collect_target_names(elt)
+
+    def pre_init_variables(self, code_template: ast.Module) -> None:
+        """
+        Populate :attr:`pre_init` with every variable name already
+        assigned somewhere in *code_template*.
+
+        Walks all ``ast.Assign``/``ast.AnnAssign`` nodes, collecting
+        targets via :meth:`_collect_target_names`. Used by
+        :meth:`update_global_python` before declaration conversion, so that
+        :meth:`_resolve_dependencies` can distinguish variables that are
+        already initialised by the template itself from ones that still
+        need a dependency-ordered read/assignment.
+
+        Parameters
+        ----------
+        code_template : ast.Module
+            The template AST to scan.
+        """
+        self.pre_init = set()
+        try:
+            for node in ast.walk(code_template):
+                if isinstance(node, ast.Assign):
+                    for target in node.targets:
+                        self._collect_target_names(target)
+
+                elif isinstance(node, ast.AnnAssign):
+                    self._collect_target_names(node.target)
+
+            self.pre_init = list(self.pre_init)
+
+        except Exception:
+            self.logger.exception("Exception in pre_init_variables")
+            raise
+
+    def search_dependant_variables(self, declaration_stmts: List) -> None:
+        """
+        Populate :attr:`dependant_variables` by analysing array-dimension
+        bounds for references to other not-yet-initialised variables.
+
+        Builds a name → initialisation-status table via
+        :meth:`_build_symbol_table`, then for each array declaration
+        extracts its bound expressions (:meth:`_extract_bounds`) and
+        resolves which referenced names are themselves uninitialised
+        dependencies (:meth:`_resolve_dependencies`). Used by
+        :meth:`update_global_python` to drive
+        :meth:`init_dependant_variables`'s insertion ordering.
+
+        Parameters
+        ----------
+        declaration_stmts : List
+            Declaration blocks to analyse.
+        """
+        self.dependant_variables = {}
+        try:
+            symbol_table = self._build_symbol_table(declaration_stmts)
+
+            for decl in declaration_stmts:
+                decl = self._preprocess_declarations(decl)
+
+                if not self._is_array_declaration(decl):
+                    continue
+                
+                var_name = self._get_decl_name(decl)
+                bounds = self._extract_bounds(decl)
+
+                deps = self._resolve_dependencies(bounds, symbol_table)
+
+                if deps:
+                    self.dependant_variables[var_name] = deps
+
+        except Exception:
+            self.logger.exception("Exception in search_dependant_variables")
             raise
     
-    def _find_init_pattern(self, function: ast.FunctionDef, class_name: str, method_name: str) -> int | None:
+    def _build_symbol_table(self, declaration_stmts: List) -> Dict:
         """
-        Identifies the position after a method call on a class instance within a function.
+        Build a ``name -> {'initialized': bool}`` table from declared
+        entities.
 
-        This helper function is responsible for identifying the class instance and locating 
-        the method call on that instance. It is used to retrieve variables or elements 
-        necessary for subsequent operations. By identifying the location of such method 
-        calls, we can determine where to insert or place elements in the function body.
+        Used by :meth:`search_dependant_variables`.
+
+        Parameters
+        ----------
+        declaration_stmts : List
+            Declaration blocks to scan.
+
+        Returns
+        -------
+        Dict
+            Per-variable initialisation status.
+        """
+        table = {}
+
+        for decl in declaration_stmts:
+            decl = self._preprocess_declarations(decl)
+
+            for entity in walk(decl, F23.Entity_Decl):
+                name = entity.children[0].string
+                _, _, _, init = entity.children
+
+                table[name] = {
+                    "initialized": init is not None
+                }
+
+        return table
+    
+    def _get_decl_name(self, decl: Any) -> Any:
+        """
+        Extract the declared entity's name from a declaration node.
+
+        Used by :meth:`search_dependant_variables`.
+
+        Parameters
+        ----------
+        decl : Any
+            A declaration node.
+
+        Returns
+        -------
+        Any
+            The declared name (string).
+        """
+        entity = walk(decl, F23.Entity_Decl)[0]
+        return entity.children[0].string
+    
+    def _extract_bounds(self, decl: Any) -> List:
+        """
+        Collect lower/upper bound expressions from a declaration's
+        explicit shape specifications.
+
+        Used by :meth:`search_dependant_variables`.
+
+        Parameters
+        ----------
+        decl : Any
+            A declaration node.
+
+        Returns
+        -------
+        List
+            Bound expression nodes.
+        """
+        bounds = []
+
+        for dim in walk(decl, F23.Explicit_Shape_Spec):
+            lb, ub = dim.children
+
+            if lb:
+                bounds.append(lb)
+            if ub:
+                bounds.append(ub)
+
+        return bounds
+    
+    def _resolve_dependencies(self, bounds: List, symbol_table: Dict) -> List:
+        """
+        Identify which names referenced in *bounds* are dependencies
+        requiring prior initialisation.
+
+        A name qualifies as a dependency when it is not already in
+        :attr:`pre_init` and the symbol table shows it as declared but not
+        yet initialised. Used by :meth:`search_dependant_variables`.
+
+        Parameters
+        ----------
+        bounds : List
+            Bound expressions, potentially containing variable references.
+        symbol_table : Dict
+            Table from :meth:`_build_symbol_table`.
+
+        Returns
+        -------
+        List
+            Names of uninitialised dependencies.
+        """
+        deps = set()
+
+        for b in bounds:
+            names = walk(b, F23.Name)
+
+            for name_node in names:
+                name = name_node.string
+
+                if name in self.pre_init:
+                    continue
+
+                info = symbol_table.get(name)
+
+                if info and not info["initialized"]:
+                    deps.add(name)
+
+        return list(deps)
+    
+    def _is_class_instantiation(self, stmt: ast.AST, class_name: str) -> bool:
+        """
+        Determine whether a statement instantiates a specific class.
+
+        A statement is considered a class instantiation when it matches the
+        pattern ``var = ClassName(...)`` where the called object is an
+        :class:`ast.Name` whose identifier equals *class_name*.
+
+        Parameters
+        ----------
+        stmt : ast.AST
+            Statement node to inspect.
+        class_name : str
+            Name of the class expected to be instantiated.
+
+        Returns
+        -------
+        bool
+            ``True`` if *stmt* is an :class:`ast.Assign` whose value is a
+            call to *class_name*; otherwise ``False``.
+
+        Notes
+        -----
+        Only direct instantiations of the form ``ClassName(...)`` are
+        recognized. Calls through attributes such as
+        ``module.ClassName(...)`` are ignored.
+        """
+        return (
+            isinstance(stmt, ast.Assign)
+            and isinstance(stmt.value, ast.Call)
+            and isinstance(stmt.value.func, ast.Name)
+            and stmt.value.func.id == class_name
+        )
+    
+    def _is_method_call(
+        self,
+        stmt: ast.AST,
+        var_name: str,
+        method_name: str
+    ) -> bool:
+        """
+        Determine whether a statement is a method call on a target variable.
+
+        Supported call patterns include:
+
+        - ``var.method(...)``
+        - ``self.var.method(...)``
+
+        Parameters
+        ----------
+        stmt : ast.AST
+            Statement node to inspect.
+        var_name : str
+            Name of the variable expected to own the method.
+        method_name : str
+            Name of the method expected to be called.
+
+        Returns
+        -------
+        bool
+            ``True`` if *stmt* matches a supported method-call pattern for
+            *var_name* and *method_name*; otherwise ``False``.
+
+        Notes
+        -----
+        The statement must be represented as an expression containing an
+        :class:`ast.Call` whose callable is an :class:`ast.Attribute`.
+        Nested ownership beyond ``self.var`` is not supported.
+        """
+        if not (
+            isinstance(stmt, ast.Expr)
+            and isinstance(stmt.value, ast.Call)
+            and isinstance(stmt.value.func, ast.Attribute)
+        ):
+            return False
+
+        func = stmt.value.func
+
+        # var.method()
+        if isinstance(func.value, ast.Name):
+            return func.value.id == var_name and func.attr == method_name
+
+        # self.var.method()
+        if isinstance(func.value, ast.Attribute):
+            return func.value.attr == var_name and func.attr == method_name
+
+        return False
+    
+    def _find_init_pattern(
+        self,
+        function: ast.FunctionDef,
+        class_name: str,
+        method_name: str
+    ) -> int | None:
+        """
+        Locate the insertion point following a class initialization pattern.
+
+        The function body is scanned for a consecutive pair of statements
+        matching:
+
+        1. An instantiation of *class_name*, as determined by
+        :meth:`_is_class_instantiation`.
+        2. A call to *method_name* on the created instance, as determined by
+        :meth:`_is_method_call`.
+
+        If the pattern is found, the index immediately following the method
+        call is returned. If any assignment statement appears after the
+        matched method call, the pattern is considered unsafe and
+        ``None`` is returned.
 
         Parameters
         ----------
         function : ast.FunctionDef
-            The AST (Abstract Syntax Tree) node representing the function in which 
-            the class instance and method call should be identified.
+            Function whose body is searched for the initialization pattern.
         class_name : str
-            The name of the class whose instance we are trying to identify.
+            Name of the class expected to be instantiated.
         method_name : str
-            The name of the method called on the class instance.
+            Name of the method expected to be invoked on the instance.
 
         Returns
         -------
         int or None
-            The index position after the method call where elements can be inserted. 
-            Returns `None` if no suitable position is found.
+            Index immediately after the matched method call, suitable for
+            inserting additional statements. Returns ``None`` if no valid
+            pattern is found or if subsequent assignments make insertion
+            unsafe.
         """
-        for i in range(len(function.body) - 1):
-            stmt1 = function.body[i]
-            stmt2 = function.body[i + 1]
+        body = function.body
 
-            # Look for assignment like: var = ClassName() or self.var = ClassName()
-            if (
-                isinstance(stmt1, ast.Assign)
-                and isinstance(stmt1.value, ast.Call)
-                and isinstance(stmt1.value.func, ast.Name)
-                and stmt1.value.func.id == class_name
-                and len(stmt1.targets) == 1
-                and isinstance(stmt1.targets[0], (ast.Name, ast.Attribute))
-            ):  
-                # THis is to handle both self and non self aspects
-                target = stmt1.targets[0]
-                if isinstance(target, ast.Name):
-                    var_name = target.id
-                elif isinstance(target, ast.Attribute):
-                    if isinstance(target.value, ast.Name) and target.value.id == "self":
-                        var_name = target.attr
-                    else:
-                        continue
-                
-                # Look for method call: var.method_name() or self.var.method_name inside class 
-                if (isinstance(stmt2, ast.Expr) and isinstance(stmt2.value, ast.Call) and isinstance(stmt2.value.func, ast.Attribute)):
-                    if isinstance(stmt2.value.func.value, ast.Name): # Here we have an instance of a.method() 
-                        if stmt2.value.func.value.id == var_name and stmt2.value.func.attr == method_name:
-                            
-                            # Check if any of the following statements is an assignment
-                            for stmt in function.body[i + 2:]:
-                                if isinstance(stmt, ast.Assign):
-                                    return None  # Found an assignment later, reject it since the follwoing elements could be variables that might depend on this until 
-                                    # we stumble upon another class instance and method call 
-                            return i + 2  # Plus two since we are removing -1 from range 
-                    elif isinstance(stmt2.value.func.value, ast.Attribute): # Here we have an instance of self.a.method()
-                        
-                        if stmt2.value.func.value.attr == var_name and stmt2.value.func.attr == method_name:
-                            for stmt in function.body[i + 2:]:
-                                if isinstance(stmt, ast.Assign):
-                                    return None 
-                            return i + 2 
-                            
+        for i in range(len(body) - 1):
+            stmt1, stmt2 = body[i], body[i + 1]
+
+            if not self._is_class_instantiation(stmt1, class_name):
+                continue
+
+            var_name = self._get_assigned_name(stmt1, require_self=True)
+
+            if not var_name:
+                continue
+
+            if not self._is_method_call(stmt2, var_name, method_name):
+                continue
+
+            # Check for unsafe assignments after
+            if any(isinstance(stmt, ast.Assign) for stmt in body[i + 2:]):
+                return None
+
+            return i + 2
+
         return None
-
-    def _check_position_within_function(self,function: ast.FunctionDef,class_name:str, method_name:str):
+    
+    def _check_position_within_function(
+        self,
+        function: ast.FunctionDef,
+        class_name: str,
+        method_name: str
+    ) -> Tuple[int, int | None]:
         """
-        Determines the appropriate insertion position within a function body.
+        Determine the most appropriate insertion position within a function body.
 
-        This method analyzes the function body to find the appropriate position to insert new code. 
-        It first attempts to find a pattern where a class instance is created and a specific method is called. 
-        If not found, it falls back to placing the insertion after the last assignment. It also ensures that 
-        the insertion does not occur after a return statement.
+        The insertion position is first resolved by searching for a recognized
+        initialization pattern via :meth:`_find_init_pattern`. If no suitable
+        pattern is found, the insertion point falls back to the position
+        immediately following the last assignment statement in the function.
+
+        If the function contains one or more return statements, the final
+        insertion position is adjusted to ensure insertion occurs before the
+        last return statement.
 
         Parameters
         ----------
         function : ast.FunctionDef
-            The AST node representing the function to analyze.
+            Function whose body is analyzed.
         class_name : str
-            The name of the class whose instance should be detected in the function.
+            Name of the class whose instantiation should be detected.
         method_name : str
-            The name of the method to detect on the class instance.
+            Name of the method expected to be called on the instantiated
+            object.
 
         Returns
         -------
-        tuple of (int, int or None)
-            A tuple containing:
-            - `insert_pos` (int): The position in the function body where code should be inserted.
-            - `return_stmt_pos` (int or None): The position of the last return statement, if any.
-        """
+        Tuple[int, int | None]
+            Two-element tuple containing:
 
-        # This is to handle cases when we a class instance followed by a method call
-        insert_pos = self._find_init_pattern(function, class_name=class_name, method_name=method_name)
-        # If not found, default to after last assignment
+            - ``insert_pos``: Index at which new statements should be inserted.
+            - ``return_pos``: Index of the last :class:`ast.Return`
+            statement, or ``None`` if no return statement exists.
+
+        See Also
+        --------
+        :meth:`_find_init_pattern`
+            Resolves insertion positions based on initialization patterns.
+
+        Notes
+        -----
+        The returned insertion position is always guaranteed to be less than
+        or equal to the position of the last return statement, when one is
+        present.
+        """
+        body = function.body
+
+        # Try pattern-based insertion 
+        insert_pos = self._find_init_pattern(function, class_name, method_name)
+
+        # Fallback to place after last assignment
         if insert_pos is None:
-            assign_positions = [pos for pos, stmt in enumerate(function.body) if isinstance(stmt, ast.Assign)]
-            insert_pos = assign_positions[-1] + 1 if assign_positions else len(function.body)
+            assign_positions = [
+                i for i, stmt in enumerate(body)
+                if isinstance(stmt, ast.Assign)
+            ]
+            insert_pos = assign_positions[-1] + 1 if assign_positions else len(body)
 
-        # Check return statement position
-        return_positions = [i for i, stmt in enumerate(function.body) if isinstance(stmt, ast.Return)]
-        return_stmt_pos = return_positions[-1] if return_positions else None
+        # Check for return statements
+        return_positions = [
+            i for i, stmt in enumerate(body)
+            if isinstance(stmt, ast.Return)
+        ]
 
-        if return_stmt_pos is not None and insert_pos > return_stmt_pos:
-            insert_pos = return_stmt_pos  # Insert just before return
+        return_pos = return_positions[-1] if return_positions else None
 
-        return insert_pos, return_stmt_pos
+        if return_pos is not None:
+            insert_pos = min(insert_pos, return_pos)
 
-    def insert_at(self, idx:int, ast_node:ast.AST, python_template:ast.Module,method_name:str = None,**kwargs) -> None:
+        return insert_pos, return_pos
+
+    def insert_at(self, idx: int, ast_node: ast.AST, python_template: ast.AST, method_name: str = None, **kwargs) -> None:
         """
-        Inserts an AST node into a Python AST module at a specified location based on context.
+        Insert an AST node into a Python AST at a context-appropriate location.
 
-        This method performs context-aware insertion of AST nodes into the provided Python AST
-        (`ast.Module`). Depending on the type of node and the provided context, it determines 
-        the correct insertion point.
+        The insertion strategy is delegated to a handler selected by
+        :meth:`_get_insert_handler`. The chosen handler is responsible for
+        determining the exact insertion location and mutating the target AST.
 
-        Supported behavior:
-        - `Import` and `ImportFrom` nodes are inserted at the top of the module.
-        - `FunctionDef` nodes are inserted at the specified index, or after the last import/function.
-        - `Assign` nodes are inserted inside the specified method (`method_name`), defaulting to `__init__`
-        if none is provided. If no method is found, it falls back to the module level.
-        - (Planned/placeholder) `For` loops may be placed based on method name and reference node.
-        - If `idx` is not provided, insertion happens after the last relevant node of the same type.
+        Supported insertion targets include imports, functions, classes,
+        assignments, and expression statements.
 
         Parameters
         ----------
         idx : int
-            The index at which to insert the AST node within the relevant scope.
+            Desired insertion index within the target scope.
         ast_node : ast.AST
-            The AST node to be inserted. Supported types include `Import`, `ImportFrom`, 
-            `FunctionDef`, `Assign`, and `For`.
+            AST node to insert.
         python_template : ast.Module
-            The Python AST (module or subtree) where the node will be inserted.
+            Target module whose AST is modified in place.
         method_name : str, optional
-            The name of the method or function where the node should be inserted. 
-            Required for contextual placement of `Assign` or `For` nodes.
+            Name of the function or method used for context-sensitive
+            insertion. Required by some insertion handlers.
 
         Other Parameters
         ----------------
         **kwargs
-            Additional keyword arguments for context-aware insertion.
+            Additional arguments forwarded directly to the selected insertion
+            handler.
+
+        Raises
+        ------
+        TypeError
+            If *ast_node* is not supported by
+            :meth:`_get_insert_handler`.
+        Exception
+            Re-raises any exception raised by the selected insertion handler
+            after logging the failure.
+
+        See Also
+        --------
+        :meth:`_get_insert_handler`
+            Resolves the insertion handler for a given AST node type.
+        """
+        try:
+            class_exists = any(isinstance(n, ast.ClassDef) for n in python_template.body)
+
+            handler = self._get_insert_handler(ast_node, class_exists)
+            handler(idx, ast_node, python_template, method_name, **kwargs)
+
+        except Exception as e:
+            self.logger.exception("Exception in insert_at", e)
+            raise
+        except TypeError as e:
+            self.logger.error('If the node is not supported by teh _get_insert_handler method', e)
+            raise 
+
+    def _get_insert_handler(self, node: ast.AST, class_exists: bool) -> Callable:
+        """
+        Resolve the insertion handler for a given AST node.
+
+        The returned handler is responsible for inserting the supplied node
+        type into the target AST. Function definitions are dispatched
+        differently depending on whether a class definition already exists in
+        the target module.
+
+        Parameters
+        ----------
+        node : ast.AST
+            AST node for which an insertion handler should be selected.
+        class_exists : bool
+            Whether the target module already contains a
+            :class:`ast.ClassDef`.
 
         Returns
         -------
-        None
-            This method modifies the `python_template` in place and returns nothing.
+        callable
+            Bound method that performs insertion for the supplied node type.
+
+        Raises
+        ------
+        TypeError
+            If *node* is not one of the supported AST node types.
+
+        Notes
+        -----
+        Currently supported node types include:
+
+        - :class:`ast.Import`
+        - :class:`ast.ImportFrom`
+        - :class:`ast.FunctionDef`
+        - :class:`ast.ClassDef`
+        - :class:`ast.Assign`
+        - :class:`ast.Expr`
         """
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            return self._insert_import
 
-        try:
-            class_exists = any(isinstance(n, ast.ClassDef) for n in python_template.body) # any(ast_walk(python_template,ast.ClassDef))
-            if class_exists:
-                if isinstance(ast_node, (ast.Import, ast.ImportFrom)):
-                    
-                    import_stmts = [pos for pos, node in enumerate(python_template.body) if isinstance(node, (ast.Import, ast.ImportFrom))]
-                    if import_stmts:
-                        python_template.body.insert(import_stmts[-1] + 1,ast_node)
-                    else:
-                        python_template.body.insert(0,ast_node)
-                
-                # If the given ast_node is that of a function defintion
-                elif isinstance(ast_node,ast.FunctionDef):
-                    function_pos = [pos for pos, node in enumerate(python_template.body[0].body) if isinstance(node,ast.FunctionDef)]
-                    # function_pos[-1] + 1 since if we have __init__ method, we place rest of the function after the init method or any other method
-                    insert_pos = function_pos[-1] + 1 if function_pos else len(python_template.body[0].body)
-                    if idx and idx > insert_pos:
-                        python_template.body[0].body.insert(idx,ast_node)
-                    else:
-                        python_template.body[0].body.insert(insert_pos, ast_node)
-                        
-                elif isinstance(ast_node,ast.Assign): # If the given ast_node is that of a variable assignement statement
-                    functions_spec = ast_walk(python_template,ast.FunctionDef)
-                    if functions_spec:
-                        for functions in functions_spec:
-                            if method_name: 
-                                self.logger.info(f"Since argument method_name is: {method_name}, placing the assign statement inside of this method")
-                                if functions.name == method_name:
-                                    class_name = kwargs.get('class_name')
-                                    method = kwargs.get('method')
-                                    insert_pos,return_stmt_pos = self._check_position_within_function(functions,class_name=class_name,method_name=method)
-                                    
-                                    if idx and (return_stmt_pos is None or idx < return_stmt_pos) and idx > insert_pos:
-                                        functions.body.insert(idx,ast_node)
-                                    else:
-                                        self.logger.info(f'Since no index is given, WILL BE USING previous known ast Assign position with this method: {method_name}')
-                                        functions.body.insert(insert_pos, ast_node)
-                            else: # By default we will place it inside the __init__ method 
-                                if functions.name == "__init__":
-                                    class_name = kwargs.get('class_name')
-                                    method = kwargs.get('method')
-                                    
-                                    assign_statement = [pos for pos, assign in enumerate(functions.body) if isinstance(assign, ast.Assign)]
-                                    insert_pos = assign_statement[-1] + 1 if assign_statement else len(functions.body)
-                                    if idx:
-                                        functions.body.insert(idx,ast_node)
-                                    else:
-                                        self.logger.info(f'Since no index is given, WILL BE USING previous known ast Assign position')
-                                        functions.body.insert(insert_pos , ast_node)
-                    else:
-                        self.logger.info(f'Since no method name is given, the ASSIGN ast will be placed inside the parent body')
-                        python_template.body.append(ast_node)
-                                
-                elif isinstance(ast_node,ast.Expr):
-                    if method_name:
-                        if isinstance(python_template, ast.FunctionDef):
-                            target_func = python_template
-                        else:
-                            target_func = [func for func in ast_walk(python_template, ast.FunctionDef)if func.name == method_name][0] 
+        if isinstance(node, ast.FunctionDef):
+            return self._insert_function_in_class if class_exists else self._insert_function_module
 
-                        if target_func:
-                            class_name = kwargs.get('class_name')
-                            method = kwargs.get('method')
-                            insert_pos,return_stmt_pos = self._check_position_within_function(target_func,class_name=class_name,method_name=method)
-                            if idx and (return_stmt_pos is None or idx < return_stmt_pos) and idx > insert_pos:
-                                target_func.body.insert(idx,ast_node)
-                            else:
-                                target_func.body.insert(insert_pos, ast_node)
-                    else:
-                        python_template.body.append(ast_node) 
-                            
-            else:
-                if isinstance(ast_node, (ast.Import, ast.ImportFrom)):
-                    import_stmts = [pos for pos, node in enumerate(python_template.body) if isinstance(node, (ast.Import, ast.ImportFrom))]
-                    if import_stmts:
-                        python_template.body.insert(import_stmts[-1] + 1,ast_node)
-                    else:
-                        python_template.body.insert(0,ast_node)
-                
-                elif isinstance(ast_node, ast.ClassDef):
-                    import_positions = [ pos for pos, stmt in enumerate(ast.iter_child_nodes(python_template))
-                            if isinstance(stmt, (ast.Import, ast.ImportFrom))]
-                    if idx:
-                        if import_positions:
-                            last_import_pos = import_positions[-1] + 1
-                            
-                            if idx <= last_import_pos:
-                                self.logger.info( f'The given idx ({idx}) is before or within the import statements. ' 
-                                                f'Correcting and placing it after the last import at position {last_import_pos}.'
-                                )
-                                python_template.body.insert(last_import_pos, ast_node)
-                            else:
-                                python_template.body.insert(idx, ast_node)
-                    else:
-                        # Perhaps check for any other elemnts especially if the __name__ == '__main__' type elements is present which can be used as 
-                        # an anchor point to to place the class or another class or function can be used to place
-                    
-                        function_positions = [pos for pos, stmt in enumerate(ast.iter_child_nodes(python_template))
-                            if isinstance(stmt, ast.FunctionDef)]
-                        
-                        _name_format = [pos for pos, stmt in enumerate(ast.iter_child_nodes(python_template)) # This is for the __name__ format if 
-                            if isinstance(stmt, ast.If) and isinstance(stmt.test, ast.Compare)]
-                        
-                        if function_positions:
-                            last_func_pos = function_positions[-1]
-                            python_template.body.insert(last_func_pos, ast_node)
-                        
-                        elif not function_positions and _name_format:
-                            last_name_format_pos = _name_format[0]
-                            python_template.body.insert(last_name_format_pos,ast_node)
-                        elif not (function_positions and _name_format) and import_positions:
-                            last_import_pos = import_positions[-1]
-                            python_template.body.insert(last_import_pos,ast_node)
-                        
-                elif isinstance(ast_node, ast.FunctionDef):
-                    if idx:
-                        # Gather positions of all import statements
-                        import_positions = [ pos for pos, stmt in enumerate(ast.iter_child_nodes(python_template))
-                            if isinstance(stmt, (ast.Import, ast.ImportFrom))]
-                
-                        if import_positions:
-                            last_import_pos = import_positions[-1] + 1
-                            if idx <= last_import_pos:
-                                self.logger.info( f'The given idx ({idx}) is before or within the import statements. ' 
-                                                f'Correcting and placing it after the last import at position {last_import_pos}.'
-                                )
-                                python_template.body.insert(last_import_pos, ast_node)
-                            else:
-                                python_template.body.insert(idx, ast_node)
-                        else:
-                            # No import statements found, safe to insert at the given idx
-                            python_template.body.insert(idx, ast_node)
-                    else:
-                        # No idx provided; insert before the last function definition if present and after the imports
-                        function_positions = [pos for pos, stmt in enumerate(ast.iter_child_nodes(python_template))
-                            if isinstance(stmt, ast.FunctionDef)]
-                
-                        if function_positions:
-                            last_func_pos = function_positions[-1]
-                            python_template.body.insert(last_func_pos, ast_node)
-                        else:
-                            # No functions yet; append at the end
-                            python_template.body.append(ast_node)
-                            
-                elif isinstance(ast_node, ast.Assign):
-                    if method_name: # Inside a method/function
-                        # print([func for func in ast_walk(python_template,ast.FunctionDef) if func.name == method_name])
-                        if isinstance(python_template, ast.FunctionDef):
-                            target_func = python_template
-                        else:
-                            target_func = [ func for func in ast_walk(python_template, ast.FunctionDef)if func.name == method_name][0] 
-                        if target_func:
-                            class_name = kwargs.get('class_name')
-                            method = kwargs.get('method')
-                            insert_pos,return_stmt_pos = self._check_position_within_function(target_func,class_name=class_name,method_name=method)
-                            
-                            # Use idx only if it's between assign and return positions
-                            if idx and (return_stmt_pos is None or idx < return_stmt_pos) and idx > insert_pos:
-                                target_func.body.insert(idx, ast_node)
-                            else:
-                                self.logger.info(f'Inserting after last assign at position {insert_pos} inside the function : {method_name}')
-                                target_func.body.insert(insert_pos, ast_node)
-                    else:
-                        assign_positions = [i for i, stmt in enumerate(python_template.body) if isinstance(stmt, ast.Assign)]
-                        insert_pos = assign_positions[-1] + 1 if assign_positions else len(python_template.body)
+        if isinstance(node, ast.ClassDef):
+            return self._insert_class
 
-                        if idx:
-                            python_template.body.insert(idx, ast_node)
-                        else:
-                            self.logger.info(f'Inserting after last assign at position {insert_pos} inside the parent body')
-                            python_template.body.insert(insert_pos, ast_node)
+        if isinstance(node, ast.Assign):
+            return self._insert_assign
 
-                elif isinstance(ast_node, ast.Expr):
-                    if method_name: # Method inside which we need to place the call statement
-                        if isinstance(python_template,ast.FunctionDef):
-                            target_func = python_template
-                        else:
-                            target_func = [func for func in ast_walk(python_template,ast.FunctionDef) if func.name == method_name][0]
-                            
-                        if target_func:
-                            # First we will handle the special case where the call statement is of read_dummy to see if the any of the 
-                            # arguments sent to it isn't applied before.
-                            is_read_dummy = (
-                                isinstance(ast_node, ast.Expr) and isinstance(ast_node.value, ast.Call)
-                                and isinstance(ast_node.value.func, ast.Name)
-                                and ast_node.value.func.id == "read_dummy"
-                            )
-                            if is_read_dummy:
-                                # Retrieve the arguments that are sent to the read_dummy
-                                args = [args.id for args in ast_node.value.args]
-                                assign_statements = [stmt.targets[0].id for stmt in target_func.body if isinstance(stmt, ast.Assign) and isinstance(stmt.targets[0], ast.Name)]
-                                
-                                if any(set(args) | set(assign_statements)): # IF there are arguments before that needs to be intiialized
-                                    class_name = kwargs.get('class_name')
-                                    method = kwargs.get('method')
-                                    insert_pos,return_stmt_pos = self._check_position_within_function(target_func,class_name=class_name,method_name=method)
-                                        
-                                    if idx and (return_stmt_pos is None or idx < return_stmt_pos) and idx > insert_pos:    
-                                        target_func.body.insert(idx,ast_node)
-                                    else:
-                                        self.logger.info(f'SPECIAL CASE, READ dummy method needs to be placed after all the assign statement(variables), insert position: {insert_pos}')
-                                        target_func.body.insert(insert_pos, ast_node)
-                            else:
-                                class_name = kwargs.get('class_name')
-                                method = kwargs.get('method')
-                                insert_pos,return_stmt_pos = self._check_position_within_function(target_func,class_name=class_name,method_name=method)
-                                if idx and (return_stmt_pos is None or idx < return_stmt_pos) and idx > insert_pos:
-                                    target_func.body.insert(idx,ast_node)
-                                else:
-                                    target_func.body.insert(insert_pos, ast_node)
-                    else:
-                        python_template.body.append(ast_node)
-        except Exception:
-            self.logger.exception(f'Exception error in insert_at')
-            raise
+        if isinstance(node, ast.Expr):
+            return self._insert_expr
 
-    def _is_scalar_var(self, dec_statement) -> str | None:
+        raise TypeError(f"Unsupported node type: {type(node)}")
+    
+    def _insert_import(self, idx, node, module, *_) -> None:
         """
-        Determines if a declaration statement corresponds to a scalar or logical variable.
+        Insert an import statement into a module.
 
-        This helper method is used to distinguish scalar or logical variables from arrays.
-        A variable is considered scalar/logical if:
-        - It does **not** have an initialization aspect (i.e., no default value assigned), and
-        - It does **not** have a `DIMENSION` attribute (i.e., not declared as an array).
+        The import is inserted immediately after the last existing
+        :class:`ast.Import` or :class:`ast.ImportFrom` statement. If the
+        module contains no imports, the node is inserted at the beginning of
+        the module body.
+
+        Parameters
+        ----------
+        idx : int or None
+            Ignored for import insertion.
+        node : ast.AST
+            Import node to insert.
+        module : ast.Module
+            Module whose body is modified in place.
+        *_ : Any
+            Additional positional arguments accepted for interface
+            compatibility and ignored.
+        """
+        positions = self._find_positions(module.body, (ast.Import, ast.ImportFrom))
+        insert_pos = positions[-1] + 1 if positions else 0
+        module.body.insert(insert_pos, node)
+    
+    def _insert_class(self, idx, node, module, *_) -> None:
+        """
+        Insert a class definition into a module.
+
+        If *idx* is provided, insertion is attempted at that position.
+        However, class definitions are never inserted within the import
+        section; when necessary, the insertion point is shifted to the first
+        position after the final import statement.
+
+        When *idx* is not provided, the insertion position is determined
+        automatically using the following precedence:
+
+        1. Before the last function definition.
+        2. Before the ``if __name__ == "__main__"`` guard.
+        3. After the final import statement.
+        4. At the end of the module.
+
+        Parameters
+        ----------
+        idx : int or None
+            Desired insertion index.
+        node : ast.ClassDef
+            Class definition to insert.
+        module : ast.Module
+            Module whose body is modified in place.
+        *_ : Any
+            Additional positional arguments accepted for interface
+            compatibility and ignored.
+        """
+        import_positions = self._find_positions(module.body, (ast.Import, ast.ImportFrom))
+        function_positions = self._find_positions(module.body, ast.FunctionDef)
+        name_guard_positions = self._find_name_guard(module.body)
+
+        if idx is not None:
+            if import_positions:
+                last_import = import_positions[-1] + 1
+
+                if idx <= last_import:
+                    self.logger.info(
+                        f"idx {idx} inside imports -> shifting to {last_import}"
+                    )
+                    module.body.insert(last_import, node)
+                    return
+
+            module.body.insert(idx, node)
+            return
+
+        # No idx -> smart placement
+        if function_positions:
+            module.body.insert(function_positions[-1], node)
+
+        elif name_guard_positions:
+            module.body.insert(name_guard_positions[0], node)
+
+        elif import_positions:
+            module.body.insert(import_positions[-1] + 1, node)
+
+        else:
+            module.body.append(node)
+        
+    def _insert_function_in_class(self, idx, node, module, *_) -> None:
+        """
+        Insert a method into the first class definition in a module.
+
+        If *idx* is provided and falls within the class body, the method is
+        inserted at that position. Otherwise, the method is inserted
+        immediately after the last existing method in the class. If the class
+        contains no methods, the new method is appended to the class body.
+
+        Parameters
+        ----------
+        idx : int or None
+            Desired insertion index within the class body.
+        node : ast.FunctionDef
+            Method definition to insert.
+        module : ast.Module
+            Module containing the target class definition.
+        *_ : Any
+            Additional positional arguments accepted for interface
+            compatibility and ignored.
+
+        Raises
+        ------
+        ValueError
+            If no :class:`ast.ClassDef` exists in the target module.
+        """
+        class_node = next((n for n in module.body if isinstance(n, ast.ClassDef)), None)
+
+        if not class_node:
+            raise ValueError("No class found for method insertion")
+
+        function_positions = self._find_positions(class_node.body, ast.FunctionDef)
+
+        if idx is not None and idx <= len(class_node.body):
+            class_node.body.insert(idx, node)
+            return
+
+        # Default: after last method
+        if function_positions:
+            insert_pos = function_positions[-1] + 1
+        else:
+            insert_pos = len(class_node.body)
+
+        class_node.body.insert(insert_pos, node)
+    
+    def _insert_function_module(self, idx, node, module, *_) -> None:
+        """
+        Insert a function definition into a module.
+
+        If *idx* is provided, insertion is attempted at that position.
+        However, function definitions are never inserted within the import
+        section; when necessary, the insertion point is shifted to the first
+        position after the final import statement.
+
+        When *idx* is not provided, the function is inserted immediately
+        before the last existing function definition. If no functions are
+        present, it is appended to the module body.
+
+        Parameters
+        ----------
+        idx : int or None
+            Desired insertion index.
+        node : ast.FunctionDef
+            Function definition to insert.
+        module : ast.Module
+            Module whose body is modified in place.
+        *_ : Any
+            Additional positional arguments accepted for interface
+            compatibility and ignored.
+        """
+        import_positions = self._find_positions(module.body, (ast.Import, ast.ImportFrom))
+        function_positions = self._find_positions(module.body, ast.FunctionDef)
+
+        if idx is not None:
+            if import_positions:
+                last_import = import_positions[-1] + 1
+
+                if idx <= last_import:
+                    self.logger.info(
+                        f"idx {idx} inside imports -> shifting to {last_import}"
+                    )
+                    module.body.insert(last_import, node)
+                    return
+
+            module.body.insert(idx, node)
+            return
+
+        # Default placement
+        if function_positions:
+            module.body.insert(function_positions[-1], node)
+        else:
+            module.body.append(node)
+    
+    def _insert_assign(self, idx, node, module, method_name, **kwargs) -> None:
+        """
+        Insert an assignment statement into a function or module.
+
+        The target function is first resolved via
+        :meth:`_resolve_target_function`. If a matching function is found,
+        the insertion position is computed via
+        :meth:`_compute_safe_insert_position` and the assignment is inserted
+        within that function body.
+
+        If no target function can be resolved, the assignment is inserted at
+        module scope after the last existing assignment statement.
+
+        Parameters
+        ----------
+        idx : int or None
+            Desired insertion index within the target scope.
+        node : ast.Assign
+            Assignment statement to insert.
+        module : ast.Module
+            Module whose AST is modified in place.
+        method_name : str
+            Name of the target function or method.
+        **kwargs
+            Additional context forwarded to
+            :meth:`_compute_safe_insert_position`.
+        """
+        target_func = self._resolve_target_function(module, method_name)
+
+        if target_func:
+            insert_pos = self._compute_safe_insert_position(target_func, idx, **kwargs)
+            target_func.body.insert(insert_pos, node)
+        else:
+            insert_pos = self._last_position(module.body, ast.Assign)
+            module.body.insert(insert_pos, node)
+    
+    def _insert_expr(self, idx, node, module, method_name, **kwargs) -> None:
+        """
+        Insert an expression statement into a function or module.
+
+        The target function is first resolved via
+        :meth:`_resolve_target_function`. If no matching function is found,
+        the expression is appended at module scope.
+
+        Special handling is applied to calls of the form
+        ``read_dummy(...)``. Such expressions use
+        :meth:`_handle_read_dummy` to determine a safe insertion location.
+        All other expressions use
+        :meth:`_compute_safe_insert_position`.
+
+        Parameters
+        ----------
+        idx : int or None
+            Desired insertion index within the target scope.
+        node : ast.Expr
+            Expression statement to insert.
+        module : ast.Module
+            Module whose AST is modified in place.
+        method_name : str
+            Name of the target function or method.
+        **kwargs
+            Additional context forwarded to insertion-position helpers.
+        """
+        target_func = self._resolve_target_function(module, method_name)
+
+        if not target_func:
+            module.body.append(node)
+            return
+
+        if (isinstance(node, ast.Expr)
+            and isinstance(node.value, ast.Call)
+            and isinstance(node.value.func, ast.Name)
+            and node.value.func.id == "read_dummy"
+        ):
+            insert_pos = self._handle_read_dummy(target_func, idx, **kwargs)
+        else:
+            insert_pos = self._compute_safe_insert_position(target_func, idx, **kwargs)
+
+        target_func.body.insert(insert_pos, node)
+    
+    def _find_positions(self, body: List, node_type: ast.AST) -> List[int]:
+        """
+        Locate all occurrences of a given AST node type within a node list.
+
+        Parameters
+        ----------
+        body : list of ast.AST
+            Sequence of AST nodes to inspect.
+        node_type : type or tuple[type, ...]
+            AST node type or types to match.
+
+        Returns
+        -------
+        List[int]
+            Indices of all nodes whose type matches *node_type*.
+        """
+        return [i for i, stmt in enumerate(body) if isinstance(stmt, node_type)]
+    
+    def _find_name_guard(self, body: List[ast.AST]) -> List[int]:
+        """
+        Locate conditional guard statements within a module body.
+
+        This helper identifies :class:`ast.If` statements whose test
+        expression is represented by an :class:`ast.Compare`. It is
+        primarily intended to detect module-level guard blocks such as
+        ``if __name__ == "__main__":``.
+
+        Parameters
+        ----------
+        body : List[ast.AST]
+            Module body to inspect.
+
+        Returns
+        -------
+        List[int]
+            Indices of matching guard statements.
+        """
+        positions = []
+
+        for i, stmt in enumerate(body):
+            if (
+                isinstance(stmt, ast.If)
+                and isinstance(stmt.test, ast.Compare)
+            ):
+                positions.append(i)
+
+        return positions
+    
+    def _resolve_target_function(self, module: ast.AST, method_name: str) -> ast.FunctionDef | None:
+        """
+        Resolve the target function for AST insertion.
+
+        If *module* is itself a :class:`ast.FunctionDef`, it is returned
+        directly. Otherwise, the AST is searched for a function definition
+        whose name matches *method_name*.
+
+        Parameters
+        ----------
+        module : ast.AST
+            AST subtree to search.
+        method_name : str
+            Name of the function to locate.
+
+        Returns
+        -------
+        ast.FunctionDef or None
+            Matching function definition, or ``None`` if no matching
+            function is found.
+
+        Notes
+        -----
+        If multiple matching functions exist, only the first match returned
+        by :func:`ast.walk` is used.
+        """
+        if isinstance(module, ast.FunctionDef):
+            return module
+
+        matches = [f for f in ast.walk(module) if isinstance(f, ast.FunctionDef) and f.name == method_name]
+
+        return matches[0] if matches else None
+    
+    def _compute_safe_insert_position(self, func: ast.FunctionDef, idx: int, **kwargs) -> int:
+        """
+        Compute a valid insertion position within a function body.
+
+        The default insertion position is determined via
+        :meth:`_check_position_within_function`, which accounts for
+        recognized initialization patterns and return statements.
+
+        If *idx* is provided and falls within the valid insertion region,
+        it is used instead of the computed position.
+
+        Parameters
+        ----------
+        func : ast.FunctionDef
+            Function whose body will receive the new statement.
+        idx : int or None
+            Desired insertion index.
+        **kwargs
+            Additional context used for insertion analysis. Expected keys
+            include ``class_name`` and ``method``.
+
+        Returns
+        -------
+        int
+            Safe insertion index within *func*.
+        """
+        class_name = kwargs.get("class_name")
+        method = kwargs.get("method")
+
+        insert_pos, return_pos = self._check_position_within_function(func, class_name, method)
+
+        if idx is not None and (return_pos is None or idx < return_pos) and idx > insert_pos:
+            return idx
+
+        return insert_pos
+    
+    def _last_position(self, body: List, node_type: ast.AST) -> int:
+        """
+        Return the insertion position following the last matching node.
+
+        Parameters
+        ----------
+        body : list of ast.AST
+            Sequence of AST nodes to inspect.
+        node_type : type or tuple[type, ...]
+            AST node type or types to match.
+
+        Returns
+        -------
+        int
+            Index immediately after the last matching node. If no matching
+            node exists, returns ``len(body)``.
+        """
+        positions = self._find_positions(body, node_type)
+        return positions[-1] + 1 if positions else len(body)
+    
+    def _handle_read_dummy(self, func: ast.FunctionDef, idx: int, **kwargs) -> int:
+        """
+        Compute a safe insertion position for ``read_dummy`` calls.
+
+        The insertion location is determined using
+        :meth:`_check_position_within_function` and adjusted according to
+        the presence of existing assignment statements and function
+        boundary constraints.
+
+        Parameters
+        ----------
+        func : ast.FunctionDef
+            Function whose body will receive the expression.
+        idx : int or None
+            Desired insertion index.
+        **kwargs
+            Additional context used for insertion analysis. Expected keys
+            include ``class_name`` and ``method``.
+
+        Returns
+        -------
+        int
+            Safe insertion index for the ``read_dummy`` expression.
+        """
+        assign_names = {
+            stmt.targets[0].id
+            for stmt in func.body
+            if isinstance(stmt, ast.Assign) and isinstance(stmt.targets[0], ast.Name)
+        }
+
+        insert_pos, return_pos = self._check_position_within_function(func, kwargs.get("class_name"), kwargs.get("method"))
+
+        if assign_names and (idx is not None and (return_pos is None or idx < return_pos) and idx > insert_pos):
+            return idx 
+        
+        return insert_pos
+
+    def _is_scalar_var(self, dec_statement: Any) -> str | None:
+        """
+        Determine whether a declaration represents a scalar variable.
+
+        A declaration is considered scalar when it has no initialization,
+        dimension attribute, or explicit shape specification.
 
         Parameters
         ----------
         dec_statement : Any
-            A declaration statement (typically a parsed representation of a Fortran declaration).
-            Expected to support inspection for initialization and dimension attributes.
+            Declaration statement to inspect. The object is expected to be
+            compatible with :func:`walk` and the relevant Fortran parser
+            node types.
 
         Returns
         -------
         str or None
-            The variable name if it is identified as a scalar or logical, otherwise `None`.
+            Name of the declared variable if it is identified as a scalar
+            variable; otherwise ``None``.
+
+        Notes
+        -----
+        Declarations containing initialization expressions, dimension
+        attributes, or explicit shape specifications are excluded.
         """
         var = walk(dec_statement, F23.Entity_Decl)[0].string
         init_spec = any(walk(dec_statement, F23.Initialization))
         alloc_spec = any(walk(dec_statement, F23.Dimension_Attr_Spec))
-        if not init_spec and not alloc_spec:
+        explicit_shape = any(walk(dec_statement, F23.Explicit_Shape_Spec))
+
+        if not init_spec and not alloc_spec and not explicit_shape:
             return var
         return None
         
-    def separate_scalar(self,subroutine_key:str, dec_stmts:List=None) -> None:
+    def separate_scalar(self, subroutine_key: str, dec_stmts: List = None) -> None:
         """
-        Identifies and separates scalar or logical variables from declaration statements.
+        Populate :attr:`scalar` with scalar or logical variable names.
 
-        This method populates `self.scalar` with variable names identified as scalars or logicals.
-        It operates in three modes depending on the `dec_stmts` input and the value of `self.global_state`.
+        The source of declarations depends on the supplied arguments and the
+        current value of :attr:`global_state`:
 
-        Modes
-        -----
-        1. If `dec_stmts` is provided:
-            - Iterates over the provided declaration statements.
-            - Checks for variables with `INTENT(IN)` or `INTENT(INOUT)` attributes.
-            - Adds scalar or logical variable names to `self.scalar`.
+        1. If *dec_stmts* is provided, only the supplied declaration
+        statements are processed.
+        2. If *dec_stmts* is ``None`` and :attr:`global_state` is ``True``,
+        declarations are obtained from
+        ``self.extractor.dec_global[subroutine_key]``.
+        3. If *dec_stmts* is ``None`` and :attr:`global_state` is ``False``,
+        declarations are obtained from
+        ``self.extractor.var_dummy[subroutine_key]`` and filtered by
+        intent attributes.
 
-        2. If `dec_stmts` is not provided and `self.global_state` is True:
-            - Iterates over global declarations (`self.dec_global`).
-            - Identifies scalar or logical variables and adds their names to `self.scalar`.
-
-        3. If `dec_stmts` is not provided and `self.global_state` is False:
-            - Examines dummy arguments (`self.var_dummy`) for the current subroutine.
-            - Filters variables with `INTENT(IN)` or `INTENT(INOUT)`.
-            - Identifies scalar or logical variables and adds their names to `self.scalar`.
+        Variables identified as scalar or logical via
+        :meth:`_is_scalar_var` are added to :attr:`scalar`.
 
         Parameters
         ----------
-        dec_stmts : list of str or None, optional
-            A list of declaration statements (e.g., parsed Fortran declarations).
-            If provided, only these statements will be processed. If `None`, the method
-            uses internal structures (`self.dec_global` or `self.var_dummy`) based on 
-            the value of `self.global_state`.
+        subroutine_key : str
+            Identifier of the subroutine whose declarations should be
+            analyzed.
+        dec_stmts : List, optional
+            Declaration statements to process. If omitted, declarations are
+            obtained from internal extractor state.
 
-        Returns
-        -------
-        None
-            Modifies `self.scalar` in place with the names of identified scalar/logical variables.
+        Raises
+        ------
+        Exception
+            Re-raises any exception encountered during declaration analysis
+            after logging the error.
         """
         try:
             self.scalar = []
-            if dec_stmts is None:
-                if self.global_state:
-                    for var in self.variable_order:
-                        dec_statement = self.extractor.dec_global[subroutine_key][var]
-                        varname = self._is_scalar_var(dec_statement)
-                        if varname:
-                            self.scalar.append(var)
-                else: # This is used to separate scalar present in the var_dummy based on their INTENT(IN,INOUT)
-                    for dec_statement in self.extractor.var_dummy[subroutine_key]:
-                        if any(i.tostr() in ["IN", "INOUT","OUT"] for i in walk(dec_statement, F23.Intent_Spec)):
-                            varname = self._is_scalar_var(dec_statement)
-                            if varname:
-                                self.scalar.append(varname)
+
+            # Step 1: determine source of declaration statements
+            if dec_stmts is not None:
+                statements = dec_stmts
+
+            elif self.global_state:
+                statements = [
+                    self.extractor.dec_global[subroutine_key][var]
+                    for var in self.variable_order
+                ]
+
             else:
-                for dec_statement in dec_stmts:
-                    # Check if the statement has an Intent_Spec with IN or INOUT
-                    has_intent = any(i.tostr() in ["IN", "INOUT"] for i in walk(dec_statement, F23.Intent_Spec))
+                statements = self.extractor.var_dummy[subroutine_key]
 
-                    if has_intent:
-                        varname = self._is_scalar_var(dec_statement)
-                        if varname:
-                            self.scalar.append(varname)
-                    else:
-                        varname = self._is_scalar_var(dec_statement)
-                        if varname:
-                            self.scalar.append(varname)
+            # Step 2: process statements
+            for dec_statement in statements:
+                # filter by intent only for dummy args
+                if dec_stmts is None and not self.global_state:
+                    has_valid_intent = any(
+                        i.tostr() in ["IN", "INOUT", "OUT"]
+                        for i in walk(dec_statement, F23.Intent_Spec)
+                    )
+                    if not has_valid_intent:
+                        continue
+
+                varname = self._is_scalar_var(dec_statement)
+                if varname:
+                    self.scalar.append(varname)
+
         except Exception as e:
-            self.logger.exception(f'Exception in separate_scalar',e)
-            raise 
+            self.logger.exception("Exception in separate_scalar", e)
+            raise
     
-    def read_file_ast(self,assign_nodes:List) -> List:
+    def read_file_ast(self, assign_nodes: List[ast.Assign]) -> List[ast.Assign]:
         """
-        Generates code lines to read variables from a Fortran binary file.
+        Generate AST assignments for reading variables from a binary file.
 
-        This method constructs individual lines of code required to read each variable 
-        from a binary file, based on provided assignment AST nodes. The resulting lines 
-        typically resemble: `ffile.read_ints(np.int32)[0]`, depending on the data type.
+        Each assignment node is converted into an equivalent file-read
+        operation. Scalar variables are handled via
+        :meth:`_build_scalar_read`, while array variables are handled via
+        :meth:`_build_array_read`.
 
         Parameters
         ----------
-        assign_nodes : list of ast.Assign
-            A list of AST assignment nodes representing the variables to be read 
-            from the binary file.
+        assign_nodes : List[ast.Assign]
+            Assignment nodes describing variables that should be read from
+            the binary file.
 
         Returns
         -------
-        var_list : list of str
-            A list of code lines (as strings) that perform reading operations 
-            for each variable from the binary file.
+        List[ast.Assign]
+            AST assignment nodes that perform the corresponding file-read
+            operations.
         """
-        var = None
-        var_name = None
-        target = None
         var_list = []
-        
-        for assign_node in assign_nodes:
-            if isinstance(assign_node,ast.Assign) and isinstance(assign_node.targets[0], ast.Name):
-                var_name = assign_node.targets[0].id
-                target = ast.Name(id=var_name,ctx = ast.Store())
-            elif isinstance(assign_node,ast.Assign) and isinstance(assign_node.targets[0], ast.Attribute):
-                var_name = assign_node.targets[0].attr
-                target = ast.Attribute(
-                    value = ast.Name(id='self',ctx=ast.Load()),
-                    attr = var_name,
-                    ctx = ast.Store()
-                )
-            
-            if len(assign_node.value.keywords) == 0: # This means they are just intergers,reals or logical values mostly scalars 
-                attr_type = assign_node.value.func.attr
-                read_type = 'read_reals' if attr_type == "float64" else 'read_ints'
-                if attr_type == "bool":
-                    # Logical values representation: .TRUE. is mostly respresent with -1 because all bits are set to 1
-                    # .FALSE. is represented by 0
-                    # https://stackoverflow.com/a/39454385
-                    subscript_format = ast.Call(
-                                        func=ast.Attribute(
-                                            value = ast.Name(id='np',ctx=ast.Load()),
-                                            attr="bool",
-                                            ctx = ast.Load()
-                                            ),
-                                        args=[
-                                            ast.Subscript(
-                                                    value = ast.Call(
-                                                        func = ast.Attribute(
-                                                            value= ast.Name(id = 'ffile',ctx=ast.Load()),
-                                                            attr='read_ints',
-                                                            ctx = ast.Load()),
-                                                        args = [
-                                                            ast.Attribute(
-                                                                value = ast.Name(id = 'np',ctx=ast.Load()),
-                                                                attr = "int32",
-                                                                ctx=ast.Load()) ],
-                                                        keywords = []),
-                                                    slice = ast.Constant(value=0),
-                                                    ctx=ast.Load()
-                                                )
-                                            ],
-                                        keywords=[])
-                    
-                else:
-                    subscript_format = ast.Subscript(
-                                        value = ast.Call(
-                                            func = ast.Attribute(
-                                                value= ast.Name(id = 'ffile',ctx=ast.Load()),
-                                                attr=read_type,
-                                                ctx = ast.Load()),
-                                            args = [
-                                                ast.Attribute(
-                                                    value = ast.Name(id = 'np',ctx=ast.Load()),
-                                                    attr = attr_type,
-                                                    ctx=ast.Load()) ],
-                                            keywords = []),
-                                        slice = ast.Constant(value=0),
-                                        ctx=ast.Load()
-                                            
-                                    )
-                
-                var = ast.Assign(
-                    targets = [target],
-                    value =  subscript_format
-                )
-                    
-            else: # This means that they all are arrays
-                attr_type = assign_node.value.keywords[0].value.attr
-                read_type = 'read_reals' if attr_type == "float64" else 'read_ints'
-                # print(arr_shape)
-                call_stmt = ast.Call(
-                        func= ast.Attribute(
-                            value= ast.Call(
-                                func=ast.Attribute(
-                                    value=ast.Name(id='ffile', ctx=ast.Load()),
-                                    attr=read_type,
-                                    ctx=ast.Load()),
-                                args=[
-                                    ast.Attribute(
-                                        value=ast.Name(id='np', ctx=ast.Load()),
-                                        attr=attr_type,
-                                        ctx=ast.Load())],
-                                keywords=[]),
-                            attr='reshape',
-                            ctx=ast.Load()),
-                        args=[assign_node.value.args[0]],
-                        keywords=[ ast.keyword( arg='order', value=ast.Constant(value='F'))])
-                    
-                var = ast.Assign(
-                    targets=[
-                    ast.Subscript(
-                        value=target,
-                        slice=ast.Slice(),
-                        ctx=ast.Store())],
-                    value = call_stmt 
-                )
-            var_list.append(var)
-            
+
+        for node in assign_nodes:
+            if not isinstance(node, ast.Assign):
+                continue
+
+            target = self._make_read_target(node)
+            value = node.value
+
+            if isinstance(value, ast.Call) and len(value.keywords) > 0:
+                new_node = self._build_array_read(target, value)
+            else:
+                new_node = self._build_scalar_read(target, value)
+
+            var_list.append(new_node)
+
         return var_list
     
-    def init_dependant_variables(self,read_ast:ast.Module,assign_nodes:List) -> List: 
+    def _make_read_target(self, node: ast.Assign) -> ast.Attribute | ast.Name:
         """
-        Initializes variables that depend on previously read input attributes.
+        Construct a writable AST target from an assignment target.
 
-        This method should be called after critical dependencies (e.g., configuration 
-        parameters, dimensions) have been read from an input file. It ensures that 
-        dependent variables are only initialized after all required 'dependee' variables 
-        are available.
+        The target is converted into a node with a
+        :class:`ast.Store` context suitable for use on the left-hand side of
+        a generated assignment statement.
 
-        The initialization order is determined using a dependency mapping (`self.dependant_variables`), 
-        which specifies which variables depend on others. For each dependent variable, 
-        the method finds the latest initialization point of its dependencies and inserts 
-        the initialization code at the appropriate position in the AST.
+        Parameters
+        ----------
+        node : ast.Assign
+            Assignment node whose target is to be transformed.
+
+        Returns
+        -------
+        ast.Name or ast.Attribute
+            Writable AST target corresponding to the original assignment
+            target.
+
+        Raises
+        ------
+        TypeError
+            If the assignment target type is unsupported.
+        """
+        target = node.targets[0]
+
+        if isinstance(target, ast.Name):
+            return ast.Name(id=target.id, ctx=ast.Store())
+
+        if isinstance(target, ast.Attribute):
+            return ast.Attribute(
+                value=ast.Name(id='self', ctx=ast.Load()),
+                attr=target.attr,
+                ctx=ast.Store()
+            )
+
+        raise TypeError(f"Unsupported target type: {type(target)}")
+    
+    def _build_scalar_read(self, target: ast.AST, value: ast.AST) -> ast.Assign:
+        """
+        Build an AST assignment that reads a scalar value from a file.
+
+        The generated assignment reads a single value from ``ffile`` using
+        the appropriate reader function and assigns the first element of the
+        returned array-like object to *target*.
+
+        Logical values receive special handling and are converted using
+        ``np.bool`` to preserve Fortran logical semantics.
+
+        Parameters
+        ----------
+        target : ast.AST
+            Assignment target.
+        value : ast.AST
+            AST node describing the scalar datatype to read.
+
+        Returns
+        -------
+        ast.Assign
+            Assignment statement that performs the scalar read operation.
+        """
+        attr_type = value.func.attr
+        read_type = self._get_read_func(attr_type)
+
+        read_call = ast.Call(
+            func=ast.Attribute(
+                value=ast.Name(id='ffile', ctx=ast.Load()),
+                attr=read_type,
+                ctx=ast.Load()
+            ),
+            args=[self._dtype_attr(('np', attr_type))],
+            keywords=[]
+        )
+
+        # NOTE: Special case: LOGICAL -> np.bool(...)
+        # Logical values representation: .TRUE. is mostly respresented with -1 because all bits are set to 1
+        # .FALSE. is represented by 0
+        # https://stackoverflow.com/a/39454385
+        if attr_type == "bool":
+            return ast.Assign(
+                targets=[target],
+                value=ast.Call(
+                    func=self._dtype_attr(("np", "bool")),
+                    args=[ast.Subscript(read_call, ast.Constant(0), ctx=ast.Load())],
+                    keywords=[]
+                )
+            )
+
+        return ast.Assign(
+            targets=[target],
+            value=ast.Subscript(read_call, ast.Constant(0), ctx=ast.Load())
+        )
+    
+    def _build_array_read(self, target: ast.AST, value: ast.AST) -> ast.Assign:
+        """
+        Build an AST assignment that reads and reshapes array data.
+
+        The generated assignment reads array contents from ``ffile`` using
+        the appropriate reader function and reshapes the resulting data
+        according to the metadata contained in *value*. Reshaping is
+        performed using Fortran ordering (``order="F"``).
+
+        Parameters
+        ----------
+        target : ast.AST
+            Assignment target representing the destination array.
+        value : ast.AST
+            AST node containing datatype and shape information.
+
+        Returns
+        -------
+        ast.Assign
+            Assignment statement that performs the array read and reshape
+            operation.
+        """
+        attr_type = value.keywords[0].value.attr
+        read_type = self._get_read_func(attr_type)
+
+        read_call = ast.Call(
+            func=ast.Attribute(
+                value=ast.Name(id='ffile', ctx=ast.Load()),
+                attr=read_type,
+                ctx=ast.Load()
+            ),
+            args=[self._dtype_attr(('np', attr_type))],
+            keywords=[]
+        )
+
+        reshape_call = ast.Call(
+            func=ast.Attribute(
+                value=read_call,
+                attr='reshape',
+                ctx=ast.Load()
+            ),
+            args=[value.args[0]],
+            keywords=[ast.keyword(arg='order', value=ast.Constant('F'))]
+        )
+
+        return ast.Assign(
+            targets=[ast.Subscript(target, ast.Slice(), ctx=ast.Store())],
+            value=reshape_call
+        )
+    
+    def _get_read_func(self, dtype: str) -> str:
+        """
+        Map data type to corresponding binary read function.
+
+        Parameters
+        ----------
+        dtype : str
+            Data type string (e.g., 'float64', 'int32').
+
+        Returns
+        -------
+        str
+            Name of the reader function ('read_reals' or 'read_ints').
+        """
+        return 'read_reals' if dtype == "float64" else 'read_ints'
+    
+    def init_dependant_variables(self, read_ast: ast.Module, assign_nodes: List) -> List:
+        """
+        Insert dependency-managed variable initializations into a read AST.
+
+        The insertion order is determined by :attr:`dependant_variables`,
+        which maps variables to the variables on which they depend. For each
+        managed variable, the latest assignment position among its dependees
+        is identified and the variable's initialization statement is inserted
+        immediately afterward.
+
+        Insertions are planned before modification of the AST and then
+        applied in sorted order to avoid index-shifting issues during
+        insertion.
 
         Parameters
         ----------
         read_ast : ast.Module
-            The AST representing the read template from which variable values are extracted.
-        assign_nodes : list of ast.Assign
-            A list of assignment nodes representing variables that require dependency-based initialization.
+            Module AST whose body will receive dependency-managed
+            initialization statements.
+        assign_nodes : list[ast.Assign]
+            Assignment nodes representing variables requiring deferred
+            initialization.
 
         Returns
         -------
-        list of ast.AST
-            A list of AST nodes representing the updated body of `read_ast` with inserted initialization logic.
+        list[ast.AST]
+            Updated module body containing the inserted initialization
+            statements.
+
+        Raises
+        ------
+        Exception
+            Re-raises any exception encountered during dependency analysis
+            or AST modification after logging the error.
         """
-        var_name = None
-        for key in list(self.dependant_variables.keys()):
-            try:
-                # Get all assign statements from the read_ast
-                assign_stmts = [(i,element) for i, element in enumerate(read_ast.body) if isinstance(element,ast.Assign)]
+        try:
+            # Build index of existing assignments
+            assign_positions = {}  # var_name -> position
 
-                dependees = self.dependant_variables[key]
-                max_pos = -1 # This will allows us to find after which variable should we place the init of the dependant variables
-                # Since each depandant variables might have multiple dependee variables which are init at different locations as such we try to find the
-                # furthest/last positin of the variable dependee 
+            for i, stmt in enumerate(read_ast.body):
+                if isinstance(stmt, ast.Assign):
+                    name = self._get_assigned_name(stmt)
+                    if name:
+                        assign_positions[name] = i
 
-                # Find the max position among all dependee variables
-                for i, stmt in assign_stmts:
-                    if not stmt.targets:
-                        raise ValueError("assign_node has no targets")
-                    target = stmt.targets[0]
-                    if isinstance(target, ast.Name):
-                        var_name = target.id
-                    elif isinstance(target, ast.Attribute):
-                        var_name = target.attr
-                    
-                    if var_name is None:
-                        raise AttributeError(f"node doesn't have either attribute or id or attr :{ast.unparse(ast.fix_missing_locations(stmt))} ")
-                    
-                    if var_name in dependees:
-                        max_pos = max(max_pos, i)
+            # Map new assignments by variable name
+            new_assign_map = {
+                self._get_assigned_name(node): node
+                for node in assign_nodes
+                if self._get_assigned_name(node)
+            }
 
-                # We insert AFTER the latest dependency
-                position = max_pos + 1
-                for assign_node in assign_nodes:
-                    try:
-                        if not assign_node.targets:
-                            raise ValueError("assign_node has no targets")
-                        target = assign_node.targets[0]
-                        if isinstance(target, ast.Name):
-                            var_name = target.id
-                        elif isinstance(target, ast.Attribute):
-                            var_name = target.attr
-                        else:
-                            raise TypeError(f"Unsupported assignment target type: {type(target).__name__}")
-                        
-                        if var_name is None:
-                           raise AttributeError(f"node doesn't have either attribute or id or attr :{ast.unparse(ast.fix_missing_locations(assign_node))} ")
+            # Compute insertion plan 
+            insert_plan = []  # list of (position, node)
 
-                        if var_name is not None and var_name == key:
-                            read_ast.body.insert(position,assign_node)
-                    except (AttributeError,IndexError,ValueError) as e:
-                        raise 
-            except Exception:
-                self.logger.exception(f'Exception in init_dependant_variable')
-                    
-        # read_ast = ast.fix_missing_locations(read_ast)
-        return read_ast.body
+            for var, dependees in self.dependant_variables.items():
 
+                # Skip if no assignment exists for this variable
+                assign_node = new_assign_map.get(var)
+                if not assign_node:
+                    continue
+
+                # Find latest dependency position
+                max_pos = max(
+                    (assign_positions.get(dep, -1) for dep in dependees),
+                    default=-1
+                )
+
+                insert_pos = max_pos + 1
+                insert_plan.append((insert_pos, assign_node))
+
+            # Sort insertions to avoid shifting issues
+            insert_plan.sort(key=lambda x: x[0])
+
+            # Apply insertions with offset correction
+            offset = 0
+            for pos, node in insert_plan:
+                read_ast.body.insert(pos + offset, node)
+                offset += 1
+
+            return read_ast.body
+
+        except Exception:
+            self.logger.exception("Exception in init_dependant_variables")
+            raise
     
-    def transfer_to_pyfile(self, tree:ast.Module, subroutine_key:str, folder_name:str="hydrol",python_file_type:Literal["module_global","main"] = "module_global") -> None:
+    def _get_assigned_name(self, node: ast.Assign, require_self: bool = False) -> str | None:
         """
-        Writes the finalized Python AST to a Python file based on its type.
+        Extract the assigned variable name from an assignment statement.
 
-        This method takes a finalized Python AST and writes it to a file, depending 
-        on the specified file type (`module_global` or `main`). The output file is placed 
-        in a designated folder, typically named `python_benchmark`, and the structure 
-        of the generated Python file is based on the AST content and file type.
+        Supports both direct assignments and attribute assignments. When
+        *require_self* is ``True``, only assignments to ``self`` attributes
+        are considered valid.
+
+        Examples of supported assignments include:
+
+        - ``x = value``
+        - ``self.x = value``
+
+        Parameters
+        ----------
+        node : ast.Assign
+            Assignment node to inspect.
+        require_self : bool, optional
+            If ``True``, only assignments targeting ``self`` attributes are
+            accepted.
+
+        Returns
+        -------
+        str or None
+            Extracted variable name, or ``None`` if no supported assignment
+            target is found.
+        """
+        if not node.targets:
+            return None
+
+        target = node.targets[0]
+
+        if isinstance(target, ast.Name):
+            return target.id
+
+        if isinstance(target, ast.Attribute):
+            if require_self:
+                if (
+                    isinstance(target.value, ast.Name)
+                    and target.value.id == "self"
+                ):
+                    return target.attr
+                return None
+
+            return target.attr
+
+        return None
+    
+    def transfer_to_pyfile(
+        self, 
+        tree: ast.Module, 
+        subroutine_key: str, 
+        folder_name: Optional[str] = "hydrol",
+        python_file_type: Literal["global_module","main"] = "global_module"
+    ) -> None:
+        """
+        Write a generated Python AST to a Python source file.
+
+        The output file is written beneath *folder_name* using a subdirectory
+        named after *subroutine_key*. The generated source is obtained via
+        :func:`ast.unparse` and written with executable user permissions.
+
+        The output filename follows the convention::
+
+            {python_file_type}_{subroutine_key}.py
 
         Parameters
         ----------
         tree : ast.Module
-            The finalized Python AST to be written to a file.
+            Python AST to serialize and write.
+        subroutine_key : str
+            Name of the target subroutine used to construct the output path.
         folder_name : str, optional
-            The name of the directory where the Python files will be saved.
-            Defaults to `'python_benchmark'`.
-        python_file_type : str, optional
-            The type of Python file to generate. Can be either `'module_global'` or `'main'`.
-            Defaults to `'module_global'`.
+            Root directory containing generated Python files.
+        python_file_type : {"global_module", "main"}, optional
+            Type of Python file being generated.
 
-        Returns
-        -------
-        None
-            This method performs file I/O.
+        Raises
+        ------
+        ValueError
+            If *folder_name* cannot be located by
+            :func:`find_folder`.
+        OSError
+            If directory creation, file writing, or permission updates
+            fail.
         """
         try:
             current_dir = os.getcwd()
@@ -2147,9 +4108,10 @@ class Transformer:
                 raise ValueError(f"For the given folder, it couldn't be found: {path_to_folder}")
             
             subroutine_path = os.path.join(path_to_folder, subroutine_key)
-            file_path = os.path.join(subroutine_path, f"{python_file_type}.py")
+            file_path = os.path.join(subroutine_path, f"{python_file_type}_{subroutine_key}.py")
 
-            # First create python benchmark directory which will contain the directories of each subroutines dir within which contains the output of the subroutines test
+            # First create python benchmark directory which will contain the directories of each subroutines 
+            # dir within which contains the output of the subroutines test
             self.logger.info("Creating benchmark directory...")
             os.makedirs(path_to_folder, exist_ok=True)
 
@@ -2169,334 +4131,363 @@ class Transformer:
 
         except Exception as e:
             self.logger.exception(f"Exception in transfer_to_pyfile",e)
-
-    @staticmethod
-    def python_parser(code:str) -> ast.Module:
-        """
-        Parses a Python code string into an AST module.
-
-        Attempts to convert the given Python source code string into an abstract syntax tree (AST)
-        using the built-in `ast` module. Logs an informational message on successful parsing, 
-        or an error message if a `SyntaxError` is encountered during parsing.
-
-        Parameters
-        ----------
-        code : str
-            The Python source code to parse.
-
-        Returns
-        -------
-        tree : ast.Module or None
-            The parsed AST module if the code is syntactically valid, otherwise `None`.
-        """
-        try:
-            tree = ast.parse(code)
-            logging.info("INFO: Parsed python template is valid")
-            return tree
-        except SyntaxError as e:
-            logging.error(f'ERROR: Syntax error: {e}')
-            return None
+        except OSError as e:
+            self.logger.error('If directory creation, file writing, or permission updates \
+            fail.', e)
     
-    def insert_all_assign_nodes(self,assign_nodes:List,code_tree:ast.Module,method_name:str,**kwargs) -> None:
+    def insert_all_assign_nodes(
+        self,
+        assign_nodes: List,
+        code_tree: ast.Module,
+        method_name: str,
+        **kwargs
+    ) -> None:
         """
-        Inserts all assignment nodes into a specified method within a global code template.
+        Insert multiple assignment statements into a target AST.
 
-        This method inserts a list of `ast.Assign` nodes into the body of a method (typically `__init__` 
-        or another subroutine) within the given AST module (`code_tree`). The insertion point 
-        is determined based on the method name and optionally guided by additional keyword arguments 
-        for more precise placement.
+        Assignments are first mapped by variable name and then inserted in an
+        order determined by the current processing mode.
+
+        When :attr:`global_state` is ``True``, variables declared in
+        :attr:`variable_order` are inserted according to declaration order,
+        while dependency-managed variables are excluded and handled
+        separately. Newly discovered variables are inserted first using
+        dependency-aware ordering.
+
+        When :attr:`global_state` is ``False``, all assignments are ordered
+        via :func:`order_assignments` and inserted into the target method.
 
         Parameters
         ----------
-        assign_nodes : list of ast.Assign
-            A list of AST assignment nodes to be inserted into the method.
+        assign_nodes : list[ast.Assign]
+            Assignment nodes to insert.
         code_tree : ast.Module
-            The Python AST module representing the global code template where the nodes 
-            will be inserted.
+            Module AST that will be modified in place.
         method_name : str
-            The name of the method inside which the assignment nodes should be inserted.
-        **kwargs : dict, optional
-            Additional context used for determining the correct insertion point (dependency order, placeholder positioning).
-
-        Returns
-        -------
-        None
-            This method modifies the `code_tree` in place and does not return a value.
+            Name of the target function or method.
+        **kwargs
+            Additional context forwarded to :meth:`insert_at`.
+        Raises
+        ------
+        ValueError
+            If an assignment node does not contain a valid assignment target.
+        Exception
+            Re-raises any exception encountered during insertion after
+            logging the error.
         """
 
         try:
-            name = None
             name_to_node = {}
+            # Create node map
+            for node in assign_nodes:
+                name = self._get_assigned_name(node)
+                if not name:
+                    raise ValueError(f"Invalid assignment node: {ast.unparse(ast.fix_missing_locations(node))}")
+                name_to_node[name] = node
+
+            all_names = set(name_to_node.keys())
+
             if self.global_state:
-                diff = list(set(
-                    assign.targets[0].id if isinstance(assign.targets[0], ast.Name) else assign.targets[0].attr
-                    for assign in assign_nodes) - set(self.variable_order))
-                # DO it in two steps first the declared and intializd variables and then the variable order
-                # The declared and non intialized variables 
-                if len(diff) != 0:
-                    for assign_node in assign_nodes:
-                        if not assign_node.targets:
-                            raise ValueError("assign_node has no targets")
-                        target = assign_node.targets[0]
-                        if isinstance(target, ast.Name):
-                            name = target.id
-                        elif isinstance(target, ast.Attribute):
-                            name = target.attr
-                        else:
-                            raise TypeError(f"Unsupported assignment target type: {type(target).__name__}")
-                        
-                        if name is None:
-                            raise AttributeError(f"node doesn't have either attribute or id or attr :{ast.unparse(ast.fix_missing_locations(assign_node))} ")
-                        
-                        if name in diff:
-                            # self.insert_at(None,assign_node,code_tree,method_name=method_name)
-                            name_to_node[name] = assign_node
-                    
-                    ordered_vars = order_assignments(assign_nodes, diff)
-                    # Insert assignment nodes in the resolved order
-                    for var in ordered_vars:
-                        if var in name_to_node:
-                            self.insert_at(None, name_to_node[var], code_tree, method_name=method_name)
 
-                # Now all the declared and not intialized variables
-                # assign_node_names = [assign.targets[0].id if isinstance(assign.targets[0], ast.Name) else assign.targets[0].attr  for assign in assign_nodes]
+                declared = set(self.variable_order)
+                dependant = set(self.dependant_variables.keys())
+                new_vars = all_names - declared
+
+                # Insert new variables first (dependency ordered)
+                if new_vars:
+                    ordered_new = order_assignments(assign_nodes, new_vars)
+
+                    for var in ordered_new:
+                        node = name_to_node.get(var)
+                        if node:
+                            self.insert_at(None, node, code_tree, method_name=method_name)
+
+                # Insert declared variables 
                 for var in self.variable_order:
-                    for assign_node in assign_nodes:
-                        if not assign_node.targets:
-                            raise ValueError("assign_node has no targets")
-                        target = assign_node.targets[0]
-                        if isinstance(target, ast.Name):
-                            name = target.id
-                        elif isinstance(target, ast.Attribute):
-                            name = target.attr
-                        else:
-                            raise TypeError(f"Unsupported assignment target type: {type(target).__name__}")
-                        
-                        if name is None:
-                            raise AttributeError(f"node doesn't have either attribute or id or attr :{ast.unparse(ast.fix_missing_locations(assign_node))} ")
-                        
-                        if var == name and var not in list(self.dependant_variables.keys()):
-                            self.insert_at(None,assign_node,code_tree,method_name=method_name)
+                    if var in dependant:
+                        continue  # skip dependency-managed vars
+
+                    node = name_to_node.get(var)
+                    if node:
+                        self.insert_at(None, node, code_tree, method_name=method_name)
+
             else:
-                for assign_node in assign_nodes:
-                    target = assign_node.targets[0]
-                    if isinstance(target, ast.Name):
-                        name = target.id
-                    elif isinstance(target, ast.Attribute):
-                        name = target.attr
-                    else:
-                        raise TypeError(f"Unsupported assignment target type: {type(target).__name__}")
-                    
-                    name_to_node[name] = assign_node
+                ordered_vars = order_assignments(assign_nodes, None)
 
-                ordered_vars = order_assignments(assign_nodes,None)
                 for var in ordered_vars:
-                    if var in name_to_node:
-                        self.insert_at(None,name_to_node[var],code_tree,method_name=method_name,**kwargs)
+                    node = name_to_node.get(var)
+                    if node:
+                        self.insert_at(
+                            None,
+                            node,
+                            code_tree,
+                            method_name=method_name,
+                            **kwargs
+                        )
 
-            # code_tree = ast.fix_missing_locations(code_tree)
-        except Exception as e:
-            self.logger.exception(f'Exception in insert_all_assign_nodes',e)
+        except Exception:
+            self.logger.exception("Exception in insert_all_assign_nodes")
             raise
 
-    def create_test_function(self, cls_info:Dict, subroutine_key: str) -> ast.FunctionDef:
+    def create_test_function(self, cls_info: Dict, subroutine_key: str) -> ast.FunctionDef:
         """
-        Create a test function to compare the output of the Python code with the FORTRAN output saved in `output.bin`.
+        Create a test function to compare the output of the 
+        Python code with the FORTRAN output saved in `output.bin`.
 
         Parameters
         ----------
-        cls_info : dict
-            Dictionary containing all the information of classes that some variable might depend on.
+        cls_info : Dict
+            Dictionary containing all the information of 
+            classes that some variable might depend on.
 
         Returns
         -------
         ast.FunctionDef
             Function AST to test the output of Python with that of FORTRAN.
         """
-
         try:
-            for key in list(cls_info.keys()):
-                try:
-                    instance_name = list(cls_info[key].keys())[0]
-                    attr = copy.deepcopy(cls_info[key][instance_name]["attributes"]) # Without the deepcopy here the dict attributes get's updated down below 
+            
+            # 1. Extract instance + attributes
+            instance_name, attributes = self._extract_instance_attributes(cls_info)
 
-                    if cls_info[key][instance_name].get('instances'):
-                        for other_key in cls_info[key][instance_name].get('instances').keys():
-                            if cls_info[key][instance_name].get('instances')[other_key].get('attributes'):
-                                attr |= cls_info[key][instance_name].get('instances')[other_key].get('attributes')
+            # 2. Build function arguments
+            args = self._build_test_args(instance_name, attributes, subroutine_key)
 
-                except (IndexError, KeyError, TypeError) as e:
-                    self.logger.error(f"Error accessing attributes for key '{key}':", e)
-                    raise
+            # 3. Create function skeleton
+            function_def = ast.FunctionDef(
+                name=f"test_{subroutine_key}",
+                args=ast.arguments(
+                    posonlyargs=[],
+                    args=args,
+                    kwonlyargs=[],
+                    kw_defaults=[],
+                    defaults=[],
+                ),
+                body=[],
+                decorator_list=[],
+            )
 
-                type_ = {"REAL": "float64",
-                        "INTEGER": "int32"}
-                args = []
-                # Now to see if we need to an instance of the class 
-                if any(set(attr) & self.extractor.var_modif[subroutine_key]):
-                    args.append(ast.arg(arg=instance_name))
-                    
-                # THese are non global args that meant to be sent as args
-                arg = [ast.arg(arg = arg) for arg in self.extractor.var_modif[subroutine_key] - set(attr)]
-                args.extend(arg)
-                
-                # First create an empty function 
-                function_def = ast.FunctionDef(
-                    name = f"test_{subroutine_key}",
-                    args=ast.arguments(
-                        posonlyargs=[],
-                        args=args,
-                        kwonlyargs=[],
-                        kw_defaults=[],
-                        defaults=[]),
-                    body=[],
-                    decorator_list=[]
-                )
-                code = """
-print('--- inside the test function for {subroutine_name} ---')
-path = f'{benchmark_dir}/{subroutine_name}/output.bin'
-ffile = FortranFile(path, 'r')
-                """
-                try:
-                    code = code.format(benchmark_dir=self.benchmark_dir, subroutine_name=subroutine_key)
-                    tree = ast.parse(code).body
-                except (SyntaxError, KeyError) as e:
-                    self.logger.error(f"Error in formatting/parsing test function body:", e)
-                    raise
+            # 4. Add setup code (file reading)
+            function_def.body.extend(
+                self._build_test_setup_block(subroutine_key)
+            )
 
-                function_def.body = tree 
-                
-                # THe primary constraint is the fact that we have class attributes and local all together and we also need to see the variable
-                # that's being read and compared, first use the var_modif_info.keys() to keep in check the variable read. 
-                modif_var = ast.Assign(
-                    targets = [ast.Name(id = "modif_var", ctx = ast.Store())],
-                    value = ast.List(elts = [ast.Constant(value = variable) for variable in list(self.extractor.var_modif_info[subroutine_key].keys())],
-                                    ctx = ast.Load()
-                            )
-                )
-                # The for loop 
-                for_loop = ast.For(
-                    target = ast.Tuple(
-                        elts = [ast.Name(id='variable', ctx=ast.Store()),
-                            ast.Name(id='value', ctx=ast.Store())],
-                        ctx = ast.Store()
-                    ),
-                    iter = ast.Call(
-                        func = ast.Name(id = 'zip', ctx = ast.Load()),
-                        args = [
-                            ast.Name(id = 'modif_var', ctx = ast.Load()),
-                            ast.List(elts = [ast.Name(id = variable,ctx=ast.Load()) for variable in list(self.extractor.var_modif_info[subroutine_key].keys())],
-                                    ctx = ast.Load()
-                            )
-                        ],
-                        keywords = []
-                    ),
-                    body=[],
-                    orelse =[]
-                    
-                )
-                # We send the for loop to replace the variables that has 
-                try:
-                    for_loop = ReplaceGlobals(cls_info).visit_For(for_loop)
-                except Exception:
-                    self.logger.exception(f"ReplaceGlobals failed")
-                    raise
-                
-                # Now we need to create the core of the for loop which only does the matching of variables read from the ouput.bin of the Fortran values
-                # with that of the python, which uses the known shape of the variables to ensure that we retrieve them in proper shape and then compare
-                # For arrays, we will use the allclose to see if two arrays has the same shape and values: https://numpy.org/doc/2.3/reference/generated/numpy.allclose.html
-                # For scalars, we will use isclose which is helpful when comparing floating points precision : https://numpy.org/devdocs/reference/generated/numpy.isclose.html
-                
-                templates = self.load_code_templates(self.config_path)
-                if templates is None:
-                    raise ValueError("Templates could not be loaded due to a prior error.")
-                        
-                code = templates["Python_templates"]["Python_test_output_template"]["template"]        
+            # For arrays, we will use the allclose to see if two arrays has the same shape and values: 
+            # https://numpy.org/doc/2.3/reference/generated/numpy.allclose.html
+            # For scalars, we will use isclose which is helpful when comparing floating points precision : 
+            # https://numpy.org/devdocs/reference/generated/numpy.isclose.html
+            # 5. Build comparison loop
+            comp_loop = self._build_test_loop(cls_info, subroutine_key)
 
-                if code is None:
-                    raise ValueError(f'Test output template is None')
-                
-                try:      
-                    core_step = ast.parse(code).body # we retreive only the body and which would allow us to add it to the the for loop body
-                    for_loop.body = core_step
+            function_def.body.extend(comp_loop)
 
-                except SyntaxError as e:
-                    self.logger.error(f"Syntax error while parsing the code template:",e)
-                    raise
+            return function_def
 
-                # Now we append the modif_var_list and the for loop inside the test function 
-                function_def.body.append(modif_var)
-                function_def.body.append(for_loop)
-                        
-                # print(ast.unparse(ast.fix_missing_locations(function_def)))
-                return function_def
-        except Exception as e:
-            self.logger.exception(f'Exception in create_test_function', e)
-            return None 
-        
-    ############################################################################################ Global python ############################################################################################
+        except Exception:
+            self.logger.exception("Exception in create_test_function")
+            return None
     
-    def prepare_read_code_global_template(self, assign_nodes:List,subroutine_key:str) -> ast.Module:
+    def _extract_instance_attributes(self, cls_info: Dict) -> Tuple:
         """
-        Generate and populate the read code template for reading a Fortran binary file.
-
-        This method builds the structure for reading a Fortran binary file line by line,
-        supporting both standalone Python scripts and class-based approaches. It inserts
-        assignment nodes into the template to define how each variable should be read.
+        Retrieves the first instance in `cls_info` and merges its attributes
+        with any nested instance attributes.
 
         Parameters
         ----------
-        assign_nodes : list
-            List of `ast.Assign` nodes for each variable.
+        cls_info : Dict
+            Nested class/instance metadata structure.
 
         Returns
         -------
-        ast.Module
-            The modified read template filled with the assignment nodes.
+        tuple
+            (instance_name, attributes)
+            - instance_name : str
+            - attributes : dict
+                Merged attribute dictionary for the instance.
+
+        Raises
+        ------
+        ValueError
+            If no instance is found in `cls_info`.
         """
+        for class_data in cls_info.values():
+            instance_name = next(iter(class_data))
+            instance_data = class_data[instance_name]
+
+            attributes = copy.deepcopy(instance_data.get("attributes", {}))
+
+            # Merge nested instance attributes
+            for inst in instance_data.get("instances", {}).values():
+                attributes.update(inst.get("attributes", {}))
+
+            return instance_name, attributes
+
+        raise ValueError("No instance found in cls_info")
+    
+    def _build_test_args(
+        self,
+        instance_name: str,
+        attributes: Dict,
+        subroutine_key: str
+    ) -> List:
+        """
+        Build argument list for generated test function.
+
+        Parameters
+        ----------
+        instance_name : str
+            Name of the class instance.
+        attributes : Dict
+            Instance attribute dictionary.
+        subroutine_key : str
+            Subroutine identifier used to fetch modified variables.
+
+        Returns
+        -------
+        List
+            List of ast.arg nodes representing function arguments.
+        """
+        args = []
+
+        modif_vars = set(self.extractor.var_modif[subroutine_key])
+
+        # If any modified variable is a class attribute -> pass instance
+        if attributes.keys() & modif_vars:
+            args.append(ast.arg(arg=instance_name))
+
+        # Add non-attribute variables
+        for var in modif_vars - attributes.keys():
+            args.append(ast.arg(arg=var))
+
+        return args
+    
+    def _build_test_setup_block(self, subroutine_key) -> List:
+        """
+        Generate AST nodes for test function setup section.
+
+        Parameters
+        ----------
+        subroutine_key : str
+            Identifier for selecting benchmark/output directory.
+
+        Returns
+        -------
+        List
+            List of AST nodes representing setup statements.
+        """
+
+        code = """
+print('--- inside the test function for {subroutine_name} ---')
+path = f'{benchmark_dir}/{subroutine_name}/output.bin'
+ffile = FortranFile(path, 'r')
+        """
+        code = code.format(benchmark_dir=self.benchmark_dir, subroutine_name=subroutine_key)
+        return ast.parse(code).body
+    
+    def _build_test_loop(self, cls_info: Dict, subroutine_key: str):
+        """
+        Construct an AST-based test loop for evaluating modified variables
+        against reference outputs using a generated comparison template.
+
+        This method builds two AST nodes:
+
+        1. A list assignment containing modified variable names extracted from
+        `self.extractor.var_modif_info[subroutine_key]`.
+        2. A `for` loop that iterates over zipped modified variables and their
+        corresponding values, then injects a comparison logic template into
+        the loop body after applying global replacements.
+
+        The loop body is populated using a Python code template loaded from
+        configuration via :func:`load_code_templates`. Global replacements
+        are applied using :class:`ReplaceGlobals`.
+
+        Parameters
+        ----------
+        cls_info : dict
+            Metadata describing the class or instance context used for resolving
+            global references and applying transformations inside the AST.
+        subroutine_key : str
+            Identifier used to select the appropriate set of modified variables
+            and associated template logic from internal extractor storage.
+
+        Returns
+        -------
+        list of ast.AST
+            A list containing:
+            - An `ast.Assign` node defining `modif_var`
+            - An `ast.For` node representing the constructed test loop
+
+        Raises
+        ------
+        ValueError
+            If the loaded comparison template is `None`.
+        SyntaxError
+            If the injected template code cannot be parsed into valid Python AST.
+        Exception
+            If global replacement via :class:`ReplaceGlobals` fails.
+        """
+        variables = list(self.extractor.var_modif_info[subroutine_key].keys())
+
+        # modif_var = [...]
+        modif_var_assign = ast.Assign(
+            targets=[ast.Name(id="modif_var", ctx=ast.Store())],
+            value=ast.List(
+                elts=[ast.Constant(v) for v in variables],
+                ctx=ast.Load()
+            )
+        )
+
+        # for variable, value in zip(...)
+        loop = ast.For(
+            target=ast.Tuple(
+                elts=[
+                    ast.Name(id="variable", ctx=ast.Store()),
+                    ast.Name(id="value", ctx=ast.Store())
+                ],
+                ctx=ast.Store()
+            ),
+            iter=ast.Call(
+                func=ast.Name(id="zip", ctx=ast.Load()),
+                args=[
+                    ast.Name(id="modif_var", ctx=ast.Load()),
+                    ast.List(
+                        elts=[ast.Name(id=v, ctx=ast.Load()) for v in variables],
+                        ctx=ast.Load()
+                    )
+                ],
+                keywords=[]
+            ),
+            body=[],
+            orelse=[]
+        )
 
         try:
-            templates = self.load_code_templates(self.config_path)
-            if templates is None:
-                raise ValueError("Templates could not be loaded due to a prior error.")
-            
-            template_str = templates["Python_templates"]["Python_read_global_template"]["template"]
-            read_code_template =template_str.format(
-                benchmark_dir=self.benchmark_dir,
-                subroutine_name=subroutine_key
-            )
-            # print(read_code_template)
-            read_ast = self.python_parser(read_code_template)
-            if read_ast is None:
-                raise ValueError(f'read ast for prepare read code global template is None due to prior error')
-            # print(ast.dump(read_ast,indent=4))
-            # We need to ensure that the assign_nodes follows the `self.variable_order`
-            assign_nodes.sort(
-                key=lambda node: self.variable_order.index(getattr(node.targets[0],'id',getattr(node.targets[0],'attr',None))) if getattr(node.targets[0],'id',getattr(node.targets[0],'attr',None)) in self.variable_order else float('inf') 
-            )
-            # Then we remove the nodes that are not necessary to be read since assign_nodes contains all the assign statement within the global python template
-            assign_temp = []
-            for assign_node in assign_nodes:
-                target = assign_node.targets[0]
-                name = getattr(target,'id', getattr(target,'attr',None))
-                if name in self.variable_order:
-                    assign_temp.append(assign_node)
-
-            var_list = self.read_file_ast(assign_nodes=assign_temp)
-            for variable in var_list:
-                read_ast.body.append(variable)
-
-            # read_ast = ast.fix_missing_locations(read_ast)
-            return read_ast
-        
+            loop = ReplaceGlobals(cls_info).visit_For(loop)
         except Exception:
-            self.logger.exception(f"Error from prepare_read_code_global_template method")
-            return None
+            self.logger.exception(f"ReplaceGlobals failed")
+            raise
 
-    def prepare_read_code_for_global_template(self,assign_nodes:List,subroutine_key:str) -> ast.Module:
+        # Load comparison template
+        templates = load_code_templates(self.config_path)
+        code = templates["Python_templates"]["Python_test_output_template"]["template"]
+
+        if code is None:
+            raise ValueError(f'Test output template is None')
+        
+        try: 
+            loop.body = ast.parse(code).body
+        except SyntaxError as e:
+            self.logger.error(f"Syntax error while parsing the code template:",e)
+            raise
+
+        return [modif_var_assign, loop]
+        
+    def prepare_read_code_for_global_template(
+        self,
+        assign_nodes: List,
+        subroutine_key: str
+    ) -> ast.Module:
         """
-        Initialize scalar variables by reading them line by line from a Fortran binary file.
-
         This method assumes that the necessary `for` loops for reading array data are already
         present in the `read_code_template`. It focuses on scalar variables, which are read
         individually and inserted into their appropriate positions within the code template.
@@ -2515,179 +4506,101 @@ ffile = FortranFile(path, 'r')
         """
 
         try:
-            template_name = "Python_read_for_loop_template" if not self.cls_mode else "Python_read_for_loop_class_template"
-            templates = self.load_code_templates(self.config_path)
+            templates = load_code_templates(self.config_path)
             if templates is None:
                 raise ValueError("Templates could not be loaded due to a prior error.")
             
-            for_template_str = templates["Python_templates"][template_name]["template"]
+            for_template_str = templates["Python_templates"]["Python_read_for_loop_class_template"]["template"]
 
             read_code_template =for_template_str.format(
                 benchmark_dir=self.benchmark_dir,
                 subroutine_name=subroutine_key,
             )
-            # print(read_code_template)
-        
-            read_ast = self.python_parser(read_code_template)
+
+            read_ast = python_parser(read_code_template)
             if read_ast is None:
                 raise ValueError(f'read_ast for the python read code for global template is None due to prior error')
             
             if assign_nodes:
                 var_list = self.read_file_ast(assign_nodes)
-                # In order to use for loop within the python script we will first read the scalars line by line and for the arrays we will read it using a for loop
-                var_pos = [i for i,element in enumerate(ast.iter_child_nodes(read_ast)) if isinstance(element,ast.For)][0] 
+                for_node = self._find_first_node(read_ast, ast.For)
                 
-                for variable in var_list:
-                    read_ast.body.insert(var_pos, variable)
-                    var_pos+=1               
-            # The arrays are read through a loop instead of reading them line by line and Now fill up the list for the for loop with the read_ast
+                insert_pos = read_ast.body.index(for_node)
+                for var in var_list:
+                    read_ast.body.insert(insert_pos, var)
+                    insert_pos += 1 
 
-            # We apply the same prinicple for the class aspect but the primary differences situates within the self and thanks to the getattr and hasattr
-            # methods which allows us to retrieve a class attribute and modify it dynamically allowing us to do a proper changement instead of using globals
-            for_ast = next(iter(ast_walk(read_ast,ast.For)))
-            # print(for_ast)
-            if for_ast.iter.elts == []:
-                difference = [item for item in self.variable_order if item not in self.scalar]
-                for_ast.iter.elts = [ast.Constant(var) for var in difference]
+            self._populate_for_loop_iterable(read_ast)
             
-            # read_ast = ast.fix_missing_locations(read_ast)
             return read_ast
         
         except Exception:
             self.logger.exception(f"Error from prepare_read_code_for_global_template method")
             return None
-
-    def convert_global_read_subroutine(self,assign_nodes:List,code_template:ast.Module,subroutine_key:str) -> None:
-        """
-        Populate the code template with all necessary elements for the `module_global` file.
-        This method uses previously defined methods to assemble and insert all required components,
-        ensuring that the `module_global` file is fully constructed.
-
-        Parameters
-        ----------
-        assign_nodes : list
-            List of assignment nodes (ast.Assign) for each variable.
-        code_template : ast.Module
-            AST tree of the code template that will be modified.
-
-        Returns
-        -------
-        None
-            This methods modifies directly the code_template.
-        """
-        try:
-            # The variable order will be retrieved since we the instance of the isolator class which use the processor and extractor class
-            function_def = ast_walk(code_template,ast.FunctionDef)
-            # print(ast.dump(read_ast,indent=4))
-            
-            # Retrieved the scalar/Logical variables that will be read 
-            self.separate_scalar(subroutine_key=subroutine_key)
-
-            if self.for_loop:
-                if self.scalar:
-                    assign_map = {}
-                    for assign_node in assign_nodes:
-                        target = assign_node.targets[0]
-                        name = target.id if isinstance(target, ast.Name) else target.attr
-                        assign_map[name] = assign_node  
-                    nodes = [assign_map[scalar] for scalar in self.scalar if scalar in assign_map]
-
-                    read_ast = self.prepare_read_code_for_global_template(assign_nodes=nodes,subroutine_key=subroutine_key)
-                    if read_ast is None:
-                        raise ValueError(f'global read ast is None using for loop')
-            else:
-                read_ast = self.prepare_read_code_global_template(assign_nodes,subroutine_key=subroutine_key)
-                if read_ast is None:
-                    raise ValueError(f'global read ast is None without using for loop')
-
-            read_ast_list = self.init_dependant_variables(read_ast,assign_nodes)
-            
-            for functions in function_def:
-                if functions.name == "declaration_initialization": # IF we find the declaration intiailization method to read and fill tables
-                    if self.scalar:
-                        try:
-                            tree = ast.parse(f"global {', '.join(self.scalar + list(self.dependant_variables.keys()))}") # self.scalar + list(self.dependant_variables.keys())
-                            
-                            functions.body.append(tree.body[0])
-                        except (SyntaxError,AttributeError):
-                            raise 
-                        
-                    # ast.iter_child_nodes(read_ast)
-                    for elem in read_ast_list:
-                        functions.body.append(elem)
-                else:
-                    print(functions.name)
-
-            # What this does it fix the missing location(lineno,end_lineno,col_offset,end_col_offset) based on the parent node
-            # https://docs.python.org/3/library/ast.html#ast.fix_missing_locations 
-            code_template = ast.fix_missing_locations(code_template)
-
-            return code_template 
-        except Exception:
-            self.logger.exception(f'Exception in convert_global_read_subroutine')
-            return None
-        
-    def transform_to_python_script(self, ast_nodes:List,subroutine_key:str) -> ast.Module:
-        """
-        Transform from AST Fortran to an AST Python script approach for a global module.
-
-        Parameters
-        ----------
-        ast_nodes : list
-            List of assignment nodes (ast.Assign) or import nodes (ast.Import or ast.ImportFrom).
-
-        Returns
-        -------
-        code_tree : ast.Module
-            The finalized Python script AST containing all elements of the transformation.
-        """
-        try:
-            code_tree = self.out_module_python()
-            if code_tree is None:
-                raise ValueError(f'Code_tree is None')
-
-            assign_nodes = []
-            procedure_nodes = []
-            
-            for node in ast_nodes:
-                if isinstance(node, (ast.Import, ast.ImportFrom)):
-                    procedure_nodes.append(node)
-                elif isinstance(node, (ast.Assign, ast.Assign)):
-                    assign_nodes.append(node)
-
-            if procedure_nodes:
-                for procedure_node in procedure_nodes:
-                    self.insert_at(None,procedure_node,code_tree)
-
-            # Specification part
-            self.insert_all_assign_nodes(assign_nodes=assign_nodes,code_tree=code_tree,method_name=None)
-            # This is for the functions part
-            functions_spec = ast_walk(code_tree,ast.FunctionDef)
-
-            for functions in functions_spec:
-                if functions.name == "declaration_initialization":
-                    code_tree = self.convert_global_read_subroutine(assign_nodes=assign_nodes,code_template=code_tree, subroutine_key=subroutine_key)
-                    if code_tree is None:
-                        raise ValueError(f'Code_tree is None')
-                        
-            return code_tree
-        except Exception:
-            self.logger.exception(f'Exception error in transform_to_python_script')
-            raise
     
-    def transform_to_class(self, ast_nodes:List,subroutine_key:str) -> ast.Module:
+    def _populate_for_loop_iterable(self, read_ast: ast.Module) -> None:
         """
-        Transform from AST Fortran to an AST Python class approach for a global module.
+        Populate empty for-loop iterable with ordered non-scalar variables.
+
+        If the template contains a for-loop with an empty list iterator,
+        this fills it using variables from `self.variable_order`, excluding
+        scalars.
 
         Parameters
         ----------
-        ast_nodes : list
-            List of assignment nodes (ast.Assign) or import nodes (ast.Import or ast.ImportFrom).
+        read_ast : ast.Module
+            AST of the read function containing the target for-loop.
+        """
+        for_node = self._find_first_node(read_ast, ast.For)
+
+        if not for_node:
+            raise ValueError("No FOR loop found in template")
+
+        if isinstance(for_node.iter, ast.List) and not for_node.iter.elts:
+            variables = [
+                v for v in self.variable_order
+                if v not in self.scalar
+            ]
+
+            for_node.iter.elts = [ast.Constant(v) for v in variables]
+    
+    def _find_first_node(self, tree: ast.AST, node_type: type[ast.AST]) -> ast.AST | None:
+        """
+        Return the first AST node matching a given type.
+
+        Performs a depth-first traversal and returns the first occurrence
+        of the specified AST node type.
+
+        Parameters
+        ----------
+        tree : ast.AST
+            AST to search.
+        node_type : type[ast.AST]
+            AST node class to locate (e.g., ast.For, ast.FunctionDef).
 
         Returns
         -------
-        code_tree : ast.Module
-            The finalized Python class AST containing all elements of the transformation.
+        ast.AST or None
+            First matching node if found, otherwise None.
+        """
+        return next((n for n in ast.walk(tree) if isinstance(n, node_type)), None)
+    
+    def transform_to_class(self, ast_nodes: List, subroutine_key: str) -> ast.Module:
+        """
+        This builds a global module class by separating imports and assignments,
+        injecting initialization logic, and wiring declaration routines.
+
+        Parameters
+        ----------
+        ast_nodes : List
+            AST nodes including ast.Assign, ast.Import, and ast.ImportFrom.
+        subroutine_key : str
+            Identifier used to specialize class and variable handling.
+
+        Returns
+        -------
+        ast.Module
+            Final Python class-based AST module.
         """
 
         try:
@@ -2695,15 +4608,12 @@ ffile = FortranFile(path, 'r')
             if class_tree is None:
                 raise ValueError(f'Class_tree is None')
             
-            # We need to modify the class name since if we call the global module files with the same class name it might cause errors as such we change only the 
-            # class name to make it correspond to the subroutine it self.
             class_defs = ast_walk(class_tree,ast.ClassDef)
 
             for class_def in class_defs:
                 if class_def.name == 'Global_module':
                     class_def.name = "_".join(["Global_module", subroutine_key])
 
-            functions_spec = ast_walk(class_tree,ast.FunctionDef)
             assign_nodes = []
             procedure_nodes = []
 
@@ -2712,74 +4622,28 @@ ffile = FortranFile(path, 'r')
                     procedure_nodes.append(node)
                 elif isinstance(node, ast.Assign):
                     assign_nodes.append(node)
-            # If the procedure is present then that we add them to the code_template
+
+            # If the procedures are present then that we add them to the template
             if procedure_nodes:
                 for procedure_node in procedure_nodes:
                     self.insert_at(None,procedure_node,class_tree)
 
             self.separate_scalar(subroutine_key=subroutine_key)
-            for functions in functions_spec:
-                if functions.name == "__init__":
-                    self.insert_all_assign_nodes(assign_nodes,class_tree,method_name = functions.name)
+            
+            for func in ast_walk(class_tree,ast.FunctionDef):
+                if func.name == "__init__":
+                    self.insert_all_assign_nodes(assign_nodes,class_tree,method_name=func.name)
                     
-                elif functions.name == "declaration_initialization":
-                    
-                    if isinstance(functions.body[0], ast.Pass):
-                        functions.body.pop(0)
-                    
-                    if self.for_loop:
-                        # Here we will separate from the assign nodes, the scalar nodes
-                        nodes = []
-                        if self.scalar:
-                            assign_map = {}
-                            for assign_node in assign_nodes:
-                                target = assign_node.targets[0]
-                                name = target.id if isinstance(target, ast.Name) else target.attr
-                                assign_map[name] = assign_node  
+                elif func.name == "declaration_initialization":
+                    self._handle_declaration_init(
+                        func,
+                        assign_nodes,
+                        class_tree,
+                        subroutine_key
+                    )
 
-                            nodes = [assign_map[scalar] for scalar in self.scalar if scalar in assign_map]
-                            
-                        read_ast = self.prepare_read_code_for_global_template(nodes,subroutine_key=subroutine_key)
-                        if read_ast is None:
-                            raise ValueError(f'global read ast is None using for loop')
-                    else:
-                        read_ast = self.prepare_read_code_global_template(assign_nodes,subroutine_key=subroutine_key)
-                        if read_ast is None:
-                            raise ValueError(f'global read ast is None without using for loop')
-
-                    read_ast_list = self.init_dependant_variables(read_ast,assign_nodes)
-                    # ast.iter_child_nodes(read_ast)
-                    for elem in read_ast_list:
-                        functions.body.append(elem)
-                    
-                    # USE THE last read_ast_list which is the for loop to check if there are any that has been read or not 
-                    # if not the for loop then it will only be ffile read 
-                    for_loop = read_ast_list[-1]
-                    if isinstance(for_loop, ast.For) and isinstance(for_loop.iter, ast.List) and for_loop.iter.elts == []:
-                        if not self.scalar:
-                            # Remove entire function
-                            class_def.body = [
-                                item for item in class_def.body
-                                if not (isinstance(item, ast.FunctionDef) and item.name == "declaration_initialization")
-                            ]
-                        else:
-                            # Remove only empty for-loop from within the function
-                            for item in class_def.body:
-                                if isinstance(item, ast.FunctionDef) and item.name == "declaration_initialization":
-                                    item.body = [
-                                        stmt for stmt in item.body
-                                        if not (isinstance(stmt, ast.For)
-                                                and isinstance(stmt.iter, ast.List)
-                                                and stmt.iter.elts == [])
-                                    ]
-                    elif isinstance(for_loop,ast.Assign):
-                        if isinstance(for_loop.targets[0],ast.Name) and for_loop.targets[0].id == 'ffile':
-                            class_def.body = [
-                                item for item in class_def.body
-                                if not (isinstance(item, ast.FunctionDef) and item.name == "declaration_initialization")
-                            ]
-
-            # What this does it fix the missing location(lineno,end_lineno,col_offset,end_col_offset) based on the parent node
+            # What this does that it fixes the missing location(lineno,end_lineno,col_offset,end_col_offset) 
+            # based on the parent node
             # https://docs.python.org/3/library/ast.html#ast.fix_missing_locations     
             class_tree = ast.fix_missing_locations(class_tree)
 
@@ -2788,9 +4652,156 @@ ffile = FortranFile(path, 'r')
             self.logger.exception(f'Exception error in transform_to_class')
             raise
     
-    def update_global_python(self,subroutine_key:str,cls_mode:bool=True,for_loop:bool=True) -> ast.Module:
+    def _handle_declaration_init(
+        self,
+        func: ast.FunctionDef,
+        assign_nodes: List,
+        class_tree: ast.AST,
+        subroutine_key: str
+    ) -> None:
         """
-        Update the global Python AST code through different 
+        Populate declaration_initialization method with read and setup logic.
+
+        Builds scalar reads and dependent variable initialization, then injects
+        them into the function body while cleaning up placeholders.
+        
+        Parameters
+        ----------
+        func : ast.FunctionDef
+            Function inside which to populate 
+        assign_nodes : List
+            Assignement nodes to check for scalar variables 
+        class_tree : ast.AST
+            Module-level AST containing class definitions.
+        subroutine_key : str
+        """
+        # Remove placeholder pass
+        if func.body and isinstance(func.body[0], ast.Pass):
+            func.body.pop(0)
+
+        scalar_nodes = self._get_scalar_nodes(assign_nodes)
+
+        read_ast = self.prepare_read_code_for_global_template(
+            scalar_nodes,
+            subroutine_key=subroutine_key
+        )
+
+        if read_ast is None:
+            raise ValueError("read_ast is None")
+
+        read_body = self.init_dependant_variables(read_ast, assign_nodes)
+
+        func.body.extend(read_body)
+
+        self._cleanup_declaration_function(func, class_tree, read_body)
+
+    def _get_scalar_nodes(self, assign_nodes: List) -> List:
+        """
+        Extract assignment nodes corresponding to scalar variables.
+
+        Parameters
+        ----------
+        assign_nodes : List
+            Assignement nodes to check for scalar variables 
+
+        Returns
+        -------
+        List
+            Filtered list of scalar ast.Assign nodes.
+        """
+        if not self.scalar:
+            return []
+
+        name_map = {
+            self._get_assigned_name(node): node
+            for node in assign_nodes
+        }
+
+        return [
+            name_map[name]
+            for name in self.scalar
+            if name in name_map
+        ]
+    
+    def _cleanup_declaration_function(
+        self,
+        func: ast.FunctionDef,
+        class_tree: ast.AST,
+        read_body: List
+    ) -> None:
+        """
+        Handles cleanup cases such as:
+        - Empty for-loops with no iterations
+        - Missing file read initialization (ffile-only case)
+        - Removal of unnecessary declaration functions
+
+        Parameters
+        ----------
+        func : ast.FunctionDef
+            Function inside which to apply cleanup 
+        class_tree : ast.AST
+            Module-level AST containing class definitions.
+        read_body : List
+            Read elements 
+        """
+        if not read_body:
+            return
+
+        last_node = read_body[-1]
+
+        # Case 1: Empty for loop
+        if (
+            isinstance(last_node, ast.For)
+            and isinstance(last_node.iter, ast.List)
+            and not last_node.iter.elts
+        ):
+            if not self.scalar:
+                # No scalars and empty for loop -> remove entier function
+                self._remove_function(class_tree, "declaration_initialization")
+            else:
+                # Only scalars and empty for loop -> remove for loop
+                func.body = [
+                    stmt for stmt in func.body
+                    if stmt is not last_node
+                ]
+
+        # Case 2: No file read 
+        elif (
+            isinstance(last_node, ast.Assign)
+            and isinstance(last_node.targets[0], ast.Name)
+            and last_node.targets[0].id == "ffile"
+        ):
+            self._remove_function(class_tree, "declaration_initialization")
+    
+    def _remove_function(self, class_tree: ast.AST, name: str) -> None:
+        """
+        Remove a method from all classes in the AST module.
+
+        Parameters
+        ----------
+        class_tree : ast.AST
+            Module-level AST containing class definitions.
+        name : str
+            Function name to remove.
+        """
+        for cls in ast_walk(class_tree, ast.ClassDef):
+            cls.body = [
+                item for item in cls.body
+                if not (isinstance(item, ast.FunctionDef) and item.name == name)
+            ]
+    
+    def update_global_python(self,subroutine_key: str, cls_mode: bool = True) -> ast.Module:
+        """
+        Build and update the global Python AST representation for a given subroutine.
+
+        This method orchestrates the full transformation pipeline:
+        - prepares configuration flags
+        - extracts declarations from the Fortran side
+        - converts them into Python AST nodes
+        - builds a class-based structure
+        - injects initialization, reading logic, and dependencies
+        - attaches child subroutines (DFS traversal)
+        - updates metadata (cls_info) and procedure calls
 
         Parameters
         ----------
@@ -2798,83 +4809,77 @@ ffile = FortranFile(path, 'r')
             Name of the isolated subroutine.
         cls_mode : bool
             If the global Python code AST should be in class mode or not.
-        for_loop : bool
-            Indicates whether to use a for loop within the code.
-
+        
         Returns
         -------
         tree : ast.Module
             AST tree containing the finalized and updated elements.
         """
         try:
-            # THESE 3 attributes are set to create cls_mode, having for loops for the reading binary files or not and the global_state which allows
-            # see which module we are currently working with 
+            # Step 1: Configure global transformation state
             self.cls_mode = cls_mode
-            self.for_loop = for_loop 
             self.global_state = True 
-            tree = None
-            # 1. Retreive the all the variables that will be declared but initialized yet/or just empty and the pre init variables such as kjipindex,nstlm etc...
+            if not cls_mode:
+                raise NotImplementedError(
+                    "Only class-based global transformation is currently supported."
+                )
+            
+            # Step 2: Load base template & extract variable metadata
             code_template = self.out_module_python()
             if code_template is None:
                 raise ValueError(f'Code template is None')
             
             self.retreive_variable_order()
             self.pre_init_variables(code_template)
-
-            # 2. Retrieve all the assignement python ast statements as well procesdure nodes(USE) for the global declarations
+            
+            # Step 3: Extract and convert declaration statements
             declaration_stmts = list(self.extractor.dec_global[subroutine_key].values())
             ast_nodes = self.convert_SPECIFICATION_PART(declaration_stmts=declaration_stmts,cls_mode=cls_mode)
             if ast_nodes is None:
-                raise ValueError(f'Ast_nodes are None')
+                raise ValueError(f'AST nodes from specification part are None')
             
-            # 3. Search for variables that dependant one another between the variable_order and global declarations
+            # Step 4: Resolve dependency relationships
             self.search_dependant_variables(declaration_stmts=declaration_stmts)
 
-            # 4. Now we insert the variables and the read and initialization statement within the code template
-            if cls_mode:
-                tree = self.transform_to_class(ast_nodes=ast_nodes,subroutine_key=subroutine_key)
-            else:
-                tree = self.transform_to_python_script(ast_nodes=ast_nodes,subroutine_key=subroutine_key)
-
-            if not cls_mode:
-                raise NotImplementedError(f'Currently only the class format is done for the global even though the python script format exists its not fully completed yet..')
+            # Step 5: Build class-based AST
+            tree = self.transform_to_class(ast_nodes=ast_nodes,subroutine_key=subroutine_key)
             
-            main_class_name = ast_walk(tree,ast.ClassDef)
-            class_def = next(iter(main_class_name))
-
+            class_def = next(iter(ast_walk(tree, ast.ClassDef)), None)
             if not class_def:
-                raise ValueError(f'Global Module needs to be in class format')
+                raise ValueError(f'Expected a class-based global module')
 
+            # Step 6: Build class metadata (attributes, methods, instances)
             cls_info, _, _ = self.create_cls_info(out_module=tree,subroutine_key = subroutine_key,self_mode=True)
             if not cls_info:
-                raise ValueError(f'Cls_info is None')
+                raise ValueError(f'cls_info generation failed')
             
-            # Need to add a timer for this subroutine to measure the time elapsed during the execution and since get_timer sends an AST tree for the 
-            # the decorator method present in template.yaml(@timer)
+            # Step 7: Attach timing decorator/helper
             timer_tree = self.get_timer(subroutine_key=subroutine_key)
             if timer_tree is None:
                 raise ValueError("Timer tree(@timer) is None")
             class_def.body.append(timer_tree)
 
+            # Step 8: Collect child subroutines (DFS traversal)
             all_child_subroutines = []
-            # First if there are call statement within the parent subroutine calling upon other child subroutines then 
-            # we attack them first before working with the parent subroutine, thus we need to dive deep onto the grandchildren or even somestimes great grandchildren cases -> which is 
-            # equivalent of doing a DFS(Deep first search)
             all_child_subroutines = self.collect_descendants_dfs(subroutine_key)
 
-            # This is to add the timer decorator in the case we need to measure the execution time of the function but only upon the parent function / top level child functions which are always
-            # present at the end of the list
-            all_child_subroutines[-1].decorator_list = [ast.Name(id=next(ast_walk(timer_tree,ast.FunctionDef)).name,ctx=ast.Load())] if timer_tree else []
-            class_def.body.extend(all_child_subroutines)
+            if all_child_subroutines:
+                all_child_subroutines[-1].decorator_list = [ast.Name(id=next(ast_walk(timer_tree,ast.FunctionDef)).name,ctx=ast.Load())] if timer_tree else []
+                class_def.body.extend(all_child_subroutines)
             
-            # UPDATE THE CLSinfo
+            # Step 9: Update method metadata + procedure calls
             update_methods(cls_info,all_child_subroutines)
             subroutine_to_stack_index = {func.name: idx for idx, func in enumerate(all_child_subroutines)}  
             main_file_attributes = [names.string for names in walk(walk(self.extractor.var_dummy[subroutine_key], F23.Entity_Decl), F23.Name)]        
-            self.process_procedures(subroutine_key = subroutine_key,subroutine_to_stack_index = subroutine_to_stack_index, module_stacks=all_child_subroutines, cls_info=cls_info,main_file_attributes=main_file_attributes)
+            self._process_procedures(
+                subroutine_key = subroutine_key,
+                subroutine_to_stack_index = subroutine_to_stack_index, 
+                module_stacks=all_child_subroutines, 
+                cls_info=cls_info,
+                main_file_attributes=main_file_attributes
+            )
 
-            # there exists somes instances in which the functions present no use of global attributes, thus doesn't have the self applied to them due to the logic upon which 
-            # we add the self is based on their use inside the function thus in some case they don't have any but still needs to be added the self argument
+            # Step 10: Ensure all methods have `self`
             for func in all_child_subroutines:
                 arg_names = [arg.arg for arg in func.args.args]
                 if 'self' not in arg_names:
@@ -2885,9 +4890,18 @@ ffile = FortranFile(path, 'r')
             self.logger.exception(f"Error in update_global_python method",e)
             return None 
     
-    def collect_descendants_dfs(self, subroutine_key:str):
+    def collect_descendants_dfs(self, subroutine_key: str) -> List:
         """
         Returns list of AST nodes in processing order: leaves first, parent last using the DFS algorithm. 
+
+        Parameters
+        ----------
+        subroutine_key : str
+        
+        Returns
+        -------
+        order : List
+            Sorted subroutine list
         """
         visited = set()
         order = []
@@ -2914,30 +4928,43 @@ ffile = FortranFile(path, 'r')
         dfs(subroutine_key, [])
         return order
             
-    ############################################################################################ Main python ############################################################################################
-
-    def prepare_read_code_for_main_template(self,assign_nodes:List[ast.AST],subroutine_key:str) -> ast.FunctionDef:
+    def prepare_read_code_for_main_template(
+        self,
+        assign_nodes: List[ast.AST],
+        subroutine_key: str
+    ) -> ast.FunctionDef:
         """
-        Prepare the `read_dummy` method by considering local variables declared in the main file, 
-        global attributes it depends on, variables that need to be returned and updated, 
-        and reading a binary file.
+        This method generates a specialized function that reads binary input
+        data and initializes variables required by the main execution pipeline.
+        It builds the function dynamically using a template and augments it
+        with scalar and array read logic derived from assignment AST nodes.
 
         Parameters
         ----------
-        assign_nodes : list of ast.AST
-            List of AST assignment nodes that need to be initialized inside the function.
+        assign_nodes : List[ast.AST]
+            Assignment AST nodes representing variables that must be initialized
+            or read from binary input.
+        subroutine_key : str
+            Identifier of the subroutine used to select variable metadata and
+            scalar/array classification rules.
 
         Returns
         -------
         ast.FunctionDef
-            An AST node representing the `read_dummy` function definition.
-        """
+            AST node representing the fully constructed `read_dummy` function.
 
-        # The primary difference between this and that of the global read code template is that the variables are returned and these 
-        # same variables are sent as arguments
+        Raises
+        ------
+        ValueError
+            If templates cannot be loaded, parsing fails, or required AST
+            components (function definition, scalar nodes) are missing.
+        Exception
+            Re-raises any unexpected error after logging.
+        """
         try:
             
-            templates = self.load_code_templates(self.config_path)
+            # Load and parse template
+            templates = load_code_templates(self.config_path)
             if templates is None:
                 raise ValueError("Templates could not be loaded due to a prior error.")
             
@@ -2948,157 +4975,348 @@ ffile = FortranFile(path, 'r')
                 subroutine_name=subroutine_key,
             )    
 
-            read_ast = self.python_parser(read_code_template).body[0]
+            read_ast = python_parser(read_code_template).body[0]
             if read_ast is None:
                 raise ValueError(f'read ast for main template is None due to prior error')
-
-            # If immutable variables are sent as arguments they are resent back to be updated but for mutable variables if they are sent 
-            # as arguments they don't need to be returned since these are sent as reference
-            # Add the arguments to the function definition
             
-            # read_ast has only one function definition and that's the read_dummy
             function_def = next(iter(ast_walk(read_ast,ast.FunctionDef)),None)
             if function_def is None:
                 raise ValueError("No FunctionDef found in read_ast")
             
+            # Add arguments (dummy variables)
             dummy_list = []
-            for node in self.variable_order:
-                arg_var = ast.arg(arg = node)
-                function_def.args.args.append(arg_var)
-                # We retrieve only the the input elements 
-                dummy_list.append(node)
+            for name in self.variable_order:
+                function_def.args.args.append(ast.arg(arg=name))
+                dummy_list.append(name)
 
-            self.separate_scalar(subroutine_key=subroutine_key) # THis will allows us to retrieve the scalars and boolean varaibles 
-            # Now we retrieve only the scalars following the order that is present in transformer.scalar 
+            # Prepare scalar + array metadata
+            self.separate_scalar(subroutine_key=subroutine_key)
+
             assign_map = {}
-            for assign_node in assign_nodes:
-                target = assign_node.targets[0]
-                name = getattr(target, 'id', getattr(target, 'attr', None))
-                assign_map[name] = assign_node  
+            for node in assign_nodes:
+                target = node.targets[0]
+                name = getattr(target, "id", getattr(target, "attr", None))
+                if name:
+                    assign_map[name] = node  
 
-            nodes = [assign_map[scalar] for scalar in self.scalar if scalar in list(assign_map.keys())]
-            var_list = self.read_file_ast(nodes) # This will get the read stateemnt for scalars, boolean
-            # BEfore adding this we need to verify that within the var_dummy that the scalars/booleans elements are read first and then the arrays
-            # To do so we will check the position of these scalars/boolean among the arrays, in the case that they aren't read in this manner, need to take into account the reading positions
-            arrays_to_add = []
-            seen_arrays = set()
-            seen_scalars = set()
-            seen_names = set() # THis will allows us to avoid adding the same instance many times 
-                
-            # Get index of each scalar in dummy_var to determine order in which these scalar are present inside the dummyvar as such we also
-            # need to handle the cases in which the arrays might be at different indexes. 
-            scalar_positions = [(scalar, self.variable_order.index(scalar)) for scalar in self.scalar if scalar in self.variable_order]
-            
-            var_pos = next((i for i, node in enumerate(ast.iter_child_nodes(read_ast)) if isinstance(node, ast.For)), 0) - 1
-            
-            for scalar_name, scalar_pos in scalar_positions:
-                # Get all arrays before this scalar that which are not present in the self.scalar and have not been previously seen/already read. 
-                arrays_before_scalar = [name for name in self.variable_order[:scalar_pos] if name not in self.scalar and name not in seen_arrays]
-                # FIrst we add the arrays onto the read_ast 
-                for assign in assign_nodes:
-                    target = assign.targets[0]
-                    name = getattr(target, 'id', getattr(target, 'attr', None))
-            
-                    if name in arrays_before_scalar:
-                        new_node = self.read_file_ast([assign])[0]
+            scalar_nodes = [assign_map[scalar] for scalar in self.scalar if scalar in assign_map]
+            scalar_read_nodes = self.read_file_ast(scalar_nodes) # This will get the read stateemnt for scalars, boolean
 
-                        if (isinstance(new_node.value, ast.Call) and new_node.value.args and isinstance(new_node.value.args[0], ast.Tuple)):
-                            for elt in reversed(new_node.value.args[0].elts):
-                                value = getattr(elt, 'value', None)
-                                if isinstance(value, ast.Name):
-                                    arg_name = value.id
-                                    if arg_name not in seen_names:
-                                        function_def.args.args.insert(0, ast.arg(arg=arg_name))
-                                        seen_names.add(arg_name)
-                                    
-                        read_ast.body.insert(var_pos, new_node)
-                        var_pos += 1
-                        seen_arrays.add(name)
-                # Add the scalar/booleans read AST from var_list
-                if scalar_name not in seen_scalars:
-                    for node in var_list:
-                        if isinstance(node, ast.Assign) and node.targets:
-                            target = node.targets[0]   
-                            name = getattr(target, 'id', getattr(target, 'attr', None))
-                            scalar_node = node if name == scalar_name else None 
-                            if scalar_node:
-                                read_ast.body.insert(var_pos, scalar_node)
-                                var_pos += 1
-                                seen_scalars.add(scalar_name)
-                        else:
-                            raise ValueError(f'Could not find scalar node for {scalar_name}')
-                        
-                arrays_to_add.extend(arrays_before_scalar) # THis is to preserve the order of binary reading files which will be used to retrieve
-                # the arrays that will read through a loop.
- 
-            # We then add the variables from the to the list in the for loop 
-            for_node = next(iter(ast_walk(read_ast,ast.For)),None)
-            if for_node is None:
-                raise ValueError(f'for_node is None')
-            # EXCEPTIONAL CASE: in which all the arrays and scalars are being read line by line due to a scalar at the end of var dummy, we don't need the for loop
-            # anymore thus could be removed or the fact we only have one element to read which could be just a scalar or boolean. 
+            # Insert read logic in correct order
+            seen = {
+                "arrays": set(),
+                "scalars": set(),
+                "names": set(),
+            }
 
-            table = self.scalar if not arrays_to_add else self.scalar + arrays_to_add
-            difference = [item for item in dummy_list if item not in table]
-            if difference:
-                for_node.iter.elts = [ast.Name(id = var,ctx = ast.Load()) for var in difference]
-            else:
-                # We will remove the for loop itself from the function
-                for_pos = [i for i, node in enumerate(ast.iter_child_nodes(read_ast)) if isinstance(node, ast.For)][0] - 1
-                read_ast.body.pop(for_pos)
-
-            # add the return element, since we know that the scalars are immutable and arrays are mutables this means that the 
-            # return element will only contain the return of the immutable elements.
-            if 'self' in seen_names  and var_list:
-                # There's a self context, scalars might already be stored in self
-                # So we don’t need to add a return, we just modify instance attributes
-                return read_ast
-            elif seen_names and var_list or (not seen_names and var_list):
-                # Either: seen_names doesn’t contain 'self', or we’re not in a class context
-                # but we have scalars to return
-                # => add a return statement that returns only the scalar vars
-                return_node = ast.Return()
-                ret_stmts = []
-                for ret_stmt in self.scalar:
-                    ret_stmts.append(ast.Name(id = ret_stmt,ctx = ast.Load()))
-
-                if len(var_list) > 1:
-                    return_node.value = ast.Tuple(
-                                            elts = ret_stmts,
-                                            ctx = ast.Load()
-                                    )
-                    read_ast.body.append(return_node)
-                elif len(var_list) == 1:
-                    return_node.value = ret_stmts[0]
-                    read_ast.body.append(return_node)
-            
+            var_pos = self._get_insertion_position(read_ast)
+            arrays_to_add = self._insert_reads_in_order(
+                read_ast,
+                function_def,
+                scalar_read_nodes,
+                assign_map,
+                seen,
+                var_pos
+            )
+            # Update loop iteration variables
+            self._update_for_loop(read_ast, dummy_list, arrays_to_add)
+            # Add return statement (if needed)
+            self._add_return_if_needed(read_ast, seen, scalar_read_nodes)
 
             return read_ast
         except Exception as e:
             self.logger.exception(f'Exception in prepare_read_code_for_main_template', e)
             raise
+    
+    def _get_insertion_position(self, read_ast: ast.AST) -> int:
+        """
+        This method identifies the correct position to insert variable read
+        operations by locating the first loop construct (`ast.For`) in the
+        AST. If no loop is found, insertion defaults to the beginning.
 
-    def update_main_python(self,out_module:ast.Module,subroutine_key:str):
+        Parameters
+        ----------
+        read_ast : ast.AST
+            AST of the read function template.
+
+        Returns
+        -------
+        int
+            Index position where read statements should be inserted.
+        """
+        for i, node in enumerate(ast.iter_child_nodes(read_ast)):
+            if isinstance(node, ast.For):
+                return max(i - 1, 0)
+        return 0
+    
+    def _insert_reads_in_order(
+        self,
+        read_ast: ast.AST,
+        function_def: ast.FunctionDef,
+        scalar_read_nodes: List,
+        assign_map: Dict,
+        seen: Dict,
+        var_pos: int 
+    ) -> List:
+        """
+        This method ensures correct ordering of variable initialization by
+        interleaving array reads and scalar reads based on variable precedence
+        defined in `self.variable_order`.
+
+        Parameters
+        ----------
+        read_ast : ast.AST
+            AST of the read function being constructed.
+        function_def : ast.FunctionDef
+            Function definition node to update with required arguments.
+        scalar_read_nodes : List
+            AST nodes corresponding to scalar variable reads.
+        assign_map : Dict
+            Mapping from variable names to their assignment AST nodes.
+        seen : Dict
+            Tracking structure for processed arrays, scalars, and names.
+        var_pos : int
+            Current insertion index within the AST body.
+
+        Returns
+        -------
+        List
+            List of array variable names that were inserted into the AST.
+        """
+        arrays_to_add = []
+
+        scalar_positions = [
+            (s, self.variable_order.index(s))
+            for s in self.scalar
+            if s in self.variable_order
+        ]
+
+        for scalar_name, scalar_pos in scalar_positions:
+            # Get all arrays before this scalar that are not present in the self.scalar and have not been previously seen/already read. 
+            arrays_before = [
+                name for name in self.variable_order[:scalar_pos]
+                if name not in self.scalar and name not in seen["arrays"]
+            ]
+            
+            for name in arrays_before:
+                assign = assign_map.get(name)
+                if not assign:
+                    continue
+
+                new_node = self.read_file_ast([assign])[0]
+                self._inject_tuple_args(function_def, new_node, seen)
+
+                read_ast.body.insert(var_pos, new_node)
+                var_pos += 1
+                seen["arrays"].add(name)
+
+            if scalar_name not in seen["scalars"]:
+                scalar_node = self._find_scalar_node(
+                    scalar_read_nodes, scalar_name
+                )
+                read_ast.body.insert(var_pos, scalar_node)
+                var_pos += 1
+                seen["scalars"].add(scalar_name)
+
+            arrays_to_add.extend(arrays_before)
+
+        return arrays_to_add
+    
+    def _find_scalar_node(self, scalar_read_nodes: List, scalar_name: str) -> ast.Assign:
+        """
+        Searches through precomputed scalar read nodes to locate the AST node
+        matching the requested scalar variable name.
+
+        Parameters
+        ----------
+        scalar_read_nodes : list
+            List of AST assignment nodes representing scalar reads.
+        scalar_name : str
+            Name of the scalar variable to locate.
+
+        Returns
+        -------
+        ast.Assign
+            AST assignment node for the requested scalar.
+
+        Raises
+        ------
+        ValueError
+            If no matching scalar node is found.
+        """
+        for node in scalar_read_nodes:
+            if isinstance(node, ast.Assign) and node.targets:
+                name = self._get_assigned_name(node)
+                if scalar_name == name:
+                    return node
+        
+        raise ValueError(f'Could not find scalar node for {scalar_name}')
+    
+    def _inject_tuple_args(self, function_def: ast.FunctionDef, node: ast.AST, seen: Dict) -> None:
+        """
+        This method inspects AST call nodes that contain tuple unpacking and
+        extracts variable names, inserting them as function arguments if they
+        have not already been added.
+
+        Parameters
+        ----------
+        function_def : ast.FunctionDef
+            Function definition whose arguments will be modified.
+        node : ast.AST
+            AST node potentially containing tuple-based variable references.
+        seen : Dict
+            Tracking dictionary to avoid duplicate argument insertion.
+        """
+        if not (
+            isinstance(node.value, ast.Call)
+            and node.value.args
+            and isinstance(node.value.args[0], ast.Tuple)
+        ):
+            return
+
+        for elt in reversed(node.value.args[0].elts):
+            if isinstance(elt.value, ast.Name):
+                name = elt.value.id
+                if name not in seen["names"]:
+                    function_def.args.args.insert(0, ast.arg(arg=name))
+                    seen["names"].add(name)
+    
+    def _update_for_loop(
+        self,
+        read_ast: ast.AST,
+        dummy_list: List,
+        arrays_to_add: List
+    ) -> None:
+        """
+        This method adjusts the loop variables used in the read function based
+        on which arrays and scalars are required. If no iteration is needed,
+        the loop is removed entirely.
+
+        Parameters
+        ----------
+        read_ast : ast.AST
+            AST of the read function.
+        dummy_list : List
+            Original list of dummy variables used for iteration.
+        arrays_to_add : List
+            Array variables that influence loop construction.
+
+        Raises
+        ------
+        ValueError
+            If no loop node is found in the AST.
+        """
+        
+        for_node = next(iter(ast_walk(read_ast, ast.For)), None)
+        if for_node is None:
+            raise ValueError("for_node is None")
+
+        table = self.scalar + arrays_to_add if arrays_to_add else self.scalar
+        difference = [x for x in dummy_list if x not in table]
+
+        if difference:
+            for_node.iter.elts = [
+                ast.Name(id=v, ctx=ast.Load()) for v in difference
+            ]
+        else:
+            read_ast.body = [
+                n for n in read_ast.body if not isinstance(n, ast.For)
+            ]
+    
+    def _add_return_if_needed(
+        self,
+        read_ast: ast.AST,
+        seen: Dict,
+        scalar_nodes: List
+    ) -> None:
+        """
+        This method determines whether the generated read function should
+        return scalar values or tuples of scalars. It skips return insertion
+        when operating in `self` context or when no scalar nodes exist.
+
+        Parameters
+        ----------
+        read_ast : ast.AST
+            AST of the read function being constructed.
+        seen : Dict
+            Tracking structure containing injected argument names.
+        scalar_nodes : List
+            List of scalar AST nodes used to determine return structure.
+        """
+        if not scalar_nodes:
+            return
+
+        # If operating on self -> no return needed
+        if "self" in seen["names"]:
+            return
+
+        return_node = ast.Return()
+
+        values = [
+            ast.Name(id=s, ctx=ast.Load())
+            for s in self.scalar
+        ]
+
+        if len(values) == 1:
+            return_node.value = values[0]
+        else:
+            return_node.value = ast.Tuple(elts=values, ctx=ast.Load())
+
+        read_ast.body.append(return_node)
+
+    def update_main_python(self,out_module: ast.Module, subroutine_key: str) -> ast.Module:
+        """
+        Construct and populate the main execution Python AST.
+
+        This method builds a complete executable script by assembling imports,
+        class instances, variable declarations, input-reading logic, function
+        calls, and optional test execution into a unified `main()` function.
+
+        Parameters
+        ----------
+        out_module : ast.Module
+            The AST module containing the output/global definitions used
+            for constructing the main script.
+        subroutine_key : str
+            Identifier for the target subroutine used to retrieve variable
+            specifications and function mappings.
+
+        Returns
+        -------
+        ast.Module
+            A fully constructed and populated AST module representing the
+            executable Python script. Returns None if construction fails.
+
+        Raises
+        ------
+        ValueError
+            If required components (main template, AST nodes, class info,
+            or function mappings) are missing or invalid.
+
+        """
         self.global_state = False 
         try:
             
+            # 1. Load main template and locate main()
             out_main_template = self.out_main_python()
+            if out_main_template is None:
+                raise ValueError("Main template is None")
 
             self.retreive_variable_order()
-            main_function_def = [function for function in ast_walk(out_main_template,ast.FunctionDef) if function.name == "main"]
-            if main_function_def:
-                main_function_def = main_function_def[-1]
-            else:
-                raise ValueError('main function is not present inside the out_main_template')
-            
-            idx = len(main_function_def.body)  # THis means that the idx represents internal counter when we add elements inside a function itself
-            # In this case it will be inside the main()
+
+            main_function = next(
+                (f for f in ast_walk(out_main_template, ast.FunctionDef) if f.name == "main"),
+                None
+            )
+            if main_function is None:
+                raise ValueError("main() not found")
             
             call_stmts = [] # Keeps the call statements of all the function
             function_stmts = [] # Keeps the all the functions ast in the order that they were created 
-            
-            # We will use the same approach used in the processor.update_main_program to add the elements onto the main function
-            # 1. Create the global instance and then add them
+
+            # 2. Extract class info (imports + instances)
+            idx = len(main_function.body)  
+
             main_cls_info, import_nodes, instance_nodes = self.create_cls_info(out_module,subroutine_key = subroutine_key)
             if not all((main_cls_info,import_nodes,instance_nodes)):
                 raise ValueError(f'ONe of these three elements is None:cls_info,import_nodes,instance_nodes')
@@ -3107,11 +5325,14 @@ ffile = FortranFile(path, 'r')
             for import_node in import_nodes:
                 self.insert_at(idx = None,ast_node=import_node,python_template=out_main_template,method_name=None)
             
-            # 2. Now we add the dummy arg variables onto the main function on which 
+            # Since we add the global instance first since the following variables could depend on this global instance
+            for instance_node in instance_nodes:
+                self.add_instance(idx,instance_node,main_cls_info,main_function,["declaration_initialization"])
+
+            # 3. Convert declaration statements -> AST nodes
             declaration_stmts = [[elements] for elements in self.extractor.var_dummy[subroutine_key]]
                     
-            ast_nodes = self.convert_SPECIFICATION_PART(declaration_stmts,fix_loc=True,cls_mode=False) # THis turns ast_nodes that contains
-            # Assign statemetn and procedure statement(use, which appear as specification part in fortran) and we need to separate them into assign_nodes and precodure_nodes.
+            ast_nodes = self.convert_SPECIFICATION_PART(declaration_stmts,fix_loc=True,cls_mode=False) 
             if ast_nodes is None:
                 raise ValueError(f'Ast_nodes is None')
             
@@ -3128,49 +5349,34 @@ ffile = FortranFile(path, 'r')
             if procedure_nodes:
                 for procedure_node in procedure_nodes:
                     self.insert_at(None,procedure_node,out_main_template)
-
-            # Since we add the global instance first since the following variables could depend on this global instance
-            for instance_node in instance_nodes:
-                self.add_instance(idx,instance_node,main_cls_info,main_function_def,["declaration_initialization"])
-                
-            idx = len(main_function_def.body)
-            self.insert_all_assign_nodes(assign_nodes,main_function_def,method_name="main",class_name=list(main_cls_info)[-1],method="declaration_initialization")
-                        
-            # We need to then see if these variables have any dependencies of the global instance, and replace them if necessary 
-            identify_replace_all(main_function_def.body,main_cls_info) # THis function allows us to identify and replace them recursivly. 
-            idx = len(main_function_def.body) 
             
-            # 3. Now we need to get the read template for these declared variables within the main function perhaps add a dummy only in the case if the input is present
-            read_dummy_ast = self.prepare_read_code_for_main_template(assign_nodes,subroutine_key=subroutine_key) # THis will create the read_dummy function in Python AST
+            # 4. Insert assignments (dependency-aware)
+            idx = len(main_function.body)
+            self.insert_all_assign_nodes(assign_nodes,main_function,method_name="main",class_name=list(main_cls_info)[-1],method="declaration_initialization")
+                        
+            # Resolve references to global instances
+            identify_replace_all(main_function.body,main_cls_info) # THis function allows us to identify and replace them recursivly. 
+
+            # 5. Build read + execution calls
+            idx = len(main_function.body) 
+            read_dummy_ast = self.prepare_read_code_for_main_template(assign_nodes,subroutine_key=subroutine_key) 
             read_dummy_ast_call_stmt = self.create_call_statements(read_dummy_ast)
             if read_dummy_ast_call_stmt is None:
                 raise ValueError(f'Read_ast_call_stmt is None')
             
-            call_stmts.append(read_dummy_ast_call_stmt) # This will keep in the current order the list of call statements
+            call_stmts.append(read_dummy_ast_call_stmt)
             function_stmts.append(read_dummy_ast)
                     
             # We need to search among that of the Global module the function itself,
-            function_def = None
-            instance_key = None
-            for _, module_content in main_cls_info.items():
-                # Search for the inner dict that contains 'methods'
-                for inst_key, instance_val in module_content.items():
-                    instance_key = inst_key
-                    if isinstance(instance_val, dict) and 'methods' in instance_val:
-                        methods_dict = instance_val['methods']
-                        function_def = methods_dict.get(subroutine_key)
-                        if not function_def:
-                            raise ValueError(f'Function {subroutine_key} is not present among the methods of the GLOBAL module')
-
+            instance_key, function_def = self._find_function_in_cls_info(main_cls_info, subroutine_key=subroutine_key)
             function_def_call_stmt = self.create_call_statements(function_def,instance=instance_key)
             if function_def_call_stmt is None:
                 raise ValueError(f'Function defintions call statement is None')          
             call_stmts.append(function_def_call_stmt)
             
-            # Try to first find if the subroutines still has the benchmark
+            # 6. Create test function
             if os.path.exists(os.path.join(self.benchmark_dir,subroutine_key,'output.bin')):
-                test_subroutine_function = self.create_test_function(main_cls_info,subroutine_key=subroutine_key) # This will create the TEST function to test the output of Python to that of 
-                # the FORTRAN ouptut
+                test_subroutine_function = self.create_test_function(main_cls_info,subroutine_key=subroutine_key) 
                 if test_subroutine_function is None:
                     raise ValueError(f'TEST subroutine {subroutine_key} is None')
                 
@@ -3180,38 +5386,89 @@ ffile = FortranFile(path, 'r')
                 call_stmts.append(test_subroutine_function_call_stmt)
                 function_stmts.append(test_subroutine_function)
                 
-            # 7. Now we can add the call onto the main function
+            # 7. Insert calls into main()
             for call_stmt in call_stmts:
                 if isinstance(call_stmt,ast.AST):
-                    self.insert_at(idx,call_stmt,main_function_def,"main")
+                    self.insert_at(idx,call_stmt,main_function,"main")
                     idx+= 1
                 else:
-                    main_function_def.body.extend(call_stmt)
+                    main_function.body.extend(call_stmt)
                     idx += len(call_stmt)
             
-            # 8. Now we add the functions created onto the main file python AST
+            # 8. Now we add the functions into the class module
             for functions in function_stmts:
                 self.insert_at(None,functions,out_main_template)
             
-            # print(ast.unparse(ast.fix_missing_locations(out_main_template)))
             return ast.fix_missing_locations(out_main_template)
         
         except Exception as e:
             self.logger.exception(f'Exception error in update_main_python', e)
             return None
     
-    def process_procedures(self,subroutine_key, subroutine_to_stack_index,module_stacks,cls_info,main_file_attributes):
+    def _find_function_in_cls_info(self, cls_info: Dict, subroutine_key: str) -> Tuple:
+        """
+        Locate a function definition inside class instance metadata.
+
+        Searches through nested class-instance mappings to find a function
+        associated with the given subroutine key.
+        """
+        for _, module_content in cls_info.items():
+            for instance_name, instance_data in module_content.items():
+                methods = instance_data.get("methods", {})
+                if subroutine_key in methods:
+                    return instance_name, methods[subroutine_key]
+
+        raise ValueError(f"{subroutine_key} not found in cls_info")
+    
+    def _process_procedures(
+        self,
+        subroutine_key: str,
+        subroutine_to_stack_index: Dict,
+        module_stacks: List,
+        cls_info: Dict,
+        main_file_attributes: List
+    ) -> None:
+        """
+        Recursively process and correct procedure subroutines in dependency order.
+        It recursively traverses the call graph, corrects function signatures/usage, 
+        and applies class-level reference replacements.
+
+        Parameters
+        ----------
+        subroutine_key : str
+            Identifier of the subroutine to process.
+        subroutine_to_stack_index : Dict
+            Mapping from subroutine names to their corresponding module stack index.
+        module_stacks : List
+            List of AST module stacks corresponding to subroutines.
+        cls_info : Dict
+            Class/instance metadata used for resolving references and corrections.
+        main_file_attributes : List
+            List of attributes available in the main file for dependency resolution.
+
+        """
         # First, process all sub-subroutines if any
         for child_key in self.extractor.call_within_sub.get(subroutine_key, []):
-            self.process_procedures(child_key, subroutine_to_stack_index,module_stacks,cls_info,main_file_attributes)  # recurse for nested calls
+            self._process_procedures(child_key, subroutine_to_stack_index,module_stacks,cls_info,main_file_attributes)  # recurse for nested calls
 
         # Then process the current subroutine
         module_stack_index = subroutine_to_stack_index[subroutine_key]
-        self.correct_function(module_stacks[module_stack_index], cls_info, subroutine_key,main_file_attributes=main_file_attributes)
-        identify_replace_all(module_stacks[module_stack_index].body,cls_info)
+        self.correct_function(module_stacks[module_stack_index], cls_info, subroutine_key, main_file_attributes=main_file_attributes)
+        identify_replace_all(module_stacks[module_stack_index].body, cls_info, self.extractor.var_local_names[subroutine_key])
         
-    def run_python_scripts(self, base_dir:str,target_dir:str, mode:Literal['CPU','GPU'] = 'CPU'):
+    def run_python_scripts(self, base_dir: str,target_dir: str, mode: Literal['CPU','GPU'] = 'CPU') -> None:
+        """
+        Validate and execute generated Python scripts with dependency checks.
 
+        Parameters
+        ----------
+        base_dir : str
+            Root directory containing generated modules.
+        target_dir : str
+            Specific module directory to execute.
+        mode : {'CPU', 'GPU'}, optional
+            Execution mode (currently informational; defaults to 'CPU').
+        """
         if not os.path.isdir(target_dir):
             self.logger.error(f"Target module directory '{target_dir}' not found.")
 
@@ -3223,14 +5480,15 @@ ffile = FortranFile(path, 'r')
         
         self.logger.info(f"Processing module: {subdir_path}")
         # Python file checks
-        main_file = os.path.join(subdir_path, 'main.py')
-        global_module_file = os.path.join(subdir_path, 'module_global.py')
+        executable_name = os.path.basename(target_dir.rstrip('/'))
+        main_file = os.path.join(subdir_path, f'main_{executable_name}.py')
+        global_module_file = os.path.join(subdir_path, f'global_module_{executable_name}.py')
 
         missing_files = []
         if not os.path.exists(main_file):
-            missing_files.append('main.py')
+            missing_files.append(f'main_{executable_name}.py')
         if not os.path.exists(global_module_file):
-            missing_files.append('module_global.py')
+            missing_files.append(f'global_module_{executable_name}.py')
         
         if missing_files:
             self.logger.warning(f"Missing files in '{subdir}': {', '.join(missing_files)}")
@@ -3259,6 +5517,6 @@ ffile = FortranFile(path, 'r')
             result = subprocess.run(['python3', main_file], check=True, capture_output=True, text=True)
             self.logger.info(f"Execution output for '{subdir}':\n{result.stdout}")
         except subprocess.CalledProcessError as e:
-            self.logger.error(f"Error running main.py for '{subdir}': ", e.stderr)
+            self.logger.error(f"Error running main_{executable_name}.py for '{subdir}': ", e.stderr)
             return 
         
