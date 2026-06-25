@@ -31,7 +31,7 @@ FFLAGS_COMMON = -Wall -g -O0 -Kieee -Ktrap=fp -Mbounds -traceback
 FFLAGS_CPU    = $(FFLAGS_COMMON) -r8 -i4
 FFLAGS_GPU    = $(FFLAGS_COMMON) -r8 -i4 -acc -gpu=cc80
 
-# C flags 
+# C flags
 CFLAGS_COMMON = -Wall -g -O0 -Kieee -Ktrap=fp -traceback -DUNDERSCORE
 CFLAGS_CPU    = $(CFLAGS_COMMON)
 CFLAGS_GPU    = $(CFLAGS_COMMON) -acc -gpu=cc80
@@ -71,7 +71,7 @@ ifdef AUTO_DIFF
 else
   $(info ⚙️  Automatic differentiation disabled)
   TAPENADE_OBJ =
-  TAPENADE_SRC =  
+  TAPENADE_SRC =
 endif
 
 ALL_OBJ = $(MODULE_OBJ) $(OTHER_OBJ) $(MAIN_OBJ) $(TAPENADE_OBJ)
