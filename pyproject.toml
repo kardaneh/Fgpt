@@ -1,0 +1,112 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "fgpt"
+version = "0.1.0"
+description = "FGPT: Fortran-to-Python transpiler and JAX/Equinox converter for scientific codebases"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [
+    {name = "Kazem Ardaneh",       email = "kardaneh@ipsl.fr"},
+    {name = "Shivamshan Sivanesan", email = "ssivanesan@ipsl.fr"},
+]
+license = {file = "LICENSE"}
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Intended Audience :: Developers",
+    "License :: Other/Proprietary License",          # CC BY-NC-SA 4.0 is not OSI
+    "Programming Language :: Python",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Topic :: Scientific/Engineering",
+    "Topic :: Software Development :: Compilers",    # transpiler
+    "Typing :: Typed",
+    "Operating System :: POSIX",
+    "Operating System :: Unix",
+]
+dependencies = [
+    "numpy>=1.24.0",
+    "fparser",
+    "pyyaml>=6.0",
+    "rich>=13.0.0",
+    "jax>=0.4.0",
+    "jaxlib>=0.4.0",
+    "equinox>=0.11.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-cov>=4.1.0",
+    "pre-commit>=3.5.0",
+    "ruff>=0.4.0",
+]
+docs = [
+    "sphinx>=7.3,<8.0",
+    "myst-parser>=3.0.1,<4.0",
+    "docutils>=0.18,<0.21",
+    "sphinx-rtd-theme>=3.1.0",
+    "sphinx-copybutton>=0.5.0",
+    "sphinx-autodoc-typehints>=1.24.0",
+    "sphinx-autosummary-accessors>=0.1.0",
+]
+notebooks = [
+    "jupyter>=1.0.0",
+    "ipykernel>=6.0.0",
+    "matplotlib>=3.7.0",
+]
+
+[project.scripts]
+fgpt = "fgpt.cli:main"
+
+[project.urls]
+Source      = "https://github.com/kardaneh/IPSL-Fgpt.git"
+Issues      = "https://github.com/kardaneh/IPSL-Fgpt/issues"
+# Documentation = "https://fgpt.readthedocs.io"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/fgpt"]
+
+[tool.hatch.build]
+include = [
+    "src/fgpt/**/*",
+    "LICENSE",
+    "README.md",
+    "template.yaml",      # needed at runtime by AutoDiff
+]
+
+# tells pytest to only look in tests/ folder
+# without this pytest searches everywhere, slow
+[tool.pytest.ini_options]
+testpaths    = ["tests"]
+addopts      = "-v --tb=short"
+filterwarnings = [
+    "ignore::DeprecationWarning",
+]
+
+[tool.ruff]
+src            = ["src"]
+line-length    = 88
+target-version = "py310"
+exclude        = [
+    "notebooks/",
+    ".venv/",
+    "__pycache__",
+]
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort
+    "UP",  # pyupgrade
+]
+ignore = [
+    "E501",  # line too long — handled by formatter
+]

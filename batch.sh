@@ -12,4 +12,3 @@
 #SBATCH --out=jobMPI.out
 source arch.env
 mpirun -np 1 ./hydrol/hydrol_soil/hydrol_soil
-
