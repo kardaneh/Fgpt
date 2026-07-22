@@ -2,7 +2,10 @@ import ast
 
 import pytest
 
-from fgpt.intrinsic import intrinsic_signatures, normalize_intrinsic_call
+from fgpt.core.transpiler.intrinsic import (
+    intrinsic_signatures,
+    normalize_intrinsic_call,
+)
 
 
 class TestIntrinsic:

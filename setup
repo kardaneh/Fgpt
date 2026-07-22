@@ -3,8 +3,18 @@
 DATE=$(date +"%Y%m%d")
 TODAY=$(date +"%Y%m%d_%H%M%S")
 
+# Choose which fgpt subcommand this setup should drive.
+#   "isolator" -> fgpt isolate  ... (Stages 1 & 2)
+#   "autodiff" -> fgpt autodiff ... (Stage 3)
+COMMAND="isolator"
+
+# How to invoke the CLI. If fgpt is installed (pip install -e .) and
+# exposes a console entry point, "fgpt" works directly. Otherwise use:
+#   FGPT_CMD="python -m fgpt.cli"
+FGPT_CMD="fgpt"
+
 # Path configuration
-WORK_DIR="$works"  # Using environment variable
+WORK_DIR="$work"  # Using environment variable
 REST_OF_PATH="modipsl_truck_opt/modeles/ORCHIDEE/src_sechiba/"
 #TARGET_MODULE="albedo_surface" #"condveg"
 TARGET_MODULE="hydrol"
@@ -18,22 +28,31 @@ TARGET_SUBROUTINES="hydrol_alma hydrol_vegupd hydrol_canop hydrol_flood hydrol_h
 # Isolation options
 OPENACC="False"
 F2PY="True"
-TAPENADE="Flase"
+TAPENADE="False"
+PY2JX="True"
+
+# Autodiff configuration
+CONFIG_PATH="template.yaml"
+CLASS_FILE="hydrol/hydrol_vegupd/global_module_hydrol_vegupd.py"
+MAIN_FILE="hydrol/hydrol_vegupd/main_hydrol_vegupd.py"
+MODE="jax"
+BENCHMARK_DIR="benchmark"
+VECTORIZE="kjpindex"
 
 # Script Generation
-run_script="run_isolator.sh"
+run_script="run_${COMMAND}.sh"
 
-# Run Script
-cat > $run_script <<EOF
+
+if [[ "$COMMAND" == "isolator" ]]; then
+cat > "$run_script" <<EOF
 #!/usr/bin/env bash
 echo "Starting isolation: $TODAY"
 echo "Target module: $TARGET_MODULE"
 echo "Parent subroutine: $PARENT_SUBROUTINE"
 echo "Target subroutines: $TARGET_SUBROUTINES"
-echo "OpenACC: $OPENACC, F2PY: $F2PY, Tapenade: $TAPENADE"
+echo "OpenACC: $OPENACC, F2PY: $F2PY, Tapenade: $TAPENADE", PY2JX: $PY2JX
 echo "=========================================="
-
-python isolator.py \\
+$FGPT_CMD isolate \\
     --work "$WORK_DIR" \\
     --rest_of_path "$REST_OF_PATH" \\
     --target_module "$TARGET_MODULE" \\
@@ -41,27 +60,68 @@ python isolator.py \\
     --target_subroutines $TARGET_SUBROUTINES \\
     --openacc "$OPENACC" \\
     --f2py "$F2PY" \\
-    --tapenade "$TAPENADE"
+    --tapenade "$TAPENADE" \\
+    --py2jx "$PY2JX" \\
+    --config_path "$CONFIG_PATH" \\
+    --vectorize $VECTORIZE \\
+    --mode "$MODE" \\
+    --benchmark_dir "$BENCHMARK_DIR" \\
 
 echo "=========================================="
 echo "Isolation completed: \$(date)"
 EOF
 
-chmod +x $run_script
+elif [[ "$COMMAND" == "autodiff" ]]; then
+BENCHMARK_ARG=""
+if [[ -n "$BENCHMARK_DIR" ]]; then
+    BENCHMARK_ARG="--benchmark_dir \"$BENCHMARK_DIR\""
+fi
 
-# Output Summary
-echo "=== Isolator Setup Complete ==="
-echo "Target Module: $TARGET_MODULE"
-echo "Source Path: $REST_OF_PATH"
-echo "Work Directory: $WORK_DIR"
-echo "Parent Subroutine: $PARENT_SUBROUTINE"
-echo "Target Subroutines: $TARGET_SUBROUTINES"
-echo "Features - OpenACC: $OPENACC, F2PY: $F2PY, Tapenade: $TAPENADE"
+cat > "$run_script" <<EOF
+#!/usr/bin/env bash
+echo "Starting autodiff transform: $TODAY"
+echo "Config: $CONFIG_PATH"
+echo "Class file: $CLASS_FILE"
+echo "Main file: $MAIN_FILE"
+echo "Mode: $MODE"
+echo "Vectorize: $VECTORIZE"
+echo "=========================================="
+$FGPT_CMD autodiff \\
+    --config_path "$CONFIG_PATH" \\
+    --class_file "$CLASS_FILE" \\
+    --main_file "$MAIN_FILE" \\
+    --mode "$MODE" \\
+    --vectorize $VECTORIZE \\
+    $BENCHMARK_ARG
+echo "=========================================="
+echo "Autodiff completed: \$(date)"
+EOF
+
+else
+    echo "Unknown COMMAND: $COMMAND (expected 'isolator' or 'autodiff')" >&2
+    exit 1
+fi
+
+chmod +x "$run_script"
+
+echo "=== fgpt Setup Complete ($COMMAND) ==="
+if [[ "$COMMAND" == "isolator" ]]; then
+    echo "Target Module: $TARGET_MODULE"
+    echo "Source Path: $REST_OF_PATH"
+    echo "Work Directory: $WORK_DIR"
+    echo "Parent Subroutine: $PARENT_SUBROUTINE"
+    echo "Target Subroutines: $TARGET_SUBROUTINES"
+    echo "Features - OpenACC: $OPENACC, F2PY: $F2PY, Tapenade: $TAPENADE, PY2JX: $PY2JX"
+else
+    echo "Config Path: $CONFIG_PATH"
+    echo "Class File: $CLASS_FILE"
+    echo "Main File: $MAIN_FILE"
+    echo "Mode: $MODE"
+    echo "Vectorize: $VECTORIZE"
+    [[ -n "$BENCHMARK_DIR" ]] && echo "Benchmark Dir: $BENCHMARK_DIR"
+fi
 echo ""
 echo "Run script generated: ./$run_script"
 echo ""
 echo "To execute:"
 echo "  ./$run_script"
-echo ""
-echo "Or run directly with:"
-echo "  python isolator.py --rest_of_path \"$REST_OF_PATH\" --target_module \"$TARGET_MODULE\" --work \"$WORK_DIR\" --parent_subroutine \"$PARENT_SUBROUTINE\" --target_subroutines $TARGET_SUBROUTINES --openacc \"$OPENACC\" --f2py \"$F2PY\" --tapenade \"$TAPENADE\""

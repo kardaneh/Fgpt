@@ -1,3 +1,11 @@
+# Copyright 2026 IPSL / CNRS / Sorbonne University
+# Authors: Shivamshan Sivanesan, Kazem Ardaneh
+#
+# This work is licensed under the Creative Commons
+# Attribution-NonCommercial-ShareAlike 4.0 International License.
+# To view a copy of this license, visit
+# http://creativecommons.org/licenses/by-nc-sa/4.0/
+
 import argparse
 import os
 import shutil
@@ -6,10 +14,11 @@ from collections import defaultdict, deque
 from fparser.two import Fortran2003 as F23
 from fparser.two.utils import walk
 
-from fgpt.extractor import Extractor
-from fgpt.logger import Logger
-from fgpt.processor import Processor
-from fgpt.transformer import Transformer
+from fgpt.autodiff import AutoDiff
+from fgpt.core.common.logger import Logger
+from fgpt.core.frontend.extractor import Extractor
+from fgpt.core.frontend.processor import Processor
+from fgpt.core.transpiler.transformer import Transformer
 
 
 class Isolator:
@@ -22,8 +31,8 @@ class Isolator:
     - Simplified transformation, such as source-to-source translation (e.g., to Python)
     - Generating standalone reproducible test cases from large code bases
 
-    Functionality:
-    --------------
+    Functionality
+    -------------
     - Identifies and loads the specified Fortran module (`target_module`)
     - Parses the source file into an abstract syntax tree (AST) using `fparser`
     - Stores both original and parsed versions of the module
@@ -38,6 +47,14 @@ class Isolator:
         The name of the module to be isolated (without `.f90`).
     work : str
         The working directory root (typically an environment variable like `$works`).
+    openacc: bool, optional
+        If we want to use GPU for fortran acceleration(default to False).
+    tapenade: bool, optional
+        Auto differencitation in Fortran using TAPENADE
+    f2np: bool, optional
+        Fortran to NumPy transformation
+    py2jx: bool, optional
+        Python to JAX transformation
 
     Attributes
     ----------
@@ -65,12 +82,13 @@ class Isolator:
 
     def __init__(
         self,
-        rest_of_path="modipsl_truck_opt/modeles/ORCHIDEE/src_sechiba/",
-        target_module="hydrol",
-        work=os.getenv("works"),
-        openacc=False,
-        tapenade=False,
-        f2py=False,
+        rest_of_path: str = "modipsl_truck_opt/modeles/ORCHIDEE/src_sechiba/",
+        target_module: str = "hydrol",
+        work: str = os.getenv("works"),
+        openacc: bool = False,
+        tapenade: bool = False,
+        f2py: bool = False,
+        py2jx: bool = False,
     ):
         self.logger = Logger(console_output=True, file_output=True, record=True)
         self.logger.show_header("Isolator")
@@ -97,6 +115,7 @@ class Isolator:
         self.openacc = openacc
         self.f2py = f2py
         self.tapenade = tapenade
+        self.py2jx = py2jx
         self.working_subroutines = defaultdict()
         self.isolated_subroutines = set()
 
@@ -104,12 +123,45 @@ class Isolator:
             self.isolate_procedure
         )
 
-    def create_target_directory(self):
+    def create_target_directory(self) -> None:
+        """
+        (Re)create the output directory for the isolated module.
+
+        If :attr:`target_module_dir` already exists, it is removed with
+        :func:`shutil.rmtree` and recreated empty via :func:`os.makedirs`.
+        Called once at the start of :meth:`run` before any procedure is
+        isolated.
+
+        Returns
+        -------
+        None
+        """
         if os.path.exists(self.target_module_dir):
             shutil.rmtree(self.target_module_dir)
         os.makedirs(self.target_module_dir)
 
-    def collect_all_subroutines(self, cls, prodecure_key):
+    def collect_all_subroutines(self, cls: Extractor, prodecure_key: str) -> set[str]:
+        """
+        Collect the transitive closure of subroutines called from a given procedure.
+
+        Performs a breadth-first traversal of ``cls.call_within_sub`` starting
+        at *prodecure_key*, following nested calls until no new procedures are
+        discovered.
+
+        Parameters
+        ----------
+        cls : Extractor
+            The :class:`~fgpt.extractor.Extractor` instance holding the
+            ``call_within_sub`` mapping of procedure name to its callees.
+        prodecure_key : str
+            Name of the procedure to start the traversal from.
+
+        Returns
+        -------
+        set of str
+            All procedure names reachable from *prodecure_key*, including
+            *prodecure_key* itself.
+        """
         collected = set()
         queue = deque([prodecure_key])
 
@@ -124,8 +176,76 @@ class Isolator:
         return collected
 
     def isolate_procedure(
-        self, cls, parent_procedure, child_procedure, transformer=None
-    ):
+        self,
+        cls: Extractor,
+        parent_procedure: str,
+        child_procedure: str,
+        transformer: Transformer = None,
+        autodiff: AutoDiff = None,
+    ) -> None:
+        """
+        Extract, isolate, and (optionally) transpile a single Fortran procedure.
+
+        Recursively isolates *child_procedure* (and any procedures it calls)
+        so it can be compiled and run independently of *parent_procedure*.
+        This includes resolving global/dummy variable declarations via
+        :class:`~fgpt.extractor.Extractor`, writing a standalone subroutine
+        directory under :attr:`target_module_dir`, generating a driver
+        program, compiling it with :meth:`Processor.compile_and_run
+        <fgpt.processor.Processor.compile_and_run>`, and writing the
+        transformed Fortran back to its source module via
+        :meth:`Processor.write_fortran_code_to_file
+        <fgpt.processor.Processor.write_fortran_code_to_file>`.
+
+        If *transformer* is provided, the isolated module and driver are also
+        transpiled to Python via :meth:`Transformer.update_global_python
+        <fgpt.transformer.Transformer.update_global_python>` and
+        :meth:`Transformer.update_main_python
+        <fgpt.transformer.Transformer.update_main_python>`.
+
+        This method is wrapped with :meth:`Logger.log_event
+        <fgpt.logger.Logger.log_event>` in :meth:`__init__` to record timing
+        and status under the "Isolated Procedure" event name.
+
+        Parameters
+        ----------
+        cls : Extractor
+            The :class:`~fgpt.extractor.Extractor` instance used to resolve
+            variable declarations, call sites, and module paths.
+        parent_procedure : str
+            Name of the procedure that calls *child_procedure*.
+        child_procedure : str
+            Name of the procedure to isolate.
+        transformer : Transformer, optional
+            If given, also transpile the isolated procedure to Python via
+            :class:`~fgpt.transformer.Transformer`. If ``None`` (default),
+            only the Fortran isolation is performed.
+
+        Returns
+        -------
+        None
+
+        Raises
+        ------
+        ValueError
+            If *child_procedure*'s AST node is neither a
+            :class:`fparser.two.Fortran2003.Subroutine_Subprogram` nor a
+            :class:`fparser.two.Fortran2003.Function_Subprogram`, or if the
+            resolved procedure type is otherwise unsupported.
+        AssertionError
+            If :attr:`Processor.benchmark_dir
+            <fgpt.processor.Processor.benchmark_dir>` does not exist, if
+            compilation fails (non-zero status from
+            :meth:`Processor.compile_and_run
+            <fgpt.processor.Processor.compile_and_run>`), or if the resolved
+            module name is not present in ``cls.module_path``.
+
+        Notes
+        -----
+        Calls itself recursively for each nested procedure discovered in
+        ``cls.call_within_sub[child_procedure]`` that is not already present
+        in :attr:`isolated_subroutines`.
+        """
         call_statements = cls.call_within_sub[parent_procedure][child_procedure]
 
         for i, call_stmt in enumerate(call_statements):
@@ -214,6 +334,7 @@ class Isolator:
                         child_procedure,
                         grand_child_procedure,
                         transformer=transformer,
+                        autodiff=autodiff,
                     )
                     self.collect_global_vars_decl(
                         cls.dec_global[grand_child_procedure],
@@ -335,6 +456,13 @@ class Isolator:
         if transformer is not None:
             transformer.run_python_scripts(os.getcwd(), subroutine_dir)
 
+        if autodiff:
+            self.logger.info(f"Transforming Python to JAX in mode: {autodiff.mode}")
+            autodiff.transform(
+                class_file=out_module, main_file=main_tree, routine_dir=subroutine_dir
+            )
+            autodiff.run_python_scripts(base_dir=os.getcwd(), target_dir=subroutine_dir)
+
         write_module_tree = procedure_tree.get_root()
         write_module_name = (
             walk(write_module_tree, F23.Module_Stmt)[0].children[1].tostr()
@@ -359,14 +487,63 @@ class Isolator:
         )
         self.isolated_subroutines.add(child_procedure)
 
-    def collect_global_vars_decl(self, in_dict, out_dict):
+    def collect_global_vars_decl(self, in_dict: dict, out_dict: dict) -> None:
+        """
+        Merge global variable declarations from a child scope into a parent scope.
+
+        For every key in *in_dict* not already present in *out_dict*, copies
+        the value over. Used in :meth:`isolate_procedure` to propagate a
+        nested procedure's global declarations up to its caller.
+
+        Parameters
+        ----------
+        in_dict : dict
+            Source mapping of declaration name to declaration value (e.g.
+            ``cls.dec_global[child_procedure]``).
+        out_dict : dict
+            Destination mapping to update in place (e.g.
+            ``cls.dec_global[parent_procedure]``).
+
+        Returns
+        -------
+        None
+        """
         for child_key, child_value in in_dict.items():
             if child_key not in out_dict:
                 out_dict[child_key] = child_value
 
     def process_subroutines(
-        self, parent_subroutine="hydrol_main", target_subroutines=["hydrol_soil"]
-    ):
+        self,
+        benchmark_dir: str,
+        config_path: str,
+        vectorize: list[str],
+        mode: str = "jax",
+        parent_subroutine: str = "hydrol_main",
+        target_subroutines: list[str] = ["hydrol_soil"],
+    ) -> None:
+        """
+        Isolate a list of target subroutines from a given parent subroutine.
+
+        Builds an :class:`~fgpt.extractor.Extractor` for :attr:`target_module`,
+        locates all subroutines via :meth:`Extractor.find_subroutines
+        <fgpt.extractor.Extractor.find_subroutines>`, optionally constructs a
+        :class:`~fgpt.transformer.Transformer` when :attr:`f2py` is enabled,
+        and calls :meth:`isolate_procedure` once per entry in
+        *target_subroutines*.
+
+        Parameters
+        ----------
+        parent_subroutine : str, optional
+            Name of the subroutine that calls each of *target_subroutines*.
+            Default is ``"hydrol_main"``.
+        target_subroutines : list of str, optional
+            Names of the subroutines to isolate. Default is
+            ``["hydrol_soil"]``.
+
+        Returns
+        -------
+        None
+        """
         self.logger.start_task(
             "Procedure Isolation/Transformation/Automatic Differentiation",
             description="Isolation, Transformation, and Automatic Differentiation of procedures through FGPT",
@@ -383,36 +560,107 @@ class Isolator:
                 "Initializing Transformer for Python conversion using f2np..."
             )
             transpy = Transformer(
-                "benchmark",
-                self,
-                cls,
-                None,
-                config_path="template.yaml",
+                benchmark_dir if benchmark_dir else "benchmark",
+                isolator=self,
+                extractor=cls,
+                ignore_case=None,
+                config_path=config_path,
                 logger=self.logger,
             )
         else:
             self.logger.info("Skipping Transformer initialization as f2np is disabled.")
             transpy = None
 
+        if self.py2jx:
+            self.logger.info(
+                f"Initializing Python for JAX conversion using mode: {mode}"
+            )
+            autodiff = AutoDiff(
+                config_path=config_path,
+                vectorize=vectorize,
+                benchmark_dir=benchmark_dir,
+                mode=mode,
+                logger=self.logger,
+            )
+        else:
+            self.logger.info(
+                "Skipping Python to JAX initialization as py2jx is disabled."
+            )
+            autodiff = None
+
         for child_procedure in target_subroutines:
             self.logger.info(
                 f"  Isolating target subroutine: '{child_procedure}' (called from '{parent_subroutine}')"
             )
             self.isolate_procedure(
-                cls, parent_subroutine, child_procedure, transformer=transpy
+                cls,
+                parent_subroutine,
+                child_procedure,
+                transformer=transpy,
+                autodiff=autodiff,
             )
 
-    def run(self, parent_subroutine="hydrol_main", target_subroutines=None):
+    def run(
+        self,
+        benchmark_dir: str,
+        config_path: str,
+        vectorize: list[str],
+        mode: str = "jax",
+        parent_subroutine: str = "hydrol_main",
+        target_subroutines: list[str] = None,
+    ) -> None:
+        """
+        Entry point for the isolation workflow.
+
+        Recreates :attr:`target_module_dir` via :meth:`create_target_directory`,
+        then isolates each subroutine in *target_subroutines* via
+        :meth:`process_subroutines`.
+
+        Parameters
+        ----------
+        parent_subroutine : str, optional
+            Name of the parent subroutine containing the targets. Default is
+            ``"hydrol_main"``.
+        target_subroutines : list of str, optional
+            Names of the subroutines to isolate. If ``None``, all defaults
+            configured in :meth:`process_subroutines` are used.
+
+        Returns
+        -------
+        None
+        """
         self.logger.info(
             f"Starting isolation for target subroutines: {target_subroutines} from parent subroutine: {parent_subroutine}"
         )
         self.create_target_directory()
         self.process_subroutines(
-            parent_subroutine=parent_subroutine, target_subroutines=target_subroutines
+            benchmark_dir=benchmark_dir,
+            config_path=config_path,
+            vectorize=vectorize,
+            mode=mode,
+            parent_subroutine=parent_subroutine,
+            target_subroutines=target_subroutines,
         )
 
 
 def parse_args():
+    """
+    Parse command-line arguments for standalone execution of this module.
+
+    Defines the CLI options consumed by :class:`Isolator` when this file
+    is run directly (``python -m fgpt.isolator`` style usage), as opposed
+    to the ``fgpt isolate`` subcommand defined in the package's main CLI
+    entry point.
+
+    Returns
+    -------
+    argparse.Namespace
+        Parsed arguments with attributes ``rest_of_path``,
+        ``target_module``, ``work``, ``parent_subroutine``,
+        ``target_subroutines``, ``openacc``, ``f2py``, and ``tapenade``,
+        matching the constructor parameters of :class:`Isolator` and the
+        keyword arguments of :meth:`Isolator.run`.
+    """
     parser = argparse.ArgumentParser(description="Fortran procedure isolator for FGPT")
 
     parser.add_argument(
@@ -474,10 +722,50 @@ def parse_args():
     )
 
     parser.add_argument(
+        "--py2jx",
+        type=lambda x: x.lower() == "true",
+        default=False,
+        help="Enable Python to JAX conversion (True/False)",
+    )
+
+    parser.add_argument(
         "--tapenade",
         type=lambda x: x.lower() == "true",
         default=False,
         help="Enable Tapenade auto-differentiation (True/False)",
+    )
+
+    parser.add_argument(
+        "--mode",
+        type=str,
+        choices=["jax", "fwd", "bwd"],
+        default="jax",
+        help="Transformation mode: 'jax' (default), 'fwd' (forward-mode AD), 'bwd' (reverse-mode AD).",
+    )
+
+    parser.add_argument(
+        "--benchmark_dir",
+        type=str,
+        default=None,
+        help="Directory for benchmark outputs. Defaults to <cwd>/benchmark if not set.",
+    )
+
+    parser.add_argument(
+        "--config_path",
+        type=str,
+        default=None,
+        help="Path to the YAML config file containing code templates (e.g. template.yaml).",
+    )
+
+    parser.add_argument(
+        "--vectorize",
+        nargs="+",
+        metavar="LOOP_BOUND",
+        default=["kjpindex"],
+        help=(
+            "Loop upper-bound variables to vectorize. "
+            "Example: --vectorize kjpindex nvm npts"
+        ),
     )
 
     return parser.parse_args()
@@ -493,9 +781,14 @@ if __name__ == "__main__":
         openacc=args.openacc,
         tapenade=args.tapenade,
         f2py=args.f2py,
+        py2jx=args.py2jx,
     )
 
     isolator.run(
+        benchmark_dir=args.benchmark_dir,
+        config_path=args.config_path,
+        vectorize=args.vectorize,
+        mode=args.mode,
         parent_subroutine=args.parent_subroutine,
         target_subroutines=args.target_subroutines,
     )

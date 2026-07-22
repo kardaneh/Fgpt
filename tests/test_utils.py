@@ -2,7 +2,7 @@ import ast
 
 import pytest
 
-from fgpt.utils import AdjustIndices, ReplaceGlobals
+from fgpt.core.common.utils import AdjustIndices, ReplaceGlobals
 
 
 def _array_info():

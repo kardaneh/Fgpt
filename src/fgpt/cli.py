@@ -1,3 +1,11 @@
+# Copyright 2026 IPSL / CNRS / Sorbonne University
+# Authors: Shivamshan Sivanesan, Kazem Ardaneh
+#
+# This work is licensed under the Creative Commons
+# Attribution-NonCommercial-ShareAlike 4.0 International License.
+# To view a copy of this license, visit
+# http://creativecommons.org/licenses/by-nc-sa/4.0/
+
 import argparse
 
 from fgpt import __author__, __license__, __version__
@@ -51,12 +59,56 @@ def _add_isolate_args(parser):
         help="Prepare output for Tapenade auto-differentiation (True/False).",
     )
 
+    parser.add_argument(
+        "--py2jx",
+        type=lambda x: x.lower() == "true",
+        default=False,
+        help=(
+            "Enable Python to JAX conversion (True/False). "
+            "Requires --f2py true, since JAX conversion operates on the "
+            "transpiled Python output."
+        ),
+    )
+
+    parser.add_argument(
+        "--mode",
+        type=str,
+        choices=["jax", "fwd", "bwd"],
+        default="jax",
+        help="Transformation mode: 'jax' (default), 'fwd' (forward-mode AD), 'bwd' (reverse-mode AD).",
+    )
+
+    parser.add_argument(
+        "--benchmark_dir",
+        type=str,
+        default=None,
+        help="Directory for benchmark outputs. Defaults to <cwd>/benchmark if not set.",
+    )
+
+    parser.add_argument(
+        "--config_path",
+        type=str,
+        default=None,
+        help="Path to the YAML config file containing code templates (e.g. template.yaml).",
+    )
+
+    parser.add_argument(
+        "--vectorize",
+        nargs="+",
+        metavar="LOOP_BOUND",
+        default=["kjpindex"],
+        help=(
+            "Loop upper-bound variables to vectorize. "
+            "Example: --vectorize kjpindex nvm npts"
+        ),
+    )
+
 
 def _add_autodiff_args(parser):
     parser.add_argument(
         "--config_path",
         type=str,
-        required=True,
+        default=None,
         help="Path to the YAML config file (e.g. template.yaml).",
     )
     parser.add_argument(
@@ -85,9 +137,29 @@ def _add_autodiff_args(parser):
         help="Directory for benchmark outputs.",
     )
 
+    parser.add_argument(
+        "--vectorize",
+        nargs="+",
+        metavar="LOOP_BOUND",
+        default=["kjpindex"],
+        help=(
+            "Loop upper-bound variables to vectorize. "
+            "Example: --vectorize kjpindex nvm npts"
+        ),
+    )
+
 
 def _run_isolate(args):
     from fgpt.isolator import Isolator
+
+    # py2jx (Stage 3, Python -> JAX) operates on the transpiled Python
+    # output produced by f2py (Stage 2), so f2py must be enabled whenever
+    # py2jx is requested.
+    if args.py2jx and not args.f2py:
+        args.f2py = True
+        print(
+            "[fgpt] --py2jx true requires --f2py true; automatically enabling --f2py."
+        )
 
     isolator = Isolator(
         rest_of_path=args.rest_of_path,
@@ -96,8 +168,14 @@ def _run_isolate(args):
         openacc=args.openacc,
         tapenade=args.tapenade,
         f2py=args.f2py,
+        py2jx=args.py2jx,
     )
+
     isolator.run(
+        benchmark_dir=args.benchmark_dir,
+        config_path=args.config_path,
+        vectorize=args.vectorize,
+        mode=args.mode,
         parent_subroutine=args.parent_subroutine,
         target_subroutines=args.target_subroutines,
     )
@@ -108,6 +186,7 @@ def _run_autodiff(args):
 
     autodiff = AutoDiff(
         config_path=args.config_path,
+        vectorize=args.vectorize,
         benchmark_dir=args.benchmark_dir,
         mode=args.mode,
     )
@@ -123,7 +202,8 @@ def main():
         description=(
             "FGPT — Fortran-to-Python transpiler and JAX converter.\n\n"
             "Commands:\n"
-            "  isolate   Extract and transpile a Fortran subroutine (Stages 1 & 2)\n"
+            "  isolate   Extract and transpile a Fortran subroutine, "
+            "optionally through Stages 1-3 (isolate, transpile, JAX conversion)\n"
             "  autodiff  Convert a NumPy Python module to JAX/Equinox (Stage 3)"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -141,8 +221,12 @@ def main():
     # fgpt isolate
     isolate_parser = subparsers.add_parser(
         "isolate",
-        help="Extract and transpile a Fortran subroutine (Stages 1 & 2).",
-        description="Isolate a Fortran subroutine, validate it, and optionally transpile to Python.",
+        help="Extract, transpile, and (optionally) JAX-convert a Fortran subroutine (Stages 1-3).",
+        description=(
+            "Isolate a Fortran subroutine, validate it, and optionally run it "
+            "through the full pipeline: transpile to Python (Stage 2, --f2py) "
+            "and convert the result to JAX/Equinox (Stage 3, --py2jx)."
+        ),
     )
     _add_isolate_args(isolate_parser)
 

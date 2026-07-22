@@ -5,8 +5,8 @@ import tempfile
 import pytest
 
 from fgpt.autodiff import AutoDiff
-from fgpt.jax_utils import contains_name, get_name
-from fgpt.logger import Logger
+from fgpt.core.backends.utils import contains_name, get_name
+from fgpt.core.common.logger import Logger
 
 
 @pytest.fixture(scope="class")
@@ -15,6 +15,7 @@ def test_env(request):
     benchmark_dir = os.path.join(test_dir, "benchmark")
     autodiff = AutoDiff(
         config_path="template.yaml",
+        vectorize=[],
         benchmark_dir=benchmark_dir,
         logger=Logger(),
         mode="fwd",  # <- has three modes, jax, fwd, bwd
@@ -35,6 +36,269 @@ def _func(code: str) -> ast.FunctionDef:
 
 @pytest.mark.usefixtures("test_env")
 class TestAutoDiff:
+    def test_correct_main(self):
+        code = """
+def main():
+    model = MyModel()
+    x = np.zeros((10,))
+    out = model.run(x)
+    test_output(model, x)
+        """
+
+        func = _func(code)
+
+        details = {
+            "instances": {"model": "MyModel"},
+            "method_calls": [
+                {
+                    "instance": "model",
+                    "method": "run",
+                    "args": ["x"],
+                }
+            ],
+            "test_calls": [
+                {
+                    "test": "test_output",
+                    "instance": "model",
+                    "args": ["model", "x"],
+                }
+            ],
+        }
+
+        self.autodiff.correct_main(func, details)
+        ast.fix_missing_locations(func)
+        source = ast.unparse(func)
+
+        assert "jax.config.update" in source
+        assert "x_d = jnp.asarray(x)" in source
+        assert "model.run(x_d)" in source
+        assert "test_output(model, x_d)" in source
+
+    def test_consumer_before_assignment(self):
+        code = """
+def main():
+    model = MyModel()
+    x = np.zeros((10,))
+    out = model.run(x)
+    test_output(model, x)
+        """
+
+        func = _func(code)
+
+        details = {
+            "instances": {"model": "MyModel"},
+            "method_calls": [{"instance": "model", "method": "run", "args": ["x"]}],
+            "test_calls": [
+                {"test": "test_output", "instance": "model", "args": ["model", "x"]}
+            ],
+        }
+
+        self.autodiff.correct_main(func, details)
+        ast.fix_missing_locations(func)
+        source = ast.unparse(func)
+        assert "x_d = jnp.asarray(x)" in source
+        assert source.index("x_d") > source.index("np.zeros")
+
+    def test_multiple_calls_first_consumer_only(self):
+        code = """
+def main():
+    model = MyModel()
+    x = np.zeros((10,))
+    a = model.other()
+    b = model.run(x)
+    c = model.run(x)
+    test_output(model, x)
+        """
+
+        func = _func(code)
+
+        details = {
+            "instances": {"model": "MyModel"},
+            "method_calls": [{"instance": "model", "method": "run", "args": ["x"]}],
+            "test_calls": [],
+        }
+
+        self.autodiff.correct_main(func, details)
+        ast.fix_missing_locations(func)
+        source = ast.unparse(func)
+        # This x_d needs to be present before the b
+        assert source.index("x_d") > source.index("b")
+
+    def test_multiple_input_args(self):
+        code = """
+def main():
+    model = MyModel()
+    x = np.zeros((10,))
+    y = np.ones((10,))
+    out = model.run(x, y)
+    test_output(model, x, y)
+        """
+
+        func = _func(code)
+
+        details = {
+            "instances": {"model": "MyModel"},
+            "method_calls": [
+                {"instance": "model", "method": "run", "args": ["x", "y"]}
+            ],
+            "test_calls": [],
+        }
+
+        self.autodiff.correct_main(func, details)
+        ast.fix_missing_locations(func)
+        source = ast.unparse(func)
+
+        assert "x_d" in source
+        assert "y_d" in source
+
+    def test_call_inside_assign(self):
+        code = """
+def main():
+    model = MyModel()
+    x = np.zeros((10,))
+    out = model.run(x)
+    wrapper = model.run(x)
+    test_output(model, x)
+        """
+
+        func = _func(code)
+
+        details = {
+            "instances": {"model": "MyModel"},
+            "method_calls": [{"instance": "model", "method": "run", "args": ["x"]}],
+            "test_calls": [],
+        }
+
+        self.autodiff.correct_main(func, details)
+        ast.fix_missing_locations(func)
+        source = ast.unparse(func)
+
+        assert "x_d = jnp.asarray(x)" in source
+
+    def test_correct_test_func(self):
+        code = """
+def test_output():
+    x = reader.read_reals(10)
+    y = reader.read_reals(20).reshape((4,5))
+        """
+
+        func = _func(code)
+
+        self.autodiff.correct_test_func(func)
+
+        source = ast.unparse(func)
+        assert "jnp.asarray" in source
+
+    def test_modify_ast(self):
+        code = """
+def main():
+    model = MyModel()
+    model.run(x)
+        """
+
+        func = _func(code)
+
+        class_modif = {
+            "model": [
+                "model_eqx",
+                ast.ClassDef(
+                    name="MyModel_eqx",
+                    bases=[],
+                    keywords=[],
+                    body=[],
+                    decorator_list=[],
+                ),
+            ]
+        }
+
+        self.autodiff.modify_ast(func, class_modif)
+
+        source = ast.unparse(func)
+
+        assert "model_eqx" in source
+
+    def test_get_class_dep(self):
+        code = """
+def a():
+    b()
+    c()
+def b():
+    pass
+def c():
+    pass
+        """
+
+        tree = _parse(code)
+
+        funcs = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)]
+
+        graph = self.autodiff.get_class_dep(funcs)
+
+        callees = {e.callee for e in graph["a"]}
+
+        assert callees == {"b", "c"}
+
+    def test_propagate_shapes(self):
+        code = """
+def a(x):
+    b(x)
+
+def b(y):
+    return y
+        """
+
+        tree = _parse(code)
+
+        funcs = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)]
+
+        graph = self.autodiff.get_class_dep(funcs)
+        fn_index = self.autodiff._index_functions(funcs)
+
+        method_calls = [{"method": "a", "args_shape": {"x": ["n"]}}]
+
+        shapes = self.autodiff._propagate_shapes(graph, fn_index, method_calls)
+
+        assert shapes["a"] == {"x": ["n"]}
+        assert shapes["b"] == {"y": ["n"]}
+
+    def test_prepare_class(self, monkeypatch):
+        code = """
+class Model:
+
+    def __init__(self):
+        pass
+
+    def run(self):
+        return ns
+        """
+
+        module = _parse(code)
+
+        monkeypatch.setattr(
+            self.autodiff,
+            "transform_procedure",
+            lambda *args, **kwargs: None,
+        )
+
+        details = {
+            "method_calls": [
+                {
+                    "instance": "m",
+                    "method": "run",
+                    "args": [],
+                    "args_shape": {},
+                }
+            ],
+            "attributes_used": set(),
+        }
+
+        self.autodiff._prepare_class(module, details)
+
+        source = ast.unparse(module)
+
+        assert "eqx.Module" in source
+        assert "class Model_eqx" in source
+
     def test_add_jax_imports(self):
         # equinox, jax.numpy and jax imports are prepended
         module = _parse("import logging\nx = 1")

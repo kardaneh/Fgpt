@@ -17,23 +17,12 @@ computation.
 1. [Introduction](#introduction)
 2. [Project Structure](#project-structure)
 3. [Pipeline Overview](#pipeline-overview)
-4. [Core Components](#core-components)
-   - [Processor](#processor)
-   - [Isolator](#isolator)
-   - [Navigator](#navigator)
-   - [Extractor](#extractor)
-   - [Modifier](#modifier)
-   - [F2NP](#f2np)
-   - [Transformer](#transformer)
-   - [AutoDiff & JAX Conversion](#autodiff--jax-conversion)
-   - [Executive](#executive)
-   - [Shaper](#shaper)
-5. [Installation](#installation)
-6. [Usage](#usage)
-7. [Testing](#testing)
-8. [Development](#development)
-9. [License](#license)
-10. [Authors](#authors)
+4. [Installation](#installation)
+5. [Usage](#usage)
+6. [Testing](#testing)
+7. [Development](#development)
+8. [License](#license)
+9. [Authors](#authors)
 ---
 
 ## Introduction
@@ -65,37 +54,60 @@ and enabling precise, auditable transformations at every stage.
 ## Project Structure
 ```
    fgpt/
-   ├── src/fgpt/                 # Main package
-   │   ├── __init__.py
-   |   ├── processor.py          # Fortran parser (fparser wrapper)
-   |   ├── isolator.py           # Subroutine extraction
-   |   ├── navigator.py          # Cross-module symbol resolution
-   |   ├── extractor.py          # Static analysis and metadata extraction
-   |   ├── modifier.py           # Optional Fortran AST rewriting
-   |   ├── f2np.py               # Statement/expression-level translator
-   |   ├── transformer.py        # Pipeline orchestrator; emits .py files
-   |   ├── autodiff.py           # JAX conversion driver
-   |   ├── jax_utils.py          # VectorizationAnalyzer, ReductionHandler, …
-   │   ├── templates/
-   │   │   └── default.yaml      # bundled default, never edited by users
-   |   ├── jax_converter/
-   |   │   ├── converter.py      # JaxConverter (ast.NodeTransformer)
-   |   │   ├── analysis.py
-   |   │   ├── array_updates.py
-   |   │   ├── call_rewriting.py
-   |   │   ├── conditionals.py
-   |   │   ├── dynamic_loops.py
-   |   │   ├── loops.py
-   |   │   ├── masking.py
-   |   │   ├── scope_utils.py
-   |   │   └── vectorization.py
-   |   ├── utils.py              # ReplaceGlobals, AdjustIndices, helpers
-   |   ├── executive.py          # Workflow orchestration
-   |   ├── logger.py             # Logging infrastructure
-   |   ├── line_length.py        # Fortran line-length utilities
-   |   ├── intrinsic.py          # Fortran intrinsic → NumPy mapping
-   |   ├── shaper.py             # Array shape/dimension handling
-   |   └── version.py
+   ├── src/
+   │   └── fgpt/
+   │       ├── __init__.py
+   │       ├── __main__.py
+   │       ├── cli.py                     # Command-line interface
+   │       ├── version.py                 # Package version
+   │       ├── isolator.py                # Fortran isolation pipeline
+   │       ├── gpu_isolator.py            # GPU/OpenACC Fortran isolation pipeline
+   │       ├── autodiff.py                # JAX/Tapenade conversion pipeline
+   │       │
+   │       ├── core/
+   │       │   ├── frontend/
+   |       |   |   ├── __init__.py
+   │       │   │   ├── processor.py       # Fortran parser (fparser wrapper)
+   │       │   │   ├── extractor.py       # Static analysis and metadata extraction
+   │       │   │   └── navigator.py       # Cross-module symbol resolution
+   │       │   │
+   │       │   ├── analysis/
+   |       |   |   ├── __init__.py
+   │       │   │   └── shaper.py          # Array shape/dimension analysis
+   │       │   │
+   │       │   ├── passes/
+   |       |   |   ├── __init__.py
+   │       │   │   └── modifier.py        # Fortran AST transformation passes
+   │       │   │
+   │       │   ├── lowering/
+   |       |   |   ├── __init__.py
+   │       │   │   ├── transformer.py     # Fortran → Python pipeline
+   │       │   │   ├── f2np.py            # Statement/expression-level translation
+   │       │   │   └── intrinsic.py       # Fortran intrinsic → NumPy mapping
+   │       │   │
+   │       │   ├── backends/
+   |       |   |   ├── __init__.py
+   |       |   |   ├── utils.py                  # Shared helper functions used across backend modules
+   |       |   |   └── jax_converter/
+   |       |   |       ├── converter.py          # Main entry point: orchestrates conversion of code into JAX representations
+   |       |   |       ├── analysis.py           # Static/dynamic analysis utilities (shape inference, dependency tracking, etc.)
+   |       |   |       ├── array_updates.py      # Handles array mutation patterns and converts them to JAX-safe updates
+   |       |   |       ├── call_rewriting.py     # Rewrites function calls into JAX-compatible primitives or transformations
+   |       |   |       ├── conditionals.py       # Transforms if/else logic into JAX control-flow primitives (e.g., lax.cond)
+   |       |   |       ├── dynamic_loops.py      # Deals with loops whose bounds depend on runtime values (dynamic control flow)
+   |       |   |       ├── loops.py              # Handles static/structured loop transformations
+   |       |   |       ├── masking.py            # Implements masking strategies for conditional execution without branching
+   |       |   |       ├── scope_utils.py        # Utilities for managing variable scope during transformation/rewrite passes
+   |       |   |       └── vectorization.py      # Converts scalar functions into vectorized versions
+   │       │   └── common/
+   |       |       ├── __init__.py
+   │       │       ├── executive.py       # Workflow orchestration
+   │       │       ├── logger.py          # Logging infrastructure
+   │       │       ├── line_length.py     # Fortran line-length utilities
+   │       │       └── utils.py           # Shared helper utilities
+   │       │
+   │       └── templates/
+   │           └── default.yaml
    ├── tests/                    # Unit tests
    │   ├── conftest.py
    │   ├── test_autodiff.py
@@ -109,12 +121,20 @@ and enabling precise, auditable transformations at every stage.
    │   ├── test_shaper.py
    │   ├── test_utils.py
    │   └── test_transformer.py
+   |
+   ├── notebooks/                         # Example notebooks, tutorials, and development prototypes
+   │   ├── autodiff_principles.ipynb      # Introduction to JVP and VJP concepts
+   │   ├── prototype.ipynb                # Experimental notebook with autodifferenciation
+   │   ├── fortran_to_numpy.ipynb         # F2NP translation examples
+   │   ├── jax_converter.ipynb            # JAX conversion pipeline examples
+   │   └── jax_examples.ipynb             # JAX experiments and demonstrations
+   |
    ├── docs/                     # Documentation
    │   ├── source/
    │   └── build/
    ├── .github/workflows/        # CI/CD pipelines
-   │   ├── ci.yaml
-   │   └── docs.yml
+   │   └── ci.yaml
+   |
    ├── setup                     # Setup file for transformation
    ├── arch-nvhpc_HAL.env
    ├── arch-nvhpc_LEONARDO.env
@@ -161,240 +181,6 @@ and enabling precise, auditable transformations at every stage.
                      ▼
         JAX/Equinox Module (_jax.py)
 ```
-
----
-
-## Core Components
-
-### Processor
-
-`processor.py` is the shared parsing primitive used throughout all three
-pipeline stages. It wraps `fparser` with a Fortran 2008 grammar and provides
-a unified interface for building ASTs from files, strings, or individual
-statements.
-
-**Key responsibilities:**
-
-- **AST construction** — parses Fortran source from files, raw strings, or
-  individual statements into `fparser` AST objects.
-- **Declaration handling** — splits, duplicates, and recombines entity
-  declarations and allocations (`separate_entity_declaration`,
-  `combine_allocate_declaration`, `map_declaration`) to support both
-  CPU and GPU code paths.
-- **Output generation** — writes the standalone `global_module.f90` and
-  `main.f90` files that are compiled and run to validate each isolated
-  subroutine (`update_global_module`, `update_main_program`).
-- **Compilation & execution** — compiles and runs the generated Fortran
-  programs via `compile_and_run`, asserting correctness before any Python
-  output is produced.
-- **Utility methods** — generates `CALL` statements (`create_call_stmt`),
-  handles variable initialisation and I/O instrumentation
-  (`initialization_statement`), and queues declarations in a consistent
-  order (scalars first, then arrays, then parameters) via `process_queue`.
----
-
-### Isolator
-
-`isolator.py` is the entry point of the pipeline. Given a target module and
-a list of subroutine names, it extracts each routine into a self-contained,
-independently compilable unit.
-
-**Key responsibilities:**
-
-- Locates the target module and parses it via `Processor`. A
-  `_org.fgpt` backup of the original source is created on first run so
-  that re-runs always start from unmodified Fortran.
-- Recursively isolates nested subroutine calls depth-first, propagating
-  global variable declarations upward via `collect_global_vars_decl`,
-  so every parent's standalone module includes everything it and its
-  callees need.
-- Calls `Extractor` for static analysis, `Navigator` for cross-module
-  symbol resolution, and optionally `Modifier` for Fortran-level
-  rewrites before generating output.
-- Produces a `global_module_<name>.f90` (shared declarations) and
-  `main_<name>.f90` (driver program) for each routine, compiles and
-  runs them to validate output, and optionally triggers `Transformer`
-  to emit Python immediately when `f2py=True`.
-- Can be run as a command-line tool — see [Usage](#usage).
----
-
-### Navigator
-
-`navigator.py` resolves variable declarations and subroutine definitions
-that are not present in the immediately parsed module. It is called
-exclusively by `Extractor` whenever a symbol cannot be resolved in the
-current scope.
-
-**Key responsibilities:**
-
-- Performs a breadth-first search over the Fortran module hierarchy,
-  following `USE` chains across file boundaries.
-- Handles external subroutine interface blocks and avoids redundant
-  traversal via a visited-modules set.
-- Exposes `find_variable_in_module`, `variable_finder`, and
-  `find_var_in_child_modules` for variable resolution, and
-  `find_external_subroutines_in_module` / `external_subroutine_finder`
-  for subroutine discovery.
----
-
-### Extractor
-
-`extractor.py` performs static and structural analysis of the parsed Fortran
-module and builds all metadata structures consumed by the transpilation
-stage.
-
-**Key responsibilities:**
-
-- **Subroutine discovery** — `find_subroutines` identifies all subroutines
-  and functions, maps dummy argument lists, and distinguishes internal from
-  external routines.
-- **Variable classification** — `find_variables` classifies every variable
-  in a subroutine as dummy argument (with intent IN / OUT / INOUT), global
-  (imported via `USE`), or local. `find_global_variables` delegates
-  cross-module resolution to `Navigator`.
-- **Array metadata** — `extract_all_array_info` collects dimensional and shape
-  information for all arrays, determines allocation requirements, and
-  unifies allocatable declarations via `Processor.combine_allocate_declaration`.
-- **Loop analysis** — `extract_loop_vect` retrieves variables usable as
-  global loop variables; `extract_intent` extracts DO loop index names
-  and their bounds.
-- **AST normalisation** — `clean_subroutine` removes redundant or
-  inconsistent declarations and verifies structural integrity before
-  transpilation.
-The Extractor is stateful; re-instantiate it for each independent
-transpilation session.
-
----
-
-### Modifier
-
-`modifier.py` is an optional pass that rewrites the Fortran AST *before*
-transpilation. It operates entirely within the Fortran representation and
-produces no Python output — its purpose is to normalise the source so that
-`F2NP` encounters only constructs it can translate directly.
-
-**Key responsibilities:**
-
-- Replaces unsupported intrinsic functions (`MAXLOC`, `MINLOC`, etc.) with
-  equivalent manual loops compatible with the target environment.
-- Converts array colon-slicing into indexed loops
-  (`replace_vec_colon_with_index`) and merges vector loop bodies
-  (`merge_vector_loop`).
-- Adds `DO` loops for implicit array assignments (`add_dos`) and adjusts
-  array bounds and subscript lists for GPU memory layouts
-  (`modify_colon_array`, `modify_colon_array_vec`).
-- Strips or replaces GPU-incompatible I/O operations (`WRITE`, `OPEN`,
-  `CLOSE`) with flag-based alternatives (`replace_gpu_unsupported`).
-- Modifies `SPECIFICATION PART` declarations to add assumed-shape specs
-  and OpenACC/GPU attributes (`modify_specification_part`).
----
-
-### F2NP
-
-`f2np.py` is the core of the transpiler. It performs the actual
-source-to-source translation, walking the Fortran AST for a single
-subroutine and incrementally building the equivalent Python `ast` tree,
-statement by statement and expression by expression.
-
-**Fortran → Python/NumPy mappings:**
-
-| Fortran construct | Python / NumPy equivalent |
-|---|---|
-| `DO i = a, b` | `for i in range(a, b)` |
-| `IF / ELSE IF / ELSE` | `if / elif / else` |
-| `WHERE (mask)` | `if mask.any(): ...` with boolean-mask subscripting |
-| `SELECT CASE` | `if / elif` chain |
-| `CALL sub(args)` | `sub(args)` |
-| `REAL, DIMENSION(n) :: A` | `A = np.zeros(n, dtype=np.float64)` |
-| `ABS`, `SQRT`, `MAXVAL`, … | `np.abs`, `np.sqrt`, `np.max`, … |
-| `arr(i)` (1-based) | `arr[i]` (corrected by `AdjustIndices`) |
-
-Control-flow constructs are tracked via an explicit stack and per-construct
-counters rather than Python's call stack, since Fortran's block-closing
-statements (`END IF`, `END DO`, `END SELECT`) must be matched against
-possibly nested and chained (`ELSE IF`) constructs.
-
-The main entry point is `recursive_ast`, which dispatches each Fortran
-statement type to a dedicated `handle_*` method. Expression-level
-translation is centralised in `handle_expr`.
-
----
-
-### Transformer
-
-`transformer.py` is the pipeline orchestrator. It consumes the raw Python
-AST emitted by `F2NP` and assembles it into a coherent, importable Python
-module — playing the same role as a compiler back-end.
-
-**Key responsibilities:**
-
-- **Class scaffolding** — converts Fortran `SPECIFICATION PART` declarations
-  into Python class attributes and `__init__` assignments; pre-initialises
-  dependent variables so the generated class is self-consistent.
-- **Dependency resolution** — builds `cls_info` (variable → owning class
-  mapping) from Fortran declarations and `USE` imports; consumed by
-  `ReplaceGlobals` and call-site rewriting.
-- **Call-site rewriting** — rewrites `CALL` statements as method invocations
-  on the correct Python class instance, injecting `self` or instance
-  arguments and correcting argument order.
-- **Binary I/O generation** — synthesises NumPy binary-read boilerplate for
-  subroutines that consume Fortran binary data files.
-- **Post-processing** — applies `ReplaceGlobals` (unqualified names →
-  `self.attr`) and `AdjustIndices` (1-based → 0-based subscripts) before
-  emitting the final `.py` file.
----
-
-### AutoDiff & JAX Conversion
-
-`autodiff.py` and `jax_converter/` transform the NumPy-based Python class
-produced by Stage 2 into a JAX/Equinox module.
-
-**`AutoDiff`** handles class-level restructuring (analogous to `Transformer`
-in Stage 2):
-
-- Rewrites the class declaration to inherit from `eqx.Module`.
-- Converts `np` operations and type annotations to `jnp` equivalents.
-- Classifies attributes as Equinox static or dynamic fields.
-- Strips `print` / `logging.*` calls (incompatible with JAX tracing) before
-  conversion begins.
-- Emits the output file suffixed with `_jax`, `_fwd`, or `_bwd` according
-  to the `mode` parameter.
-**`JaxConverter`** handles all control-flow and expression rewriting:
-
-| NumPy construct | JAX equivalent | Strategy |
-|---|---|---|
-| `a[i] = v` | `a = a.at[i].set(v)` | Functional update |
-| `if cond: x = a else: x = b` | `x = jnp.where(cond, a, b)` | Value select |
-| `if cond: <stateful>` | `lax.cond(cond, _if_true_N, _if_false_N, ...)` | Synthetic helpers |
-| `for i in range(...):` (sequential) | `lax.scan(_scan_body_N, carry, indices)` | State-carrying loop |
-| `for i in range(...):` (independent) | vectorised body (loop removed) | Batch axis |
-| `np.zeros / np.ones` | `jnp.zeros / jnp.ones` | Library alias |
-
-> **Note on differentiation modes.** All three modes (`jax`, `fwd`, `bwd`)
-> produce valid, XLA-compilable `eqx.Module` subclasses. Explicit
-> `jax.grad` / `jax.jvp` / `jax.vjp` call sites are planned for a future
-> release once the differentiation input specification interface is defined.
-
----
-
-### Executive
-
-`executive.py` validates isolated subroutines after they have been compiled
-and produced binary output files. It iterates over the subroutines in the
-target folder and runs them in either CPU or GPU mode to verify correctness
-and performance.
-
----
-
-### Shaper
-
-`shaper.py` reconstructs accurate argument declarations for subroutines and
-functions that are called from outside their defining module. It uses
-`Navigator` to locate the call site, analyses each argument's shape and
-usage context, and generates the corresponding Fortran declaration
-statements. This is particularly useful for cross-module routines whose
-dummy argument dimensions cannot be inferred from the definition alone.
-
 ---
 
 ## Installation
@@ -465,7 +251,7 @@ isolator.run(
 
 The CLI exposes two subcommands corresponding to the two stages of the pipeline.
 
-**Stage 1 & 2 — Isolation and transpilation:**
+**Stage 1 - 3 — Isolation, transpilation and JAX conversion**
 
 ```bash
 fgpt isolate \
@@ -476,7 +262,12 @@ fgpt isolate \
     --target_subroutines hydrol_soil hydrol_alma \
     --f2py True \
     --openacc False \
-    --tapenade False
+    --tapenade False \
+    --py2jx False \
+    --mode jax \
+    --config_path template.yaml \
+    --vectorize kjpindex \
+    --benchmark_dir benchmark/ \
 ```
 
 The key flags control which transformation path is taken:
@@ -486,8 +277,9 @@ The key flags control which transformation path is taken:
 | `--f2py` | `False` | Also transpile the isolated Fortran to NumPy Python |
 | `--openacc` | `False` | Preserve OpenACC directives for GPU Fortran output |
 | `--tapenade` | `False` | Prepare output for Tapenade automatic differentiation |
+| `--py2jx` | `False` | Prepare output for JAX transformation and optimization |
 
-These three flags are mutually independent — for example, `--f2py True --openacc True` produces both a Python translation and an OpenACC-annotated Fortran output.
+These three flags are mutually independent, except that `py2jx` requires `f2py` to be enabled. For example, `--f2py True --openacc True` produces both a Python translation and an OpenACC-annotated Fortran output.
 
 **Stage 3 — JAX conversion:**
 
@@ -496,6 +288,7 @@ fgpt autodiff \
     --config_path template.yaml \
     --class_file hydrol/hydrol_soil/global_module_hydrol_soil.py \
     --main_file hydrol/hydrol_soil/main_hydrol_soil.py \
+    --vectorize kjpindex
     --mode jax
 ```
 
@@ -504,8 +297,11 @@ The `--mode` flag selects the transformation target:
 | Mode | Output file suffix | Description |
 |---|---|---|
 | `jax` | `_jax.py` | XLA-compiled JAX module (default) |
-| `fwd` | `_fwd.py` | Scaffolded for forward-mode differentiation |
-| `bwd` | `_bwd.py` | Scaffolded for reverse-mode differentiation with checkpointing |
+| `fwd` | `_d.py` | Scaffolded for forward-mode differentiation |
+| `bwd` | `_d.py` | Scaffolded for reverse-mode differentiation with checkpointing |
+
+The `--vectorize` option specifies the lower-bound loops that the user wants to vectorize.
+By default it's set to `["kjpindex"]`
 
 **Version and help:**
 
@@ -530,12 +326,35 @@ autodiff.transform(
 # produces global_module_hydrol_soil_jax.py and main_hydrol_soil_jax.py
 ```
 
+The `isolate` command can perform the complete pipeline, including the JAX conversion. Alternatively, it can be used to execute only stages 1 and 2, with the `autodiff` command handling the final stage.
+
+## Notebooks
+
+The repository includes several example notebooks, such as `Test_F2NP.ipynb` and `Test_JAX_Converter.ipynb`, which demonstrate different features and workflows.
+
+Before using the notebooks, complete the steps described in the [Installation](#Installation) section. Then activate the virtual environment and register it as a Jupyter kernel:
+
+```bash
+source .venv/bin/activate
+uv run ipython kernel install --user \
+    --env VIRTUAL_ENV "$(pwd)/.venv" \
+    --name=project
+```
+
+Once the kernel has been installed, you can launch JupyterLab with:
+
+```bash
+uv run --with jupyter jupyter lab
+```
+
+Alternatively, you can open the notebooks directly in Visual Studio Code. VS Code will automatically detect the project's `.venv`. Simply select the `project` kernel (or the corresponding virtual environment) when prompted.
+
 ---
 
 ## Testing
 
 FGPT uses `pytest` for comprehensive testing of the transpilation pipeline,
-metadata extraction, JAX conversion, and automatic differentiation workflows.
+metadata extraction, JAX conversion, and the futur automatic differentiation workflows.
 
 ```bash
 # Full test suite
@@ -588,3 +407,19 @@ kardaneh@ipsl.fr
 **Shivamshan Sivanesan**
 CNRS / IPSL
 ssivanesan@ipsl.fr
+
+## Citation
+
+If you use FGPT in your research, please cite the software.
+
+### BibTeX
+
+```bibtex
+@software{ardaneh_fgpt_2026,
+  author = {Kazem Ardaneh and Shivamshan Sivanesan},
+  title = {FGPT: A Fortran-to-Python and JAX Transpiler for Scientific Codes},
+  year = {2026},
+  publisher = {GitHub},
+  url = {https://github.com/kardaneh/IPSL-Fgpt}
+}
+```

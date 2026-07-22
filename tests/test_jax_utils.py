@@ -2,7 +2,7 @@ import ast
 
 import pytest
 
-from fgpt.jax_utils import (
+from fgpt.core.backends.utils import (
     MaybeAddIndexTransformer,
     ReductionHandler,
     VectorizationAnalyzer,
@@ -55,7 +55,7 @@ def _make_cls_info():
 
 @pytest.fixture(scope="class")
 def test_env(request):
-    analyzer = VectorizationAnalyzer()
+    analyzer = VectorizationAnalyzer(vectorize=["kjpindex"])
     request.cls.analyzer = analyzer
 
     indextransformer = MaybeAddIndexTransformer(
@@ -122,13 +122,14 @@ class TestVectorizationAnalyzer:
         node = _stmt("for i in range(0, kjpindex):\n    pass")
         assert self.analyzer._collect_loop_vars_from_for(node) == {"i"}
 
-        # Non vector loop
-        node = _stmt("for i in range(0, nslm):\n    pass")
-        assert self.analyzer._collect_loop_vars_from_for(node) == set()
-
         # Tuple targets
         node = _stmt("for i, j in range(0, self.kjpindex):\n    pass")
         assert self.analyzer._collect_loop_vars_from_for(node) == {"i", "j"}
+
+    def test_is_vectorizable(self):
+        # Non vector loop
+        node = _stmt("for i in range(0, nslm):\n    pass")
+        assert self.analyzer._is_vectorizable_loop(node) is False
 
     def test_name_used(self):
         expr = _expr("a + i")

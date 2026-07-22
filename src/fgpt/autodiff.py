@@ -1,14 +1,23 @@
+# Copyright 2026 IPSL / CNRS / Sorbonne University
+# Authors: Shivamshan Sivanesan, Kazem Ardaneh
+#
+# This work is licensed under the Creative Commons
+# Attribution-NonCommercial-ShareAlike 4.0 International License.
+# To view a copy of this license, visit
+# http://creativecommons.org/licenses/by-nc-sa/4.0/
+
 import argparse
 import ast
 import os
 import stat
+import subprocess
 from copy import deepcopy
 from pathlib import Path
 from string import Template
 from typing import Any, Literal
 
-from fgpt.jax_converter.converter import JaxConverter
-from fgpt.jax_utils import (
+from fgpt.core.backends.jax_converter.converter import JaxConverter
+from fgpt.core.backends.utils import (
     CallEdge,
     RemoveLogging,
     contains_name,
@@ -17,8 +26,13 @@ from fgpt.jax_utils import (
     get_name,
     topo_sort,
 )
-from fgpt.logger import Logger
-from fgpt.utils import ast_walk, get_instance_name, load_code_templates, python_parser
+from fgpt.core.common.logger import Logger
+from fgpt.core.common.utils import (
+    ast_walk,
+    get_instance_name,
+    load_code_templates,
+    python_parser,
+)
 
 DEFAULT_TEMPLATE = Path(__file__).parent / "templates" / "default.yaml"
 
@@ -49,6 +63,9 @@ class AutoDiff:
     config_path : str
         Path to the YAML config file containing code templates
         (e.g. the JAX timer template).
+    vectorize : list[str], optional
+        List of lower-bound loops that the user wants to vectorize.
+        Defaults to ``["kjpindex"]``.
     benchmark_dir : str, optional
         Directory where per-module runtime measurements are written.
         Defaults to ``<cwd>/benchmark``, created if absent.
@@ -70,6 +87,8 @@ class AutoDiff:
         Active logger instance.
     config_path : str
         Path to the YAML config file.
+    vectorize : list[str]
+        List of lower-bound loops that can be vectorized.
     mode : str
         Active transformation mode. Controls the suffix applied to output
         files: ``'jax'`` → ``_jax``, ``'fwd'`` → ``_fwd``,
@@ -90,6 +109,7 @@ class AutoDiff:
     def __init__(
         self,
         config_path: str,
+        vectorize: list[str] = ["kjpindex"],
         benchmark_dir: str | None = None,
         logger: Logger | None = None,
         mode: Literal["jax", "fwd", "bwd"] = "jax",
@@ -142,6 +162,11 @@ class AutoDiff:
         self.write_to_file = self.logger.log_event("Transfer to Python File")(
             self.write_to_file
         )
+        self.run_python_scripts = self.logger.log_event("Run JAX python scripts")(
+            self.run_python_scripts
+        )
+        # Defines the loop bounds of which are vectorizable
+        self.vectorize = vectorize
 
     def _build_output_path(self, path: Path) -> Path:
         """
@@ -350,7 +375,10 @@ class AutoDiff:
                 raise ValueError("fn_shapes is empty — check _propagate_shapes")
 
             jax_converter = JaxConverter(
-                cls_info=self.cls_info, logger=self.logger, mode=self.mode
+                cls_info=self.cls_info,
+                vectorize=self.vectorize,
+                logger=self.logger,
+                mode=self.mode,
             )
             self.transform_procedure(class_dep, fn_index, fn_shapes, jax_converter)
 
@@ -433,8 +461,54 @@ class AutoDiff:
             f"Expected a file path or ast.Module, got {type(source).__name__}"
         )
 
+    def _validate_class_module(self, module: ast.Module) -> None:
+        """Validate that a module contains a top-level class definition.
+
+        Parameters
+        ----------
+        module : ast.Module
+            Parsed Python module to validate.
+
+        Raises
+        ------
+        ValueError
+            If the module does not contain a top-level
+            :class:`ast.ClassDef` node.
+        """
+        if not any(isinstance(node, ast.ClassDef) for node in module.body):
+            raise ValueError("Expected a module containing a class definition.")
+
+    def _validate_main_module(self, module: ast.Module) -> None:
+        """Validate that a module contains a ``__main__`` entry point.
+
+        Parameters
+        ----------
+        module : ast.Module
+            Parsed Python module to validate.
+
+        Raises
+        ------
+        ValueError
+            If the module does not contain an
+            ``if __name__ == "__main__":`` block.
+        """
+        has_main = any(
+            isinstance(node, ast.If)
+            and isinstance(node.test, ast.Compare)
+            and isinstance(node.test.left, ast.Name)
+            and node.test.left.id == "__name__"
+            for node in module.body
+        )
+        if not has_main:
+            raise ValueError(
+                "Expected a module containing `if __name__ == '__main__':`."
+            )
+
     def transform(
-        self, main_file: str | ast.Module, class_file: str | ast.Module
+        self,
+        main_file: str | ast.Module,
+        class_file: str | ast.Module,
+        routine_dir: str = None,
     ) -> None:
         """
         Orchestrate the full Python-to-JAX/Equinox transformation pipeline.
@@ -463,6 +537,9 @@ class AutoDiff:
             Path to the main Python file, or a parsed ``ast.Module``.
         class_file : Union[str, ast.Module]
             Path to the class Python file, or a parsed ``ast.Module``.
+        routine_dir : str, optional
+            Defines the folder inside which we need to save the files in the
+            case when `main_file` and `class_file` is sent as ``ast.Module``.
 
         Raises
         ------
@@ -478,6 +555,9 @@ class AutoDiff:
             main_module = self._to_module(main_file)
             class_module = self._to_module(class_file)
 
+            self._validate_class_module(class_module)
+            self._validate_main_module(main_module)
+
             # Resolve output paths from the original string paths when available,
             # otherwise fall back to the import statement inside main_module.
             if isinstance(main_file, str) and isinstance(class_file, str):
@@ -485,20 +565,24 @@ class AutoDiff:
                 class_path = Path(class_file)
             else:
                 # Derive paths from the from-import that references the class module
-                class_import = next(
-                    (
-                        stmt
-                        for stmt in main_module.body
-                        if isinstance(stmt, ast.ImportFrom) and stmt.module
-                    ),
-                    None,
-                )
-                if class_import is None:
+                class_def = next(iter(ast_walk(class_module, ast.ClassDef)), None)
+                if class_def is None:
                     raise ValueError(
                         "Cannot derive output paths: no ImportFrom found in main_module"
                     )
-                class_path = Path(class_import.module + ".py")
-                main_path = Path("main.py")
+                if routine_dir is None:
+                    raise ValueError(
+                        "When the given main and class files as ast.Modules, path in which \
+                        these files needs to be saved"
+                    )
+                executable_name = os.path.basename(routine_dir.rstrip("/"))
+
+                class_path = Path(
+                    os.path.join(routine_dir, f"{class_def.name.lower()}.py")
+                )
+                main_path = Path(
+                    os.path.join(routine_dir, f"main_{executable_name}.py")
+                )
 
             main_new_path = self._build_output_path(main_path)
             class_new_path = self._build_output_path(class_path)
@@ -946,40 +1030,62 @@ class AutoDiff:
 
             # Find the insertion point: first method call that uses an input arg
             insert_pos = None
+            last_assignment_pos = None
+            first_consumer_pos = None
+            preferred_method_pos = None
+
             for i, item in enumerate(node.body):
-                if not isinstance(item, ast.Expr | ast.Assign):
+                if isinstance(item, ast.Assign):
+                    for target in item.targets:
+                        if isinstance(target, ast.Name) and target.id in input_args:
+                            last_assignment_pos = i + 1
+
+                call_node = None
+
+                if isinstance(item, ast.Expr) and isinstance(item.value, ast.Call):
+                    call_node = item.value
+
+                elif isinstance(item, ast.Assign) and isinstance(item.value, ast.Call):
+                    call_node = item.value
+
+                if call_node is None:
                     continue
-                call = (
-                    item.value
-                    if isinstance(item, ast.Expr)
-                    else (item.value if isinstance(item, ast.Assign) else None)
+
+                consumes_input = any(
+                    isinstance(arg, ast.Name) and arg.id in input_args
+                    for arg in call_node.args
+                ) or any(
+                    isinstance(kw.value, ast.Name) and kw.value.id in input_args
+                    for kw in call_node.keywords
                 )
-                if not (
-                    call
-                    and isinstance(call, ast.Call)
-                    and isinstance(call.func, ast.Attribute)
+
+                if consumes_input and first_consumer_pos is None:
+                    first_consumer_pos = i + 1
+
+                if (
+                    consumes_input
+                    and isinstance(call_node.func, ast.Attribute)
+                    and isinstance(call_node.func.value, ast.Name)
                 ):
-                    continue
-                instance_name = (
-                    call.func.value.id
-                    if isinstance(call.func.value, ast.Name)
-                    else None
-                )
-                method_name = call.func.attr
-                for mc in main_details["method_calls"]:
+                    instance_name = call_node.func.value.id
+                    method_name = call_node.func.attr
+
                     if (
-                        mc.get("instance") == instance_name
-                        and mc.get("method") == method_name
-                        and mc.get("args")
-                        and any(
-                            isinstance(arg, ast.Name) and arg.id in input_args
-                            for arg in call.args
+                        any(
+                            mc["instance"] == instance_name
+                            and mc["method"] == method_name
+                            for mc in main_details["method_calls"]
                         )
+                        and preferred_method_pos is None
                     ):
-                        insert_pos = i
-                        break
-                if insert_pos is not None:
-                    break
+                        preferred_method_pos = i
+
+            if preferred_method_pos is not None:
+                insert_pos = preferred_method_pos
+            elif first_consumer_pos is not None:
+                insert_pos = first_consumer_pos
+            else:
+                insert_pos = last_assignment_pos
 
             if insert_pos is None:
                 raise ValueError(
@@ -3203,6 +3309,85 @@ class AutoDiff:
             self.logger.exception("Exception in _transform_declaration_init:", e)
             raise
 
+    def run_python_scripts(
+        self, base_dir: str, target_dir: str, mode: Literal["CPU", "GPU"] = "CPU"
+    ) -> None:
+        """
+        Validate and execute generated JAX Python scripts with dependency checks.
+
+        Parameters
+        ----------
+        base_dir : str
+            Root directory containing generated modules.
+        target_dir : str
+            Specific module directory to execute.
+        mode : {'CPU', 'GPU'}, optional
+            Execution mode (currently informational; defaults to 'CPU').
+        """
+        if not os.path.isdir(target_dir):
+            self.logger.error(f"Target module directory '{target_dir}' not found.")
+
+        subdir_path = os.path.join(base_dir, target_dir)
+        subdir = os.path.basename(subdir_path)
+        if not os.path.isdir(subdir_path):
+            self.logger.warning(f"Skipping non-directory entry: {subdir_path}")
+            return
+
+        self.logger.info(f"Processing module: {subdir_path}")
+        # Python file checks
+        executable_name = os.path.basename(target_dir.rstrip("/"))
+        main_file = os.path.join(subdir_path, f"main_{executable_name}_{self.mode}.py")
+        global_module_file = os.path.join(
+            subdir_path, f"global_module_{executable_name}_{self.mode}.py"
+        )
+
+        missing_files = []
+        if not os.path.exists(main_file):
+            missing_files.append(f"main_{executable_name}_{self.mode}.py")
+        if not os.path.exists(global_module_file):
+            missing_files.append(f"global_module_{executable_name}_{self.mode}.py")
+
+        if missing_files:
+            self.logger.warning(
+                f"Missing files in '{subdir}': {', '.join(missing_files)}"
+            )
+            self.logger.info(f"Skipping '{subdir}' due to missing Python files.\n")
+            return
+        else:
+            self.logger.info(f"Required Python files found in '{subdir}'.")
+
+        # Binary file checks
+        benchmark_subdir = os.path.join(self.benchmark_dir, subdir)
+        dummy_bin = os.path.join(benchmark_subdir, "dummy.bin")
+        global_bin = os.path.join(benchmark_subdir, "global.bin")
+        output_bin = os.path.join(benchmark_subdir, "output.bin")
+        bin_missing = []
+        for bin_file in [dummy_bin, global_bin, output_bin]:
+            if not os.path.exists(bin_file):
+                bin_missing.append(os.path.basename(bin_file))
+
+        if bin_missing:
+            self.logger.warning(
+                f"Missing binary files for '{subdir}': {', '.join(bin_missing)}"
+            )
+            self.logger.info(f"Skipping '{subdir}' due to missing binaries.\n")
+            return
+
+        self.logger.info(
+            f"All binary files found for '{subdir}'. Running unit tests..."
+        )
+        try:
+            result = subprocess.run(
+                ["python3", main_file], check=True, capture_output=True, text=True
+            )
+            self.logger.info(f"Execution output for '{subdir}':\n{result.stdout}")
+        except subprocess.CalledProcessError as e:
+            self.logger.error(
+                f"Error running main_{executable_name}_{self.mode}.py for '{subdir}': ",
+                e.stderr,
+            )
+            return
+
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -3245,6 +3430,17 @@ def parse_args():
         help="Directory for benchmark outputs. Defaults to <cwd>/benchmark if not set.",
     )
 
+    parser.add_argument(
+        "--vectorize",
+        nargs="+",
+        metavar="LOOP_BOUND",
+        default=["kjpindex"],
+        help=(
+            "Loop upper-bound variables to vectorize. "
+            "Example: --vectorize kjpindex nvm npts"
+        ),
+    )
+
     return parser.parse_args()
 
 
@@ -3254,6 +3450,7 @@ def main():
         config_path=args.config_path,
         benchmark_dir=args.benchmark_dir,
         mode=args.mode,
+        vectorize=args.vectorize,
     )
     autodiff.transform(
         class_file=args.class_file,

@@ -181,7 +181,5 @@ python-venv/*
 
 # Ignore all __pycache__ folders recursively
 __pycache__/
-notebooks/
-docs
 .virtual_documents/
 .vscode/

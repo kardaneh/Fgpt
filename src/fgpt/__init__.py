@@ -15,16 +15,11 @@ __description__ = "Fortran source analysis, transpilation, and JAX conversion to
 
 
 from fgpt.autodiff import AutoDiff
-from fgpt.extractor import Extractor
-
-# Core components
-from fgpt.f2np import F2NP
+from fgpt.core.backends import JaxConverter
+from fgpt.core.common import Logger
+from fgpt.core.frontend import Extractor, Navigator, Processor
+from fgpt.core.transpiler import F2NP, Transformer
 from fgpt.isolator import Isolator
-from fgpt.jax_converter.converter import JaxConverter
-from fgpt.logger import Logger
-from fgpt.navigator import Navigator
-from fgpt.processor import Processor
-from fgpt.transformer import Transformer
 from fgpt.version import __version__, __version_info__, get_version
 
 __all__ = [
