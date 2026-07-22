@@ -5,9 +5,9 @@ import tempfile
 import pytest
 from fparser.two import Fortran2003 as F23
 
-from fgpt.logger import Logger
-from fgpt.navigator import Navigator
-from fgpt.processor import Processor
+from fgpt.core.common.logger import Logger
+from fgpt.core.frontend.navigator import Navigator
+from fgpt.core.frontend.processor import Processor
 
 
 @pytest.fixture(scope="class")

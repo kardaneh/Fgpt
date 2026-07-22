@@ -7,9 +7,9 @@ import pytest
 from fparser.two import Fortran2003 as F23
 from fparser.two.utils import walk
 
-from fgpt.logger import Logger
-from fgpt.processor import Processor
-from fgpt.transformer import Transformer
+from fgpt.core.common.logger import Logger
+from fgpt.core.frontend.processor import Processor
+from fgpt.core.transpiler.transformer import Transformer
 
 
 @pytest.fixture(scope="class")

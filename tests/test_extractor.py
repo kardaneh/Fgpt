@@ -6,9 +6,9 @@ from collections import defaultdict
 import pytest
 from fparser.two import Fortran2003 as F23
 
-from fgpt.extractor import Extractor
-from fgpt.logger import Logger
-from fgpt.processor import Processor
+from fgpt.core.common.logger import Logger
+from fgpt.core.frontend.extractor import Extractor
+from fgpt.core.frontend.processor import Processor
 
 
 @pytest.fixture(scope="class")
