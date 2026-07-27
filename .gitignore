@@ -179,6 +179,8 @@ condveg/*
 python-venv/*
 !python-venv/.gitkeep
 
+src/fgpt/gpu_isolator.py
+src/fgpt/core/passes/modifier.py
 # Ignore all __pycache__ folders recursively
 __pycache__/
 .virtual_documents/
