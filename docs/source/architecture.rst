@@ -48,7 +48,7 @@ High-Level Pipeline
 
 
 Frontend — Parsing and IR Construction
-----------------------------------------
+--------------------------------------
 
 The frontend locates a target Fortran subroutine within a large codebase,
 resolves all of its cross-module dependencies, and produces a self-contained
@@ -95,7 +95,7 @@ inference specifically is delegated to
   pass, :class:`~fgpt.core.transpiler.f2np.F2NP`.
 
 Middle-End — Lowering Fortran IR to NumPy
--------------------------------------------
+-----------------------------------------
 
 The middle-end is the core of FGPT's code generation: it lowers the
 Fortran AST into structurally equivalent NumPy-based Python — a
@@ -139,7 +139,7 @@ file. It applies two IR-to-IR post-processing passes before code emission:
   the target-neutral IR consumed by the JAX backend.
 
 JAX Backend — Target Lowering and Code Generation
-----------------------------------------------------
+-------------------------------------------------
 
 The JAX backend lowers the target-neutral NumPy IR produced by the
 middle-end into a JAX/Equinox-compatible module — analogous to a compiler
@@ -172,7 +172,7 @@ ABI setup), and :class:`~fgpt.core.backends.jax_converter.converter.JaxConverter
 handles all control-flow and expression code generation.
 
 AutoDiff — Backend Driver
-~~~~~~~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~~~~~~
 
 :class:`~fgpt.autodiff.AutoDiff` plays a role analogous to
 :class:`~fgpt.core.transpiler.transformer.Transformer` in the middle-end: it
@@ -211,7 +211,7 @@ JAX tracing.
    future release once the input specification interface is defined.
 
 JaxConverter — Backend Code Generator
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 :class:`~fgpt.core.backends.jax_converter.converter.JaxConverter` is an
 ``ast.NodeTransformer`` composed of several mixin classes — one per target
