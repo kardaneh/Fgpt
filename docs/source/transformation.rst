@@ -423,6 +423,7 @@ consumes the key intermediate artefacts:
        :meth:`~fgpt.core.transpiler.transformer.Transformer.correct_function`
      - :class:`dict`
    * - Corrected Fortran AST
+     - :class:`~fgpt.isolator.Isolator`
      - :class:`~fgpt.core.transpiler.f2np.F2NP`
      - ``fparser`` AST
    * - Raw Python AST
