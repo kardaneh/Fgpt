@@ -4,7 +4,7 @@ DATE=$(date +"%Y%m%d")
 TODAY=$(date +"%Y%m%d_%H%M%S")
 
 # Choose which fgpt subcommand this setup should drive.
-#   "isolator" -> fgpt isolate  ... (Stages 1 & 2)
+#   "isolator" -> fgpt isolate  ... (Stages 1 - 3)
 #   "autodiff" -> fgpt autodiff ... (Stage 3)
 COMMAND="isolator"
 
@@ -29,7 +29,7 @@ TARGET_SUBROUTINES="hydrol_alma hydrol_vegupd hydrol_canop hydrol_flood hydrol_h
 OPENACC="False"
 F2PY="True"
 TAPENADE="False"
-PY2JX="True"
+PY2JX="False"
 
 # Autodiff configuration
 CONFIG_PATH="template.yaml"

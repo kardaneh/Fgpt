@@ -54,7 +54,6 @@ FGPT addresses these challenges through a structured, three-phase transformation
 - Fortran parsing and AST generation (Processor)
 - Target subroutine isolation and cross-module dependency resolution (Isolator, Navigator)
 - Structural analysis and metadata extraction, including array-shape inference (Extractor, Shaper)
-- Optional AST-level rewriting for vectorization and GPU adaptation (Modifier)
 
 **Middle-end — transpiling to NumPy:**
 
@@ -86,9 +85,9 @@ Architecture Overview
 
     Fortran Source                Frontend                  Middle-End              Backend
     ───────────────   ───────────────────────────────   ─────────────────   ─────────────────────
-       .f / .f90   →  Processor → Isolator → Navigator   →   F2NP           →   AutoDiff
-                       → Extractor (+ Shaper) → Modifier →   → Transformer  →   → JaxConverter
-                                                              (NumPy output)     (JAX/Equinox output)
+       .f / .f90   →  Processor → Isolator → Navigator →   Transformer    →      AutoDiff
+                       → Extractor (+ Shaper)                 F2NP             JaxConverter
+                                                         (NumPy output)     (JAX/Equinox output)
 
 See :doc:`architecture` for the full class-by-class breakdown of each phase.
 
@@ -107,28 +106,25 @@ Key Components
 4. **Extractor**
    Identifies subroutines, variables, loops, and dependency structures via static analysis.
    Delegates array-shape and dimension inference to the **Shaper**.
-5. **Modifier**
-   Optional AST-level rewriting pass for vectorization, GPU adaptation, and other
-   non-portable-construct fixes, applied before transpiling begins.
 
 **Middle-end**
 
-6. **Intrinsic System**
+5. **Intrinsic System**
    Normalizes Fortran intrinsic functions (``SUM``, ``MAXVAL``, ``RESHAPE``, etc.)
    into their NumPy equivalents; used by F2NP during translation.
-7. **F2NP**
+6. **F2NP**
    Performs statement- and expression-level translation of the Fortran AST into a raw
    Python AST.
-8. **Transformer**
+7. **Transformer**
    Assembles F2NP's output into a proper Python class (attributes, method calls, I/O
    boilerplate) and emits the final NumPy-based ``.py`` file.
 
 **Backend**
 
-9. **AutoDiff**
+8. **AutoDiff**
    Restructures the NumPy class into an ``eqx.Module`` (class-level orchestration),
    analogous to Transformer's role in the middle-end.
-10. **JaxConverter**
+9. **JaxConverter**
     Specialized, analysis-driven pipeline that rewrites control flow and expressions
     (loops, conditionals, array updates) into JAX-traceable, GPU/TPU-executable code.
 

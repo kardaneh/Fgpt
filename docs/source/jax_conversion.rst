@@ -91,7 +91,7 @@ Given a NumPy class such as:
            self.kjpindex = 100
            self.soil_temp = np.zeros(100)
 
-       def compute(self):
+       def hydrol_alma(self):
            for ji in range(0, self.kjpindex):
                self.soil_temp[ji] = self.soil_temp[ji] + 1.0
 
@@ -116,7 +116,7 @@ The conversion produces an Equinox module where:
        soil_temp: jnp.ndarray
 
        @eqx.filter_jit
-       def compute(self):
+       def hydrol_alma(self):
            def _scan_body_0(carry, ji):
                soil_temp = carry
                soil_temp = soil_temp.at[ji].set(soil_temp[ji] + 1.0)
@@ -143,6 +143,7 @@ transpiler (or any compatible NumPy class files) to
    autodiff = AutoDiff(
        config_path="template.yaml",
        mode="jax",
+       vectorize=["kjpindex"]
    )
 
    routine = "hydrol_alma"
@@ -239,6 +240,7 @@ before being unparsed:
    autodiff.transform(
         class_file = class_tree,
         main_file = main_tree,
+        routine_dir = f"hydrol/{routine}/"
     )
    # Unparse to source global
    class_source = ast.unparse(ast.fix_missing_locations(class_tree))
@@ -291,6 +293,68 @@ The following table summarises the key rewriting rules applied by
      - *(removed)*
      - Stripped by ``RemoveLogging`` before tracing begins.
 
+.. _checkpointed-while-bounds:
+
+Static Bound Inference for Checkpointed While-Loops
+-----------------------------------------------------
+
+Reverse-mode automatic differentiation through a data-dependent ``while``
+loop cannot rely on the standard unroll-and-reverse strategy used for
+fixed-length loops, since the number of iterations is not known at trace
+time. JAX's checkpointed while-loop primitive
+(``equinox.internal.checkpointed_while_loop``, used in ``bwd`` mode)
+addresses this by pre-allocating a fixed number of checkpoint slots, and
+therefore requires an explicit upper bound on the number of iterations
+(``max_steps``) before tracing begins, even though the original Python
+source expresses no explicit iteration limit.
+
+Rather than requiring the user to annotate loops with iteration bounds, or
+conservatively applying a single global constant to every loop, FGPT infers
+the bound automatically for the common case in which it is statically
+derivable, and falls back to a configurable conservative constant only when
+it is not.
+
+The inference targets loops of the form::
+
+    idx = init
+    while cond(idx, bound):
+        ...
+        idx = idx ± step
+
+where ``init``, ``bound``, and ``step`` are all statically resolvable at
+transform time (constants, attribute lookups, or arithmetic combinations
+thereof — not dependent on runtime array values). For such loops, the
+number of iterations is bounded exactly by:
+
+.. math::
+
+   \text{max_steps} =
+   \left\lfloor \frac{init - bound}{step} \right\rfloor + 1
+   \quad \text{(decreasing index, condition } idx > bound\text{)}
+
+.. math::
+
+   \text{max_steps} =
+   \left\lfloor \frac{bound - init}{step} \right\rfloor + 1
+   \quad \text{(increasing index, condition } idx < bound\text{)}
+
+This pattern is detected syntactically at the AST level: candidate index
+variables are identified from assignments of the form ``idx = idx ± step``
+in the loop body, and the loop condition is scanned for a comparison
+involving the same variable against a statically-resolvable bound. When
+found, the bound expression is constructed as an AST expression referencing
+the original ``init``, ``bound``, and ``step`` subexpressions, so it is
+evaluated at *runtime* using the model's actual parameter values (e.g. grid
+dimensions), rather than being hard-coded as a literal at transform time.
+
+When no such pattern is found, for example, in convergence loops whose
+termination depends on a runtime array value such as a residual norm, no
+sound static bound exists, and the transformation instead emits a
+configurable default (``default_max_steps``). This guarantees that every
+generated checkpointed while-loop remains executable, at the cost of a
+looser (but always safe) checkpoint allocation for loops whose termination
+is genuinely data-dependent.
+
 .. _known-limitations:
 
 Known Limitations
@@ -316,10 +380,10 @@ constructs are not yet supported, or are only partially supported:
   reverse-mode differentiation through the loop.
 - **Differentiation call sites.** As noted above, ``jax.grad``,
   ``jax.jvp``, and ``jax.vjp`` are not yet emitted automatically in any
-  mode.
+  mode of fwd or bwd.
 
 If you encounter a construct that silently produces incorrect output
-rather than a clear error, please report it — the priority for upcoming
+rather than a clear error, please report it, the priority for upcoming
 releases is converting silent failures into explicit, actionable errors
 at conversion time.
 

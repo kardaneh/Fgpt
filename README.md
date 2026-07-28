@@ -4,6 +4,7 @@
 [![License](https://img.shields.io/badge/License-CC%20BY--NC--SA%204.0-blue.svg)](https://creativecommons.org/licenses/by-nc-sa/4.0/)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
 [![Documentation](https://img.shields.io/badge/docs-Sphinx-green.svg)](./docs)
+[![CI](https://github.com/kardaneh/IPSL-Fgpt/actions/workflows/ci.yaml/badge.svg)](https://github.com/kardaneh/IPSL-Fgpt/actions/workflows/ci.yaml)
 
 **FGPT** is a source-to-source transpiler that converts production scientific
 Fortran code into executable NumPy-based Python, and optionally into
@@ -61,7 +62,6 @@ and enabling precise, auditable transformations at every stage.
    │       ├── cli.py                     # Command-line interface
    │       ├── version.py                 # Package version
    │       ├── isolator.py                # Fortran isolation pipeline
-   │       ├── gpu_isolator.py            # GPU/OpenACC Fortran isolation pipeline
    │       ├── autodiff.py                # JAX/Tapenade conversion pipeline
    │       │
    │       ├── core/
@@ -158,7 +158,7 @@ and enabling precise, auditable transformations at every stage.
 │  Stage 1 — Isolation & Analysis         │
 │  Processor → Isolator                   │
 │       ├── Navigator  ─┐                 │
-│       └── Extractor ◄─┘  → Modifier     │
+│       └── Extractor ◄─┘                 │
 └────────────────────┬────────────────────┘
                      │ corrected Fortran AST
                      ▼
