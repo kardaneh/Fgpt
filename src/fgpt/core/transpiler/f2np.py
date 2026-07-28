@@ -1,5 +1,5 @@
 # Copyright 2026 IPSL / CNRS / Sorbonne University
-# Authors: Shivamshan Sivanesan, Kazem Ardaneh
+# Authors: Shivamshan Sivanesan and Kazem Ardaneh
 #
 # This work is licensed under the Creative Commons
 # Attribution-NonCommercial-ShareAlike 4.0 International License.
@@ -996,8 +996,13 @@ class F2NP:
             function_node, args_spec_list = stmt.children
             func_name = function_node.string
 
+            extractor = getattr(self, "extractor", None)
+
             # Case 1: regular function call
-            if func_name not in self.extractor.allowed_external_subroutines:
+            if (
+                extractor is None
+                or func_name not in extractor.allowed_external_subroutines
+            ):
                 return ast.Expr(
                     value=self._build_regular_call(func_name, args_spec_list)
                 )
@@ -1636,10 +1641,14 @@ class F2NP:
             The conventional variable name, or ``None`` if no mapping
             exists for the given key/variable pair.
         """
+        extractor = getattr(self, "extractor", None)
+        if extractor is None:
+            return None
+
         normalized_upper_key = upper_key.replace(" ", "")
 
         mapping = {}
-        for key, var_set in self.extractor.loop_dict.items():
+        for key, var_set in extractor.loop_dict.items():
             normalized_key = key.replace(" ", "")  # normalize keys from loop_dict
 
             if len(var_set) == 1:
@@ -3444,9 +3453,13 @@ class F2NP:
             Re-raises any unexpected error after logging.
         """
         try:
+            extractor = getattr(self, "extractor", None)
+            if extractor is None:
+                return node
+
             # Handle variable names like: array
             if isinstance(node, ast.Name):
-                for elements in self.extractor.all_array_info.values():
+                for elements in extractor.all_array_info.values():
                     if node.id in elements.keys():
                         return ast.Subscript(
                             value=ast.Name(id=node.id, ctx=ast.Load()),
@@ -3458,7 +3471,7 @@ class F2NP:
             elif isinstance(node, ast.Subscript):
                 base = node.value
                 if isinstance(base, ast.Name):
-                    for elements in self.extractor.all_array_info.values():
+                    for elements in extractor.all_array_info.values():
                         if base.id in elements.keys():
                             # Recursively apply masking to subscript slice
                             node.slice = self.apply_mask_to_rhs(node.slice)
@@ -3491,7 +3504,7 @@ class F2NP:
             elif isinstance(node, ast.Attribute):
                 # Check if this attribute is a known array (only if it's in tracking attributes in all_array_info)
                 attr_str = node.attr  # For example: "obj.attr"
-                for elements in self.extractor.all_array_info.values():
+                for elements in extractor.all_array_info.values():
                     if attr_str in elements.keys():
                         return ast.Subscript(
                             value=node,

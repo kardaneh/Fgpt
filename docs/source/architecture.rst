@@ -27,7 +27,7 @@ High-Level Pipeline
             │
             ▼
     ┌───────────────────┐
-    │     Frontend      │  Processor · Isolator · Navigator · Extractor · Modifier
+    │     Frontend      │  Processor · Isolator · Navigator · Extractor
     │  (parse + IR gen) │
     └────────┬──────────┘
              │  standalone Fortran AST (IR) + metadata
@@ -85,14 +85,6 @@ modified), and implicit shape information. It is stateful and should be
 re-instantiated per independent analysis session. Array-shape and dimension
 inference specifically is delegated to
 :class:`~fgpt.core.analysis.shaper.Shaper`.
-
-:class:`~fgpt.core.passes.modifier.Modifier` is an **IR-to-IR pass**: it
-optionally rewrites the Fortran AST before transpiling begins, targeting
-non-portable constructs, restructuring loops for vectorisation, adapting
-conditional structures, and preparing GPU-oriented memory movement patterns.
-It assumes prior parsing by
-:class:`~fgpt.core.frontend.processor.Processor` and analysis by
-:class:`~fgpt.core.frontend.extractor.Extractor`.
 
 **Key IR artefacts produced:**
 
@@ -305,7 +297,6 @@ passes, ``transpiler/`` holds the Fortran → NumPy IR transpiler (middle-end),
     ├── cli.py                     # Command-line interface (driver)
     ├── version.py                 # Package version
     ├── isolator.py                # Frontend driver: Fortran isolation pipeline
-    ├── gpu_isolator.py            # Frontend driver: GPU/OpenACC isolation pipeline
     ├── autodiff.py                # Backend driver: JAX pipeline
     │
     ├── core/
@@ -368,11 +359,10 @@ means each phase can be developed, tested, and executed independently, and
 new backends could in principle be added alongside the JAX one without
 touching the frontend or middle-end.
 
-**IR-centric transformations.** All rewriting — whether at the Fortran-IR
-level (``Modifier``), the NumPy-IR level (``ReplaceGlobals``,
-``AdjustIndices``), or the JAX target level (``JaxConverter``) — operates on
-AST representations rather than source text, ensuring structural correctness
-and enabling precise node-level introspection.
+**IR-centric transformations.** All rewriting — whether at the NumPy-IR level
+(``ReplaceGlobals``, ``AdjustIndices``), or the JAX target level
+(``JaxConverter``) — operates on AST representations rather than source text,
+ensuring structural correctness and enabling precise node-level introspection.
 
 **Progressive metadata enrichment.** The frontend's ``Extractor`` builds the
 symbol table and metadata structures (array shapes, scope maps, loop

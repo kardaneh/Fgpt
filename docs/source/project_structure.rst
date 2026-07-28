@@ -19,7 +19,6 @@ pipeline description.
    │       ├── cli.py                     # Command-line interface
    │       ├── version.py                 # Package version
    │       ├── isolator.py                # Fortran isolation pipeline
-   │       ├── gpu_isolator.py            # GPU/OpenACC Fortran isolation pipeline
    │       ├── autodiff.py                # JAX/Tapenade conversion pipeline
    │       │
    │       ├── core/
@@ -219,8 +218,6 @@ Top-Level Drivers
      - Command-line interface exposing the ``isolate`` and ``autodiff`` subcommands
    * - ``isolator.py``
      - Frontend driver: separates independent code blocks for modular transformation and analysis
-   * - ``gpu_isolator.py``
-     - Frontend driver: separates independent code blocks with GPU/OpenACC compatibility
    * - ``autodiff.py``
      - Backend driver: AST-based transformations for JAX compatibility and code rewriting for automatic differentiation
    * - ``version.py``

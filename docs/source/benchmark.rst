@@ -415,7 +415,7 @@ NVIDIA HPC Fortran compiler through an MPI wrapper:
 **Hardware**
 
 - CPU model: *AMD EPYC 7302 16-Core Processor*
-- Core count used: *64*
+- Core count used: *1*
 - Memory: *6GiB*
 
 **Software versions**

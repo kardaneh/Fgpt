@@ -34,20 +34,11 @@ testing a single routine in isolation requires:
 The Isolator automates this entire workflow. Optionally, if a
 :class:`~fgpt.core.transpiler.transformer.Transformer` instance is supplied,
 it also triggers the Fortran-to-Python transpilation of each isolated
-routine immediately after the Fortran isolation step completes.
-
-.. note::
-   This class (:class:`~fgpt.isolator.Isolator`, top-level module
-   ``fgpt/isolator.py``) is the general-purpose isolation pipeline. A
-   parallel, GPU/OpenACC-specialised implementation exists at
-   ``fgpt/gpu_isolator.py`` (:mod:`~fgpt.gpu_isolator`). The ``openacc``
-   flag described below is documented here as affecting
-   :class:`~fgpt.core.passes.modifier.Modifier` behaviour within this
-   class; given the existence of a separate ``gpu_isolator`` module,
-   please confirm whether GPU-target isolation should actually route
-   through that module instead of (or in addition to) this one — the
-   division of responsibility between the two is not fully clear from
-   the source tree alone.
+routine immediately after the Fortran isolation step completes. If the
+``py2jx`` flag is additionally enabled, the resulting Python output is then
+passed to the JAX/Equinox conversion stage (Stage 3), producing a
+JAX-traceable Equinox module directly from the isolated Fortran routine
+without requiring a separate manual invocation.
 
 Isolation Workflow
 ------------------
@@ -92,9 +83,13 @@ follows:
         │  8. update_main_program — write           │
         │     standalone driver program             │
         │  9. compile_and_run — validate output     │
-        │ 10. (optional) core.transpiler.transformer  │
+        │ 10. (optional) core.transpiler.transformer│
         │     .Transformer — transpile to Python    │
         │     immediately                           │
+        │ 11. (optional) core.autodiff.AutoDiff     │
+        │     convert Stage 2's Python output to    │
+        │     JAX/Equinox (Stage 3, py2jx=True;     │
+        │     requires f2py=True)                   │
         └────────┬──────────────────────────────────┘
                  │
                  ▼
@@ -127,10 +122,12 @@ For each isolated subroutine, the Isolator creates a directory under
 
     <target_module>/
     └── <subroutine_name>/
-        ├── global_module_<subroutine_name>.f90   standalone module with all dependencies
-        ├── main_<subroutine_name>.f90            driver program: declares vars, calls routine, writes outputs
-        ├── global_module_<subroutine_name>.py    (if f2py=True) transpiled Python class
-        └── main_<subroutine_name>.py             (if f2py=True) transpiled Python driver
+        ├── global_module_<subroutine_name>.f90         standalone module with all dependencies
+        ├── main_<subroutine_name>.f90                  driver program: declares vars, calls routine, writes outputs
+        ├── global_module_<subroutine_name>.py          (if f2py=True) transpiled Python class
+        ├── main_<subroutine_name>.py                   (if f2py=True) transpiled Python driver
+        ├── global_module_<subroutine_name>_<mode>.py   (if py2jx=True) transformed NumPy code to JAX based on the mode
+        └── main_<subroutine_name>_<mode>.py            (if py2jx=True) transformed NumPy code to JAX based on the mode
 
 The Fortran driver is compiled and executed automatically as a validation
 step. If compilation or execution fails, an assertion error is raised and
@@ -183,6 +180,35 @@ is instantiated internally and called after each Fortran isolation step,
 writing ``global_module_<routine>.py`` and ``main_<routine>.py`` alongside
 the Fortran output files.
 
+To run the complete pipeline through JAX/Equinox conversion (Stage 3),
+enable ``py2jx`` in addition to ``f2py``:
+
+.. code-block:: python
+
+   isolator = Isolator(
+       rest_of_path="modipsl/modeles/ORCHIDEE/src_sechiba/",
+       target_module="hydrol",
+       work="/scratch/user/runs",
+       f2py=True,
+       py2jx=True,
+   )
+
+   isolator.run(
+       parent_subroutine="hydrol_main",
+       target_subroutines=["hydrol_soil"],
+       vectorize=["kjpindex"],
+       config_path="template.yaml",     # yours or the packaged default template
+       mode="jax",                      # "jax" | "fwd" | "bwd"
+       benchmark_dir="benchmark_dir"
+   )
+
+With ``py2jx=True``, the JAX conversion stage operates directly on the
+Python output produced by the preceding ``f2py`` step (``global_module_
+<routine>.py`` and ``main_<routine>.py``), producing corresponding
+JAX/Equinox output files alongside them. If ``f2py`` is not explicitly set
+to ``True`` when ``py2jx=True``, it is enabled automatically, consistent
+with the CLI's behavior in ``fgpt.cli``.
+
 Command-Line Interface
 ~~~~~~~~~~~~~~~~~~~~~~
 
@@ -199,7 +225,12 @@ writing any Python code:
        --target_subroutines hydrol_soil hydrol_alma \
        --f2py True \
        --openacc False \
-       --tapenade False
+       --tapenade False \
+       --py2jx False \
+       --mode jax \
+       --config_path template.yaml \
+       --vectorize kjpindex \
+       --benchmark_dir benchmark/ \
 
 All arguments mirror the Python API parameters. ``--target_subroutines``
 accepts a space-separated list of routine names.
@@ -234,10 +265,7 @@ Parameters and Flags
    * - ``openacc``
      - ``False``
      - If ``True``, OpenACC directives are preserved and included in the
-       isolated output. Enables GPU-oriented isolation paths in
-       :class:`~fgpt.core.passes.modifier.Modifier` — and/or
-       :mod:`~fgpt.gpu_isolator`; see the note above regarding which
-       module actually owns GPU-target isolation.
+       isolated output.
    * - ``tapenade``
      - ``False``
      - If ``True``, the isolated Fortran output is prepared for Tapenade
@@ -246,6 +274,14 @@ Parameters and Flags
        (described elsewhere as the "JAX/Tapenade conversion pipeline"),
        though the exact hand-off point between ``Isolator`` and
        ``autodiff`` is not documented here and should be confirmed.
+   * - ``py2jx``
+     - ``False``
+     - If ``True``, a JAX/Equinox conversion (Stage 3) is triggered
+       immediately after the Fortran-to-Python transpilation step,
+       operating on the Python output produced by ``f2py``. Since Stage 3
+       consumes Stage 2's output, ``py2jx=True`` requires ``f2py=True``;
+       if ``f2py`` is not explicitly enabled, it is automatically set to
+       ``True`` with a warning.
 
 
 Source Preservation
@@ -279,23 +315,24 @@ Relationship to Other Components
      - Called by :class:`~fgpt.core.frontend.extractor.Extractor` to
        resolve variable declarations and subroutine definitions that are
        imported from other modules via ``USE`` associations.
-   * - :class:`~fgpt.core.passes.modifier.Modifier`
-     - Optionally rewrites the Fortran AST before isolation to normalise
-       non-portable constructs, restructure loops, or prepare GPU
-       patterns.
    * - :class:`~fgpt.core.transpiler.transformer.Transformer`
      - Optionally invoked (when ``f2py=True``) after each subroutine is
        isolated to produce the corresponding Python class and driver
        files.
-   * - :mod:`~fgpt.gpu_isolator`
-     - GPU/OpenACC-specialised counterpart to this class; relationship to
-       the ``openacc`` flag above should be confirmed (see note).
+   * - :class:`~fgpt.autodiff.AutoDiff`
+     - Optionally invoked (when ``py2jx=True``) after the Fortran-to-Python
+       transpilation step to convert the transpiled Python output into a
+       JAX/Equinox-compatible module (Stage 3). Requires ``f2py=True``,
+       since it consumes the Python files produced by
+       :class:`~fgpt.core.transpiler.transformer.Transformer`.
 
 See Also
 --------
 
 * :doc:`transformation` — The Fortran-to-Python transpilation stage that
   the Isolator feeds into when ``f2py=True``.
+* :doc:`jax_conversion` — The Python-to-JAX transformation stage to a
+  jax compatible ``py2jx=True``.
 * :doc:`architecture` — How the Isolator fits into the overall FGPT
   pipeline.
 * :doc:`extractor` — Process of extraction.

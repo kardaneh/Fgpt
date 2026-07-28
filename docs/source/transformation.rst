@@ -19,7 +19,7 @@ statement-level translation.
 Overview
 --------
 
-The pipeline proceeds in three broad phases:
+The pipeline proceeds in two broad phases:
 
 1. **Preprocessing** — The target Fortran subroutine is located, parsed,
    and structurally analysed. :class:`~fgpt.core.frontend.processor.Processor`
@@ -36,16 +36,7 @@ The pipeline proceeds in three broad phases:
    stage. Array shape/dimension resolution specifically is delegated to
    :mod:`~fgpt.core.analysis.shaper`.
 
-2. **Optional Fortran-level correction**
-   (:class:`~fgpt.core.passes.modifier.Modifier`) — Before transpilation,
-   the isolated Fortran AST may be rewritten to remove non-portable
-   constructs, restructure loops for vectorisation, or prepare GPU-oriented
-   patterns. This pass operates entirely within the Fortran AST and
-   produces no Python output of its own. For GPU/OpenACC-targeted
-   isolation specifically, see :mod:`~fgpt.gpu_isolator` rather than the
-   general-purpose :class:`~fgpt.isolator.Isolator`.
-
-3. **Transpilation** (:class:`~fgpt.core.transpiler.f2np.F2NP` +
+2. **Transpilation** (:class:`~fgpt.core.transpiler.f2np.F2NP` +
    :class:`~fgpt.core.transpiler.transformer.Transformer`) — The
    statement-level translator walks the (possibly modified) Fortran AST
    subroutine by subroutine and emits a raw Python :mod:`ast` tree,
@@ -66,16 +57,6 @@ translation to correct the raw output before it is written to disk:
 - ``AdjustIndices`` compensates for Fortran's 1-based array indexing by
   inserting ``- 1`` offsets at every array subscript and adjusting loop
   bounds correspondingly, since Python arrays are 0-based.
-
-.. note::
-   **Path correction pending verification.** The previous revision of this
-   document located these two classes at ``fgpt.utils``, which does not
-   exist in the current tree. The current source layout has no single
-   obvious home for them — the closest candidates are
-   :mod:`~fgpt.core.transpiler.transformer` (same package as their caller)
-   or :mod:`~fgpt.core.common.utils` (general shared helpers). Please
-   confirm the actual defining module and update the ``:class:`` targets
-   above accordingly; they are left unlinked here rather than guessed.
 
 Pipeline Diagram
 ~~~~~~~~~~~~~~~~
@@ -107,12 +88,6 @@ Pipeline Diagram
         └───────┬───────┘
                 │  metadata
                 ▼
-        ┌──────────────────────────────┐
-        │ core.passes.modifier         │  optional Fortran-level rewrites (portability / GPU / vectorisation)
-        │   Modifier                   │
-        └───────┬──────────────────────┘
-                │  corrected Fortran AST
-                ▼
         ┌────────────────────────────────┐
         │ core.transpiler.f2np           │  source-to-source: Fortran statements & expressions → Python AST
         │   F2NP  ──uses──▶ core.transpiler.intrinsic (Fortran → NumPy mapping)
@@ -120,7 +95,7 @@ Pipeline Diagram
                 │  raw Python AST
                 ▼
         ┌──────────────────────────────┐
-        │ core.transpiler.transformer    │  class scaffolding, dependency resolution, I/O, output
+        │ core.transpiler.transformer  │  class scaffolding, dependency resolution, I/O, output
         │   Transformer                │
         └───────┬──────────────────────┘
                 │
@@ -171,13 +146,6 @@ an AST via :class:`~fgpt.core.frontend.processor.Processor`, stores both
 the original and a re-parsed copy for structural transformation, and
 prepares metadata about internal subroutine calls and dependency flags
 used by downstream passes.
-
-.. note::
-   :mod:`~fgpt.gpu_isolator` provides an analogous isolation pipeline
-   specialised for GPU/OpenACC targets and is not covered by this class;
-   see that module's documentation for isolation of GPU-oriented
-   subroutines.
-
 
 Cross-Module Navigator
 ----------------------
@@ -230,37 +198,7 @@ Array Shape Analysis
 :mod:`~fgpt.core.analysis.shaper` provides dedicated array shape and
 dimension analysis, factored out of the Extractor into its own module. It
 is invoked by :class:`~fgpt.core.frontend.extractor.Extractor` while
-building metadata, and its results are also consulted by
-:class:`~fgpt.core.passes.modifier.Modifier` when resolving implicit array
-shapes during Fortran-level rewriting.
-
-
-Fortran Code Modifier
----------------------
-
-:class:`~fgpt.core.passes.modifier.Modifier` is an optional pass that
-rewrites the Fortran AST *before* transpilation begins. It operates
-entirely within the Fortran representation and produces no Python
-output — its purpose is to normalise the source so that
-:class:`~fgpt.core.transpiler.f2np.F2NP` encounters only constructs it can
-translate directly.
-
-Key responsibilities include:
-
-- Rewriting unsupported or non-portable Fortran constructs into
-  translatable equivalents.
-- Transforming array operations and resolving implicit array shapes (via
-  :mod:`~fgpt.core.analysis.shaper`).
-- Restructuring loops for vectorisation and inserting vector loop
-  patterns.
-- Normalising conditional structures (``IF`` / ``ELSE IF`` / ``ELSE``).
-- Adapting subroutine call patterns for the target translation.
-- Preparing GPU-oriented memory movement patterns for OpenACC targets.
-
-The Modifier assumes prior parsing by
-:class:`~fgpt.core.frontend.processor.Processor` and metadata extraction
-by :class:`~fgpt.core.frontend.extractor.Extractor`. It should not be
-reused across unrelated transpilation sessions without reinitialization.
+building metadata.
 
 
 Statement-Level Translator
@@ -476,8 +414,7 @@ consumes the key intermediate artefacts:
      - ``fparser`` AST
    * - Isolation artefacts
      - :class:`~fgpt.isolator.Isolator`
-     - :class:`~fgpt.core.passes.modifier.Modifier`,
-       :class:`~fgpt.core.transpiler.f2np.F2NP`
+     - :class:`~fgpt.core.transpiler.f2np.F2NP`
      - ``fparser`` AST + metadata dicts
    * - Extracted metadata (``cls_info``, arrays, loops, scopes)
      - :class:`~fgpt.core.frontend.extractor.Extractor` (array shapes via
@@ -486,7 +423,6 @@ consumes the key intermediate artefacts:
        :meth:`~fgpt.core.transpiler.transformer.Transformer.correct_function`
      - :class:`dict`
    * - Corrected Fortran AST
-     - :class:`~fgpt.core.passes.modifier.Modifier`
      - :class:`~fgpt.core.transpiler.f2np.F2NP`
      - ``fparser`` AST
    * - Raw Python AST
@@ -512,8 +448,5 @@ See Also
   the transpiled Python output, implemented under
   :mod:`~fgpt.core.backends.jax_converter` and orchestrated by
   :mod:`~fgpt.autodiff`.
-* :mod:`~fgpt.gpu_isolator` — GPU/OpenACC-specialised counterpart to
-  :class:`~fgpt.isolator.Isolator`, not otherwise covered in this
-  document.
 * :doc:`architecture` — How this transpilation layer fits into the
   overall FGPT pipeline.

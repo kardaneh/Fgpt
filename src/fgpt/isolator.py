@@ -1,5 +1,5 @@
 # Copyright 2026 IPSL / CNRS / Sorbonne University
-# Authors: Shivamshan Sivanesan, Kazem Ardaneh
+# Authors: Shivamshan Sivanesan and Kazem Ardaneh
 #
 # This work is licensed under the Creative Commons
 # Attribution-NonCommercial-ShareAlike 4.0 International License.
@@ -28,7 +28,7 @@ class Isolator:
 
     This process is particularly useful for:
     - Isolated testing or debugging of specific Fortran routines
-    - Simplified transformation, such as source-to-source translation (e.g., to Python)
+    - Simplified transformation, such as source-to-source translation (e.g., to NumPy, JAX)
     - Generating standalone reproducible test cases from large code bases
 
     Functionality
@@ -77,7 +77,7 @@ class Isolator:
     -----
     The isolation workflow is designed to be extendable. This class can later be
     used in conjunction with automatic input generation, test harness creation,
-    or source-to-source translation routines.
+    or source-to-source translation routines using ``py2jx`` or ``f2np``.
     """
 
     def __init__(

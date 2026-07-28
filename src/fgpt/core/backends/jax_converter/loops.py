@@ -1,5 +1,5 @@
 # Copyright 2026 IPSL / CNRS / Sorbonne University
-# Authors: Shivamshan Sivanesan, Kazem Ardaneh
+# Authors: Shivamshan Sivanesan and Kazem Ardaneh
 #
 # This work is licensed under the Creative Commons
 # Attribution-NonCommercial-ShareAlike 4.0 International License.
@@ -1136,6 +1136,129 @@ class _LoopLowering:
             self.logger.exception("Exception in get_initial_values_from_stack:", e)
             raise
 
+    def _infer_max_steps(
+        self,
+        test: ast.AST,
+        body: list[ast.AST],
+        initial_values: dict[str, ast.AST | None],
+    ) -> ast.AST | None:
+        """
+        Attempt to statically derive a ``max_steps`` bound for a
+        ``while`` loop being lowered into
+        :func:`eqx.internal.checkpointed_while_loop`.
+
+        Looks for the common pattern of a scalar index variable that is
+        incremented or decremented by a static step each iteration, and
+        compared against a static bound in the loop condition. When found,
+        the iteration count is derived as an AST expression referencing
+        the loop's initial value, bound, and step -- so it is evaluated at
+        runtime rather than baked in as a constant.
+
+        Returns
+        -------
+        ast.AST | None
+            An expression computing ``max_steps``, or ``None`` if the
+            pattern is not recognized and a fallback should be used.
+        """
+        try:
+            # Find a scalar index update of the form idx = idx +/- step
+            candidates = {}  # idx_name -> (op_type, step_node)
+            for stmt in body:
+                if not isinstance(stmt, ast.Assign) or len(stmt.targets) != 1:
+                    continue
+                target = stmt.targets[0]
+                if not isinstance(target, ast.Name):
+                    continue
+                idx_name = target.id
+                value = stmt.value
+                if not isinstance(value, ast.BinOp) or not isinstance(
+                    value.op, ast.Add | ast.Sub
+                ):
+                    continue
+
+                # idx = idx - step  OR  idx = step_expr_reversed (rare) -- only
+                # handle the standard left-associated case: left is the idx itself.
+                if isinstance(value.left, ast.Name) and value.left.id == idx_name:
+                    step_node = value.right
+                else:
+                    continue
+
+                if not self.is_static_expr(step_node):
+                    continue
+
+                candidates[idx_name] = (type(value.op), step_node)
+
+            if not candidates:
+                return None
+
+            # Find a Compare in the condition matching one of these names
+            for cmp_node in ast.walk(test):
+                if not isinstance(cmp_node, ast.Compare) or len(cmp_node.ops) != 1:
+                    continue
+
+                left, op, right = (
+                    cmp_node.left,
+                    cmp_node.ops[0],
+                    cmp_node.comparators[0],
+                )
+
+                idx_name = None
+                bound_node = None
+                if isinstance(left, ast.Name) and left.id in candidates:
+                    idx_name = left.id
+                    bound_node = right
+                elif isinstance(right, ast.Name) and right.id in candidates:
+                    idx_name = right.id
+                    bound_node = left
+                    # normalize: flip comparison direction since idx is now on the right
+                    op = self._flip_compare(op)
+
+                if idx_name is None or not self.is_static_expr(bound_node):
+                    continue
+
+                init_node = initial_values.get(idx_name)
+                if init_node is None:
+                    continue
+
+                op_type, step_node = candidates[idx_name]
+
+                # Decreasing index: idx -= step, loop continues while idx > bound
+                if op_type is ast.Sub and isinstance(op, ast.Gt | ast.GtE):
+                    numerator = ast.BinOp(
+                        left=init_node, op=ast.Sub(), right=bound_node
+                    )
+                # Increasing index: idx += step, loop continues while idx < bound
+                elif op_type is ast.Add and isinstance(op, ast.Lt | ast.LtE):
+                    numerator = ast.BinOp(
+                        left=bound_node, op=ast.Sub(), right=init_node
+                    )
+                else:
+                    # Direction of update and condition don't match a bounded pattern
+                    continue
+
+                # max_steps = (numerator // step) + 1
+                floordiv = ast.BinOp(left=numerator, op=ast.FloorDiv(), right=step_node)
+                max_steps_expr = ast.BinOp(
+                    left=floordiv, op=ast.Add(), right=ast.Constant(value=1)
+                )
+                return ast.fix_missing_locations(max_steps_expr)
+
+            return None
+        except Exception as e:
+            self.logger.exception("Exception in _infer_max_steps:", e)
+            return None
+
+    @staticmethod
+    def _flip_compare(op: ast.cmpop) -> ast.cmpop:
+        """Flip a comparison operator when swapping the sides of a Compare."""
+        mapping = {
+            ast.Lt: ast.Gt(),
+            ast.LtE: ast.GtE(),
+            ast.Gt: ast.Lt(),
+            ast.GtE: ast.LtE(),
+        }
+        return mapping.get(type(op), op)
+
     def visit_While(self, node: ast.While) -> list[ast.AST]:
         """
         Transform a Python ``while`` loop into an
@@ -1418,9 +1541,20 @@ class _LoopLowering:
             )
             # Select execution mode (lax vs checkpointed)
             if self.mode in ["fwd", "jax"]:
-                kind = ast.keyword(arg="kind", value=ast.Constant(value="lax"))
+                while_keywords = ast.keyword(
+                    arg="kind", value=ast.Constant(value="lax")
+                )
             else:
                 kind = ast.keyword(arg="kind", value=ast.Constant(value="checkpointed"))
+                max_steps_expr = self._infer_max_steps(
+                    node.test, node.body, intial_values
+                )
+                if max_steps_expr is None:
+                    max_steps_expr = ast.Constant(
+                        value=getattr(self, "default_max_steps", 1000)
+                    )
+                max_steps_kw = ast.keyword(arg="max_steps", value=max_steps_expr)
+                while_keywords = [kind, max_steps_kw]
             input_elts = []
             for state_input in state_inputs:
                 if state_input in inputs:
@@ -1445,7 +1579,9 @@ class _LoopLowering:
                         ast.Name(id="body_fn", ctx=ast.Load()),
                         ast.Name(id="init_state", ctx=ast.Load()),
                     ],
-                    keywords=[kind],
+                    keywords=[while_keywords]
+                    if isinstance(while_keywords, ast.AST)
+                    else while_keywords,
                 ),
             )
 
