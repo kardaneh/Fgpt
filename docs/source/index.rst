@@ -13,6 +13,25 @@ NumPy, JAX, or other Python-based numerical ecosystems.
 
 GitHub repository: https://github.com/kardaneh/FGPT.git
 
+.. admonition:: Development Status
+   :class: important
+
+   **FGPT is in active development.**
+
+   This framework is still a Proof of Concept currently undergoing rapid development
+   and has not yet reached a stable release. Please be aware that:
+
+   * APIs and interfaces may change without notice
+   * Feature names and module structures are subject to modification
+   * Core architectural decisions may be revised
+
+   **Recommendations for users:**
+
+   - Regularly update from the main branch
+   - Rebase local branches frequently to avoid conflicts
+   - Submit pull requests for broadly useful enhancements
+   - Report issues for unexpected behavior or bugs.
+
 Key Features
 ------------
 
