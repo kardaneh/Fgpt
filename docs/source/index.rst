@@ -18,7 +18,7 @@ GitHub repository: https://github.com/kardaneh/FGPT.git
 
    **FGPT is in active development.**
 
-   This framework is still a Proof of Concept currently undergoing rapid development
+   This framework is still a **Proof of Concept** currently undergoing rapid development
    and has not yet reached a stable release. Please be aware that:
 
    * APIs and interfaces may change without notice
