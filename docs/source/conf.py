@@ -11,10 +11,10 @@ html_title = "FGPT Documentation"
 
 copyright = (
     f"{datetime.now().year}, "
-    "S. SIVANESAN, K. Ardaneh / CNRS / IPSL / Sorbonne University"
+    "S. Sivanesan, K. Ardaneh / CNRS / IPSL / Sorbonne University"
 )
 
-author = "Shivamshan SIVANESAN, Kazem Ardaneh"
+author = "Shivamshan Sivanesan, Kazem Ardaneh"
 
 release = "0.1.0"
 version = "0.1"
