@@ -1,15 +1,16 @@
-# Fgpt
+# FGPT
 
 
 [![License](https://img.shields.io/badge/License-CC%20BY--NC--SA%204.0-blue.svg)](https://creativecommons.org/licenses/by-nc-sa/4.0/)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
 [![Documentation](https://img.shields.io/badge/docs-Sphinx-green.svg)](./docs)
-[![CI](https://github.com/kardaneh/IPSL-Fgpt/actions/workflows/ci.yaml/badge.svg)](https://github.com/kardaneh/IPSL-Fgpt/actions/workflows/ci.yaml)
+[![CI](https://github.com/kardaneh/FGPT/actions/workflows/ci.yaml/badge.svg)](https://github.com/kardaneh/FGPT/actions/workflows/ci.yaml)
 
 **FGPT** is a source-to-source transpiler that converts production scientific
 Fortran code into executable NumPy-based Python, and optionally into
 JAX/Equinox-compatible modules for GPU-accelerated and differentiable
-computation.
+computation. The current state of the project is a proof of concept, which has been tested on large modules of the IPSL land surface model.
+The project has received support from the AI4PEX project.
 
 ---
 
@@ -194,7 +195,7 @@ and enabling precise, auditable transformations at every stage.
 ### Using pip
 
 ```bash
-git clone https://github.com/kardaneh/IPSL-Fgpt.git
+git clone https://github.com/kardaneh/IPSL-FGPT.git
 cd fgpt
 pip install -e .
 ```
@@ -209,7 +210,7 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
 
 # Clone the repository
-git clone https://github.com/kardaneh/IPSL-Fgpt.git
+git clone https://github.com/kardaneh/IPSL-FGPT.git
 cd fgpt
 
 # Create virtual environment and activate
@@ -420,6 +421,6 @@ If you use FGPT in your research, please cite the software.
   title = {FGPT: A Fortran-to-Python and JAX Transpiler for Scientific Codes},
   year = {2026},
   publisher = {GitHub},
-  url = {https://github.com/kardaneh/IPSL-Fgpt}
+  url = {https://github.com/kardaneh/IPSL-FGPT}
 }
 ```
