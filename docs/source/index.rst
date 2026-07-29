@@ -11,7 +11,7 @@ translation of legacy scientific Fortran codes into modern Python workflows.
 FGPT serves as an intermediate compilation layer that can subsequently target
 NumPy, JAX, or other Python-based numerical ecosystems.
 
-GitHub repository: https://github.com/kardaneh/IPSL-Fgpt.git
+GitHub repository: https://github.com/kardaneh/FGPT.git
 
 Key Features
 ------------
