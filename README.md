@@ -2,7 +2,7 @@
 
 
 [![License](https://img.shields.io/badge/License-CC%20BY--NC--SA%204.0-blue.svg)](https://creativecommons.org/licenses/by-nc-sa/4.0/)
-[![Python](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
+[![Python](https://img.shields.io/badge/Python-3.10%20%7C%203.11%20%7C%203.12-blue.svg)](https://www.python.org/)
 [![Documentation](https://img.shields.io/badge/docs-Sphinx-green.svg)](./docs)
 [![CI](https://github.com/kardaneh/FGPT/actions/workflows/ci.yaml/badge.svg)](https://github.com/kardaneh/FGPT/actions/workflows/ci.yaml)
 
@@ -188,7 +188,7 @@ and enabling precise, auditable transformations at every stage.
 
 ### Requirements
 
-- Python 3.10+
+- Python 3.10, 3.11 or 3.12 (all three are covered by CI)
 - A Fortran compiler (e.g. `gfortran`, `nvhpc`) accessible on `PATH`
 - `fparser2` for Fortran AST construction
 
