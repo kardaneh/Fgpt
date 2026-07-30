@@ -28,6 +28,12 @@ def normalize_ast(node):
     return node
 
 
+# PEP 695 type parameters, added to the AST in Python 3.12. ast.parse() sets this
+# field on function and class nodes; nodes we build by hand never do, so a parsed
+# AST and a constructed one compare unequal on 3.12+ despite being equivalent.
+IGNORED_FIELDS = frozenset({"type_params"})
+
+
 def ast_to_dict(node):
     """
     Convert AST into a nested dict for stable comparison.
@@ -35,7 +41,11 @@ def ast_to_dict(node):
     if isinstance(node, ast.AST):
         return {
             "_type": type(node).__name__,
-            **{field: ast_to_dict(value) for field, value in ast.iter_fields(node)},
+            **{
+                field: ast_to_dict(value)
+                for field, value in ast.iter_fields(node)
+                if field not in IGNORED_FIELDS
+            },
         }
     elif isinstance(node, list):
         return [ast_to_dict(x) for x in node]
