@@ -66,9 +66,9 @@ notebooks = [
 fgpt = "fgpt.cli:main"
 
 [project.urls]
-Source      = "https://github.com/kardaneh/IPSL-Fgpt.git"
-Issues      = "https://github.com/kardaneh/IPSL-Fgpt/issues"
-# Documentation = "https://fgpt.readthedocs.io"
+Source      = "https://github.com/kardaneh/Fgpt"
+Issues      = "https://github.com/kardaneh/Fgpt/issues"
+Documentation = "https://fgpt.readthedocs.io"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/fgpt"]
