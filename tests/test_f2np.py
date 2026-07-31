@@ -1,6 +1,7 @@
 import ast
 from unittest.mock import MagicMock
 
+import numpy as np
 import pytest
 from fparser.two import Fortran2003 as F23
 from fparser.two.utils import walk
@@ -895,3 +896,78 @@ def extreme_case(x, y, n):
         """
         expected_ast = ast.parse(expected_output).body[0]
         assert_ast_equal(func, expected_ast)
+
+
+@pytest.mark.usefixtures("test_env")
+class TestF2NPIntrinsicLowering:
+    """
+    End-to-end checks on the code emitted for Fortran intrinsics.
+
+    ``tests/test_intrinsic.py`` only exercises ``normalize_intrinsic_call``,
+    i.e. the normalized argument dictionary. These tests go one step further
+    and assert on the NumPy call that is actually emitted, then execute it,
+    which is what catches arguments emitted as keywords that NumPy only
+    accepts positionally.
+    """
+
+    def unparse_intrinsic(self, expr):
+        code = (
+            "subroutine t(a, b, shp, m)\n"
+            "  real :: a(6), b(6)\n"
+            "  integer :: shp(2)\n"
+            "  logical :: m(6)\n"
+            f"  b = {expr}\n"
+            "end subroutine t\n"
+        )
+        tree = Processor(logger=Logger()).parse_fortran_string(code)
+        node = walk(tree, F23.Intrinsic_Function_Reference)[0]
+        return ast.unparse(self.f2np.handle_intrinsic_function_reference(node))
+
+    @pytest.mark.parametrize(
+        "fortran, expected",
+        [
+            # np.matmul / np.dot are ufuncs: arguments are positional-only.
+            ("MATMUL(A, B)", "np.matmul(A, B)"),
+            ("DOT_PRODUCT(A, B)", "np.dot(A, B)"),
+            # np.reshape made `a` positional-only and dropped `newshape`
+            # in favour of `shape` (deprecated in NumPy 2.1).
+            ("RESHAPE(A, SHP)", "np.reshape(A, SHP, order='F')"),
+            ("RESHAPE(SOURCE=A, SHAPE=SHP)", "np.reshape(A, SHP, order='F')"),
+            # Reductions keep passing DIM/MASK by keyword.
+            ("SUM(A, DIM=1)", "np.sum(A, axis=0)"),
+            ("SUM(A, MASK=M)", "np.sum(A, where=M)"),
+            ("MAXVAL(A)", "np.max(A)"),
+            ("SQRT(A)", "np.sqrt(A)"),
+        ],
+    )
+    def test_emitted_call_matches_numpy_signature(self, fortran, expected):
+        assert self.unparse_intrinsic(fortran) == expected
+
+    @pytest.mark.parametrize(
+        "fortran",
+        [
+            "MATMUL(A, B)",
+            "DOT_PRODUCT(A, B)",
+            "RESHAPE(A, SHP)",
+            "SUM(A, DIM=1)",
+            "SUM(A, MASK=M)",
+            "PRODUCT(A)",
+            "MAXVAL(A)",
+            "MINVAL(A)",
+            "MAXLOC(A)",
+            "MINLOC(A)",
+            "SQRT(A)",
+            "MIN(A, B)",
+            "MAX(A, B)",
+        ],
+    )
+    def test_emitted_call_is_executable(self, fortran):
+        """The emitted NumPy call must not raise (e.g. TypeError on keywords)."""
+        namespace = {
+            "np": np,
+            "A": np.arange(6.0),
+            "B": np.arange(6.0) + 1.0,
+            "SHP": (2, 3),
+            "M": np.arange(6.0) > 2.0,
+        }
+        eval(compile(self.unparse_intrinsic(fortran), "<emitted>", "eval"), namespace)

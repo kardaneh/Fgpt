@@ -2185,15 +2185,26 @@ class F2NP:
                     )
                     final_args = []
                     final_keywords = []
-                    if "array" in normalized:
-                        final_args.append(normalized["array"])
+                    # NOTE: several NumPy entry points only accept these
+                    # arguments positionally -- ``np.matmul``/``np.dot`` are
+                    # ufuncs, and ``np.reshape`` made ``a`` positional-only in
+                    # NumPy 2.1 -- so the signature declares which normalized
+                    # keys have to be emitted as positional arguments.
+                    emitted_positionally = set()
+                    for key in signature.positional or []:
+                        value = normalized.get(key)
+                        if value is None:
+                            # An omitted optional argument ends the positional
+                            # run; everything after it must go by keyword.
+                            break
+                        final_args.append(value)
+                        emitted_positionally.add(key)
                     # keywords via arg_map
                     for key, value in normalized.items():
-                        if key == "array" or value is None:
+                        if key in emitted_positionally or value is None:
                             continue
                         py_name = signature.arg_map.get(key, key)
-                        if value is not None:
-                            final_keywords.append(ast.keyword(arg=py_name, value=value))
+                        final_keywords.append(ast.keyword(arg=py_name, value=value))
                     if signature.name in ("MIN", "MAX"):
                         # NOTE: Fortran constructs may contain an arbitrary number of nested
                         # elements or operands. In contrast, Python's AST often represents

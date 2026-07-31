@@ -72,7 +72,8 @@ class TestIntrinsic:
         )
 
         assert result["source"] == "A"
-        assert result["newshape"] == (2, 2)
+        # `shape`, not `newshape`: NumPy 2.1 deprecated the `newshape` keyword.
+        assert result["shape"] == (2, 2)
         assert result["order"].value == "F"
 
     def test_matmul(self):
