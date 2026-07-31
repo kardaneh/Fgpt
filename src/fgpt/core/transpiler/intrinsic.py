@@ -47,6 +47,12 @@ class IntrinsicSignature:
     varargs: bool = False  # e.g. MAX, MIN
     arg_map: dict[str, str] = None  # Fortran -> Python names
     transform: Callable | None = None
+    # Normalized keys that MUST be emitted positionally in the generated call,
+    # in this order. Several NumPy entry points take positional-only arguments
+    # (``np.matmul``/``np.dot`` are ufuncs; ``np.reshape`` made ``a``
+    # positional-only in NumPy 2.1), so emitting them as keywords produces code
+    # that raises TypeError at runtime.
+    positional: list[str] = None
 
 
 def normalize_intrinsic_call(
@@ -137,6 +143,7 @@ SUM = IntrinsicSignature(
     optional={"dim", "mask"},
     defaults={"dim": None, "mask": None},
     arg_map={"array": "a", "axis": "axis", "mask": "where"},
+    positional=["array"],
     transform=lambda args: {
         "array": args["array"],
         "axis": dim_to_axis(args["dim"]),
@@ -150,6 +157,7 @@ MAXLOC = IntrinsicSignature(
     optional={"dim", "mask"},
     defaults={"dim": None, "mask": None},
     arg_map={"array": "a", "axis": "axis"},
+    positional=["array"],
     transform=lambda args: {"array": args["array"], "axis": dim_to_axis(args["dim"])},
 )
 
@@ -159,11 +167,17 @@ MINLOC = IntrinsicSignature(
     optional={"dim", "mask"},
     defaults={"dim": None, "mask": None},
     arg_map={"array": "a", "axis": "axis"},
+    positional=["array"],
     transform=lambda args: {"array": args["array"], "axis": dim_to_axis(args["dim"])},
 )
 
 SQRT = IntrinsicSignature(
-    name="SQRT", args=["array"], optional=set(), defaults={}, arg_map={"array": "a"}
+    name="SQRT",
+    args=["array"],
+    optional=set(),
+    defaults={},
+    arg_map={"array": "a"},
+    positional=["array"],
 )
 
 MAXVAL = IntrinsicSignature(
@@ -172,6 +186,7 @@ MAXVAL = IntrinsicSignature(
     optional={"dim", "mask"},
     defaults={"dim": None, "mask": None},
     arg_map={"array": "a", "axis": "axis"},
+    positional=["array"],
     transform=lambda args: {"array": args["array"], "axis": dim_to_axis(args["dim"])},
 )
 
@@ -181,6 +196,7 @@ MINVAL = IntrinsicSignature(
     optional={"dim", "mask"},
     defaults={"dim": None, "mask": None},
     arg_map={"array": "a", "axis": "axis"},
+    positional=["array"],
     transform=lambda args: {"array": args["array"], "axis": dim_to_axis(args["dim"])},
 )
 
@@ -189,10 +205,11 @@ RESHAPE = IntrinsicSignature(
     args=["source", "shape", "pad", "order"],
     optional={"pad", "order"},
     defaults={"pad": None, "order": ast.Constant(value="F")},
-    arg_map={"source": "a", "shape": "newshape", "order": "order"},
+    arg_map={"source": "a", "shape": "shape", "order": "order"},
+    positional=["source", "shape"],
     transform=lambda args: {
         "source": args["source"],
-        "newshape": args["shape"],
+        "shape": args["shape"],
         "order": args["order"],
     },
 )
@@ -203,6 +220,7 @@ PRODUCT = IntrinsicSignature(
     optional={"dim", "mask"},
     defaults={"dim": None, "mask": None},
     arg_map={"array": "a", "axis": "axis", "mask": "where"},
+    positional=["array"],
     transform=lambda args: {
         "array": args["array"],
         "axis": dim_to_axis(args["dim"]),
@@ -234,6 +252,7 @@ DOT_PRODUCT = IntrinsicSignature(
     optional=set(),
     defaults={},
     arg_map={"a": "a", "b": "b"},
+    positional=["a", "b"],
 )
 
 MATMUL = IntrinsicSignature(
@@ -242,6 +261,7 @@ MATMUL = IntrinsicSignature(
     optional=set(),
     defaults={},
     arg_map={"a": "a", "b": "b"},
+    positional=["a", "b"],
 )
 
 # Defines the ensemble of intrinsic signature which requires some modificaiton
