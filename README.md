@@ -198,7 +198,7 @@ and enabling precise, auditable transformations at every stage.
 ### Using pip
 
 ```bash
-git clone https://github.com/kardaneh/IPSL-FGPT.git
+git clone https://github.com/kardaneh/FGPT.git
 cd fgpt
 pip install -e .
 ```
@@ -213,7 +213,7 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
 
 # Clone the repository
-git clone https://github.com/kardaneh/IPSL-FGPT.git
+git clone https://github.com/kardaneh/FGPT.git
 cd fgpt
 
 # Create virtual environment and activate
@@ -421,9 +421,9 @@ If you use FGPT in your research, please cite the software.
 ```bibtex
 @software{ardaneh_fgpt_2026,
   author = {Kazem Ardaneh and Shivamshan Sivanesan},
-  title = {FGPT: A Fortran-to-Python and JAX Transpiler for Scientific Codes},
+  title = {FGPT: A Fortran General-Purpose Transpiler},
   year = {2026},
   publisher = {GitHub},
-  url = {https://github.com/kardaneh/IPSL-FGPT}
+  url = {https://github.com/kardaneh/FGPT}
 }
 ```
