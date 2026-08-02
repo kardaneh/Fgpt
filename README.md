@@ -1,5 +1,8 @@
 # FGPT
 
+<p align="center">
+  <img src="./images/Fgpt_logo.jpeg" alt="FGPT pipeline" width="30%">
+</p>
 
 [![License](https://img.shields.io/badge/License-CC%20BY--NC--SA%204.0-blue.svg)](https://creativecommons.org/licenses/by-nc-sa/4.0/)
 [![Python](https://img.shields.io/badge/Python-3.10%20%7C%203.11%20%7C%203.12-blue.svg)](https://www.python.org/)
