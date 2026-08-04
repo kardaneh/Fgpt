@@ -13,6 +13,8 @@ NumPy, JAX, or other Python-based numerical ecosystems.
 
 GitHub repository: https://github.com/kardaneh/FGPT.git
 
+arXiv preprint: https://arxiv.org/abs/2608.00130
+
 .. admonition:: Development Status
    :class: important
 
