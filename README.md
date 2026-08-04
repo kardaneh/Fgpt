@@ -420,11 +420,14 @@ If you use FGPT in your research, please cite the software.
 ### BibTeX
 
 ```bibtex
-@software{ardaneh_fgpt_2026,
-  author = {Kazem Ardaneh and Shivamshan Sivanesan},
-  title = {FGPT: A Fortran General-Purpose Transpiler},
-  year = {2026},
-  publisher = {GitHub},
-  url = {https://github.com/kardaneh/FGPT}
+@misc{sivanesan2026fgpt,
+  title         = {A Fortran General-Purpose Transpiler: Proof of Concept},
+  author        = {Shivamshan Sivanesan and Kazem Ardaneh},
+  year          = {2026},
+  eprint        = {2608.00130},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.PL},
+  doi           = {10.48550/arXiv.2608.00130},
+  url           = {https://arxiv.org/abs/2608.00130}
 }
 ```
