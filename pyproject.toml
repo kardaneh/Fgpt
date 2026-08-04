@@ -69,6 +69,7 @@ fgpt = "fgpt.cli:main"
 Source      = "https://github.com/kardaneh/Fgpt"
 Issues      = "https://github.com/kardaneh/Fgpt/issues"
 Documentation = "https://fgpt.readthedocs.io"
+Paper         = "https://arxiv.org/abs/2608.00130"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/fgpt"]
