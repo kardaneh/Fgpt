@@ -7,6 +7,7 @@
 [![License](https://img.shields.io/badge/License-CC%20BY--NC--SA%204.0-blue.svg)](https://creativecommons.org/licenses/by-nc-sa/4.0/)
 [![Python](https://img.shields.io/badge/Python-3.10%20%7C%203.11%20%7C%203.12-blue.svg)](https://www.python.org/)
 [![Documentation](https://img.shields.io/badge/docs-Sphinx-green.svg)](./docs)
+[![arXiv](https://img.shields.io/badge/arXiv-2604.03275-b31b1b.svg)](https://arxiv.org/abs/2608.00130)
 [![CI](https://github.com/kardaneh/FGPT/actions/workflows/ci.yaml/badge.svg)](https://github.com/kardaneh/FGPT/actions/workflows/ci.yaml)
 
 **FGPT** is a source-to-source transpiler that converts production scientific
