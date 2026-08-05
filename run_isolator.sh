@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
-echo "Starting isolation: 20260723_083956"
-echo "Target module: hydrol"
-echo "Parent subroutine: hydrol_main"
-echo "Target subroutines: hydrol_alma hydrol_vegupd hydrol_canop hydrol_flood hydrol_hydraulic_arch_tuzet_calc hydrol_soil explicitsnow_main"
-echo "OpenACC: False, F2PY: True, Tapenade: False", PY2JX: False
+echo "Starting isolation: 20260805_114612"
+echo "Target module: condveg"
+echo "Parent subroutine: condveg_main"
+echo "Target subroutines: albedo_surface_main"
+echo "OpenACC: False, F2PY: False, Tapenade: False", PY2JX: False
 echo "=========================================="
 fgpt isolate \
     --work "/scratchu/kardaneh" \
-    --rest_of_path "modipsl_truck_opt/modeles/ORCHIDEE/src_sechiba/" \
-    --target_module "hydrol" \
-    --parent_subroutine "hydrol_main" \
-    --target_subroutines hydrol_alma hydrol_vegupd hydrol_canop hydrol_flood hydrol_hydraulic_arch_tuzet_calc hydrol_soil explicitsnow_main \
+    --rest_of_path "tmp/modipsl_truck_opt/modeles/ORCHIDEE/src_sechiba/" \
+    --target_module "condveg" \
+    --parent_subroutine "condveg_main" \
+    --target_subroutines albedo_surface_main \
     --openacc "False" \
-    --f2py "True" \
+    --f2py "False" \
     --tapenade "False" \
     --py2jx "False" \
     --config_path "template.yaml" \

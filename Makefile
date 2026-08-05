@@ -1,7 +1,7 @@
 # -----------------------------
 # Environment
 # -----------------------------
-WORK = /scratchu/kardaneh
+WORK = /scratchu/kardaneh/tmp
 FC_NVIDIA = mpif90
 CC        = mpicc
 

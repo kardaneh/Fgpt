@@ -523,7 +523,11 @@ class Extractor:
             self.func_result[function_key] = suffix
         else:
             self.logger.warning(
-                f"No suffix found in function '{function_key}', using '{function_key}_result' as result variable."
+                f"No suffix found in function '{function_key}', using '{function_key}_result' as result variable. "
+                f"The variable '{function_key}_result' will be referenced by the generated write statement, but it is not "
+                f"declared in the original code. Remove the corresponding write statement from the original code and the "
+                f"corresponding read statement from the isolated function '{function_key}'. Otherwise, the generated "
+                f"in/out benchmark will fail to compile under Fortran `implicit none`."
             )
             self.func_result[function_key] = f"{function_key}_result"
 
@@ -1311,7 +1315,13 @@ class Extractor:
                     locally_defined_types.add(child.tostr().lower())
 
         names_queue = deque(names_used)
-        declared_names_str = {name.string for name in names_declared}
+        # Convert all names to lowercase for case-insensitive comparison. In some
+        # Fortran source files, a variable may appear with different capitalization
+        # in the declaration and executable sections (e.g., in Fup is declared but
+        # later referenced as fup, see multilevel_matrix). Normalizing the names
+        # prevents such variables from being incorrectly identified as global variables.
+        # TODO: Check if all tests pass
+        declared_names_str = {name.string.lower() for name in names_declared}
 
         seen = {}
 
@@ -1385,11 +1395,17 @@ class Extractor:
                     )
                     continue
 
+            # Convert all names to lowercase for case-insensitive comparison. In some
+            # Fortran source files, a variable may appear with different capitalization
+            # in the declaration and executable sections (e.g., in Fup is declared but
+            # later referenced as fup, see multilevel_matrix). Normalizing the names
+            # prevents such variables from being incorrectly identified as global variables.
+            # TODO: Check if all tests pass
             if (
-                name.string not in declared_names_str
-                and name.string not in self.exclude
+                name.string.lower() not in declared_names_str
+                and name.string.lower() not in self.exclude
             ):
-                seen[name.string] = name
+                seen[name.string.lower()] = name
 
         self.var_global[subroutine_key] = list(seen.values())
         for idx, node in enumerate(specification_part.children):
