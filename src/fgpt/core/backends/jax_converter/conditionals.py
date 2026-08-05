@@ -1190,8 +1190,32 @@ class _ConditionalLowering:
         vectorization_context: dict | None,
     ) -> ast.AST | list[ast.AST]:
         """
-        Lower an ``if``/``else`` pair where both branches assign the same
-        targets, into ``jnp.where``-based updates.
+        Public entry point. See :meth:`_lower_masked_branch_pair_impl` for
+        the full algorithm; this wrapper just flattens its
+        ``(preamble, final_assigns)`` result into the ``ast.AST |
+        list[ast.AST]`` shape the rest of the lowering pass expects.
+        """
+        try:
+            preamble, final_assigns = self._lower_masked_branch_pair_impl(
+                node, vectorization_context
+            )
+            result = preamble + final_assigns
+            return result if len(result) > 1 else result[0]
+        except NotImplementedError:
+            raise
+        except Exception as e:
+            self.logger.exception("Exception in _lower_masked_branch_pair:", e)
+            raise
+
+    def _lower_masked_branch_pair_impl(
+        self,
+        node: ast.If,
+        vectorization_context: dict | None,
+    ) -> tuple[list[ast.AST], list[ast.Assign]]:
+        """
+        Lower an ``if``/``else`` (or ``if``/``elif``/.../``else``) chain
+        where every branch assigns the same targets, into ``jnp.where``-based
+        updates.
 
         For each ``(true_assign, false_assign)`` pair (matched positionally
         by target), two cases are handled:
@@ -1211,211 +1235,262 @@ class _ConditionalLowering:
         each branch's operation is reconstructed as a ``BinOp`` before
         merging, with the final array update forced to ``.set``.
 
+        If *node* is the head of a longer ``if``/``elif``/.../``else``
+        ladder (i.e. ``node.orelse`` is itself a single nested ``ast.If``
+        rather than a terminal list of ``ast.Assign``), the rest of the
+        chain is first collapsed by recursing on ``node.orelse[0]``. That
+        recursive call returns two separate lists rather than one mixed
+        list: ``preamble`` (supporting statements such as mask assigns,
+        ``old_val`` reads, and broadcast preambles -- these are themselves
+        ``ast.Assign`` nodes, e.g. ``_mask_7 = ...``, so they cannot be
+        told apart from a "real" result by type alone) and
+        ``final_assigns`` (the actual merged per-target result of
+        everything below this point in the chain). Only ``final_assigns``
+        is reused as this level's ``orelse``; ``preamble`` is carried
+        upward untouched and hoisted ahead of this level's own result so
+        it still executes before anything that depends on it.
+
         Parameters
         ----------
         node : ast.If
             The conditional to lower; must have one ``ast.Assign`` per
-            target in each of ``node.body`` and ``node.orelse``.
+            target in ``node.body``, and either one ``ast.Assign`` per
+            target in ``node.orelse`` (terminal ``else``) or a single
+            nested ``ast.If`` continuing the ``elif`` chain.
         vectorization_context : Optional[dict]
             The active :class:`Control` context as a dict, or ``None`` if
             no vectorisation scope is active.
 
         Returns
         -------
-        ast.AST or list[ast.AST]
-            The merged assignment(s); a single node if only one target was
-            found, otherwise a list (preamble statements followed by the
-            merged assignments).
+        tuple[list[ast.AST], list[ast.Assign]]
+            ``(preamble, final_assigns)``. ``preamble`` holds supporting
+            statements that must run before ``final_assigns`` (masks,
+            ``old_val`` reads, broadcast preambles, and any preamble
+            inherited from a collapsed nested chain). ``final_assigns``
+            holds exactly one merged ``ast.Assign`` per target discovered
+            in ``node.body`` -- this is the list the caller (or an outer
+            recursive call collapsing an enclosing ``elif``) should treat
+            as "the result," never ``preamble``.
 
         Raises
         ------
         NotImplementedError
             If both branches independently produce a non-trivial broadcast
             index list for the same subscript target (unsupported: cannot
-            determine which one should drive the final indexing).
+            determine which one should drive the final indexing), or if
+            branch operations differ but either branch's terminal call
+            isn't a recognized attribute-call array operation.
         Exception
             Re-raises any unexpected error after logging.
         """
-        try:
-            assigns_true = [stmt for stmt in node.body if isinstance(stmt, ast.Assign)]
-            assigns_false = [
-                stmt for stmt in node.orelse if isinstance(stmt, ast.Assign)
-            ]
+        preamble: list[ast.AST] = []
+        final_assigns: list[ast.Assign] = []
 
-            new_nodes = []
-            for stmt_true, stmt_false in zip(assigns_true, assigns_false):
-                target_true = stmt_true.targets[0]
+        # If this node is the head of an elif chain, collapse the rest of
+        # the chain (everything in node.orelse[0]) first, by recursing.
+        # Crucially: only the recursive call's `final_assigns` become this
+        # level's `orelse` -- its `preamble` (mask assigns, old_val reads,
+        # ...) is carried through untouched and must NOT be mistaken for
+        # part of the orelse, since it consists of ast.Assign nodes too.
+        already_lowered_orelse = False
+        if len(node.orelse) == 1 and isinstance(node.orelse[0], ast.If):
+            nested_preamble, nested_final = self._lower_masked_branch_pair_impl(
+                node.orelse[0], vectorization_context
+            )
+            preamble.extend(nested_preamble)
+            node = ast.copy_location(
+                ast.If(test=self.visit(node.test), body=node.body, orelse=nested_final),
+                node,
+            )
+            already_lowered_orelse = True
 
-                deps_true = self._expr_depends_on_axes(
-                    stmt_true.value,
-                    vectorization_context.get("vectorization_axis", {})
-                    if vectorization_context
-                    else {},
+        assigns_true = [stmt for stmt in node.body if isinstance(stmt, ast.Assign)]
+        assigns_false = [stmt for stmt in node.orelse if isinstance(stmt, ast.Assign)]
+
+        for stmt_true, stmt_false in zip(assigns_true, assigns_false):
+            target_true = stmt_true.targets[0]
+
+            deps_true = self._expr_depends_on_axes(
+                stmt_true.value,
+                vectorization_context.get("vectorization_axis", {})
+                if vectorization_context
+                else {},
+            )
+            deps_false = self._expr_depends_on_axes(
+                stmt_false.value,
+                vectorization_context.get("vectorization_axis", {})
+                if vectorization_context
+                else {},
+            )
+
+            if isinstance(target_true, ast.Name):
+                stmts_true_list = (
+                    [self.visit(s) for s in stmt_true]
+                    if isinstance(stmt_true, list)
+                    else [self.visit(stmt_true)]
                 )
-                deps_false = self._expr_depends_on_axes(
-                    stmt_false.value,
-                    vectorization_context.get("vectorization_axis", {})
-                    if vectorization_context
-                    else {},
-                )
-
-                if isinstance(target_true, ast.Name):
-                    stmts_true_list = (
-                        [self.visit(s) for s in stmt_true]
-                        if isinstance(stmt_true, list)
-                        else [self.visit(stmt_true)]
-                    )
+                # An already-lowered elif-chain tail comes back as a
+                # fully-transformed Assign -- reuse it directly instead of
+                # visiting it a second time.
+                if already_lowered_orelse:
+                    stmts_false_list = [stmt_false]
+                else:
                     stmts_false_list = (
                         [self.visit(s) for s in stmt_false]
                         if isinstance(stmt_false, list)
                         else [self.visit(stmt_false)]
                     )
 
-                    true_value = stmts_true_list[-1].value
-                    false_value = stmts_false_list[-1].value
-                    if self.var_deps.get(target_true.id):
-                        target_axes = self.var_deps[target_true.id]
-                        true_value = self.broadcast_scalar(
-                            true_value, deps_true, target_axes
+                true_value = stmts_true_list[-1].value
+                false_value = stmts_false_list[-1].value
+                if self.var_deps.get(target_true.id):
+                    target_axes = self.var_deps[target_true.id]
+                    true_value = self.broadcast_scalar(
+                        true_value, deps_true, target_axes
+                    )
+                    false_value = self.broadcast_scalar(
+                        false_value, deps_false, target_axes
+                    )
+
+                jnp_call = ast.Call(
+                    func=ast.Attribute(
+                        value=ast.Name(id="jnp", ctx=ast.Load()),
+                        attr="where",
+                        ctx=ast.Load(),
+                    ),
+                    args=[
+                        self._transform_if_test(self.visit(node.test)),
+                        true_value,
+                        false_value,
+                    ],
+                    keywords=[],
+                )
+                preamble.extend(stmts_true_list[:-1])
+                preamble.extend(stmts_false_list[:-1])
+                new_assign = ast.Assign(targets=[target_true], value=jnp_call)
+
+            elif isinstance(target_true, ast.Subscript):
+                stmt_true = self.visit(stmt_true)
+                # Same reuse-don't-revisit rule as the Name-target case
+                # above: an already-collapsed elif tail is final output,
+                # not raw source, so it must not be visited again.
+                stmt_false = (
+                    stmt_false if already_lowered_orelse else self.visit(stmt_false)
+                )
+
+                true_preamble, stmt_true = self._unwrap_stmt_list(stmt_true)
+                false_preamble, stmt_false = self._unwrap_stmt_list(stmt_false)
+
+                if not isinstance(stmt_true, ast.Assign) or not isinstance(
+                    stmt_false, ast.Assign
+                ):
+                    preamble.extend(true_preamble)
+                    preamble.extend(false_preamble)
+                    for s in (stmt_true, stmt_false):
+                        if s is not None:
+                            final_assigns.append(s)
+                    continue
+
+                preamble.extend(true_preamble)
+                preamble.extend(false_preamble)
+
+                same_operation = False
+                operation_true = None
+                operation_false = None
+                if isinstance(stmt_true.value.func, ast.Attribute) and isinstance(
+                    stmt_false.value.func, ast.Attribute
+                ):
+                    operation_true = stmt_true.value.func.attr
+                    operation_false = stmt_false.value.func.attr
+                    if operation_false == operation_true:
+                        same_operation = True
+
+                target_slice = target_true.slice
+                target_rank = self._target_rank(target_slice)
+
+                true_args, false_args = None, None
+                if isinstance(stmt_true.value, ast.Call):
+                    true_args = stmt_true.value.args[0]
+                if isinstance(stmt_false.value, ast.Call):
+                    false_args = stmt_false.value.args[0]
+
+                true_args, true_elts_list = self.maybe_add_index(
+                    true_args,
+                    target_rank,
+                    vectorization_context if vectorization_context else {},
+                )
+                false_args, false_elts_list = self.maybe_add_index(
+                    false_args,
+                    target_rank,
+                    vectorization_context if vectorization_context else {},
+                )
+
+                mask_name = f"_mask_{self._mask_counter}"
+                self._mask_counter += 1
+                node.test = self.visit(node.test)
+                mask_assign = ast.Assign(
+                    targets=[ast.Name(id=mask_name, ctx=ast.Store())],
+                    value=node.test,
+                )
+                mask_assign = self._boolean_mask(mask_assign)
+                preamble.append(mask_assign)
+
+                if true_elts_list and false_elts_list:
+                    raise NotImplementedError(
+                        "Handling both true_elts_list and false_elts_list is not implemented yet."
+                    )
+
+                selected_elts_list = (
+                    true_elts_list if true_elts_list else false_elts_list
+                )
+                ranks = self.subscript_ranks(node.test)
+                mask_rank = ranks.get(node.test, 0)
+
+                if not selected_elts_list:
+                    if mask_rank == target_rank:
+                        mask_expr = ast.Name(id=mask_name, ctx=ast.Load())
+                    elif mask_rank < target_rank:
+                        dimensions = self.get_active_dims(self.visit(target_true))
+                        loop_info = (
+                            vectorization_context.get("loop_info", {})
+                            if vectorization_context
+                            else {}
                         )
-                        false_value = self.broadcast_scalar(
-                            false_value, deps_false, target_axes
+                        vectorization_axis = (
+                            vectorization_context.get("vectorization_axis", {})
+                            if vectorization_context
+                            else {}
                         )
 
-                    jnp_call = ast.Call(
-                        func=ast.Attribute(
-                            value=ast.Name(id="jnp", ctx=ast.Load()),
-                            attr="where",
-                            ctx=ast.Load(),
-                        ),
-                        args=[
-                            self._transform_if_test(node.test),
-                            true_value,
-                            false_value,
-                        ],
-                        keywords=[],
-                    )
-                    final_nodes = stmts_true_list[:-1] + stmts_false_list[:-1]
-                    new_nodes.extend(final_nodes)
-                    new_assign = ast.Assign(targets=[target_true], value=jnp_call)
+                        elts = [ast.Constant(value=None)] * target_rank
+                        for loop_dim, loop_var in loop_info.items():
+                            if loop_dim not in dimensions:
+                                continue
+                            dim_index = dimensions.index(loop_dim)
+                            vect_axis = vectorization_axis.get(loop_var, [])
+                            if dim_index not in vect_axis:
+                                continue
+                            elts[dim_index] = ast.Slice()
 
-                elif isinstance(target_true, ast.Subscript):
-                    stmt_true = self.visit(stmt_true)
-                    stmt_false = self.visit(stmt_false)
-
-                    true_preamble, stmt_true = self._unwrap_stmt_list(stmt_true)
-                    false_preamble, stmt_false = self._unwrap_stmt_list(stmt_false)
-
-                    if not isinstance(stmt_true, ast.Assign) or not isinstance(
-                        stmt_false, ast.Assign
-                    ):
-                        new_nodes.extend(true_preamble)
-                        if stmt_true is not None:
-                            new_nodes.append(stmt_true)
-                        new_nodes.extend(false_preamble)
-                        if stmt_false is not None:
-                            new_nodes.append(stmt_false)
-                        return new_nodes if len(new_nodes) > 1 else new_nodes[0]
-
-                    new_nodes.extend(true_preamble)
-                    new_nodes.extend(false_preamble)
-
-                    same_operation = False
-                    operation_true = None
-                    operation_false = None
-                    if isinstance(stmt_true.value.func, ast.Attribute) and isinstance(
-                        stmt_false.value.func, ast.Attribute
-                    ):
-                        operation_true = stmt_true.value.func.attr
-                        operation_false = stmt_false.value.func.attr
-                        if operation_false == operation_true:
-                            same_operation = True
-
-                    target_slice = target_true.slice
-                    target_rank = self._target_rank(target_slice)
-
-                    new_assign = None
-                    true_args, false_args = None, None
-                    if isinstance(stmt_true.value, ast.Call):
-                        true_args = stmt_true.value.args[0]
-                    if isinstance(stmt_false.value, ast.Call):
-                        false_args = stmt_false.value.args[0]
-
-                    true_args, true_elts_list = self.maybe_add_index(
-                        true_args,
-                        target_rank,
-                        vectorization_context if vectorization_context else {},
-                    )
-                    false_args, false_elts_list = self.maybe_add_index(
-                        false_args,
-                        target_rank,
-                        vectorization_context if vectorization_context else {},
-                    )
-
-                    mask_name = f"_mask_{self._mask_counter}"
-                    self._mask_counter += 1
-                    node.test = self.visit(node.test)
-                    mask_assign = ast.Assign(
-                        targets=[ast.Name(id=mask_name, ctx=ast.Store())],
-                        value=node.test,
-                    )
-                    mask_assign = self._boolean_mask(mask_assign)
-                    new_nodes.append(mask_assign)
-
-                    if true_elts_list and false_elts_list:
-                        raise NotImplementedError(
-                            "Handling both true_elts_list and false_elts_list is not implemented yet."
-                        )
-
-                    selected_elts_list = (
-                        true_elts_list if true_elts_list else false_elts_list
-                    )
-                    ranks = self.subscript_ranks(node.test)
-                    mask_rank = ranks.get(node.test, 0)
-
-                    if not selected_elts_list:
-                        if mask_rank == target_rank:
-                            mask_expr = ast.Name(id=mask_name, ctx=ast.Load())
-                        elif mask_rank < target_rank:
-                            dimensions = self.get_active_dims(self.visit(target_true))
-                            loop_info = (
-                                vectorization_context.get("loop_info", {})
-                                if vectorization_context
-                                else {}
-                            )
-                            vectorization_axis = (
-                                vectorization_context.get("vectorization_axis", {})
-                                if vectorization_context
-                                else {}
-                            )
-
-                            elts = [ast.Constant(value=None)] * target_rank
-                            for loop_dim, loop_var in loop_info.items():
-                                if loop_dim not in dimensions:
-                                    continue
-                                dim_index = dimensions.index(loop_dim)
-                                vect_axis = vectorization_axis.get(loop_var, [])
-                                if dim_index not in vect_axis:
-                                    continue
-                                elts[dim_index] = ast.Slice()
-
-                            mask_expr = ast.Subscript(
-                                value=ast.Name(id=mask_name, ctx=ast.Load()),
-                                slice=ast.Tuple(elts=elts, ctx=ast.Load()),
-                                ctx=ast.Load(),
-                            )
-                    else:
                         mask_expr = ast.Subscript(
                             value=ast.Name(id=mask_name, ctx=ast.Load()),
-                            slice=ast.Tuple(elts=selected_elts_list, ctx=ast.Load()),
+                            slice=ast.Tuple(elts=elts, ctx=ast.Load()),
                             ctx=ast.Load(),
                         )
-                    mask_arg = (
-                        mask_expr
-                        if mask_expr is not None
-                        else ast.Name(id=mask_name, ctx=ast.Load())
+                else:
+                    mask_expr = ast.Subscript(
+                        value=ast.Name(id=mask_name, ctx=ast.Load()),
+                        slice=ast.Tuple(elts=selected_elts_list, ctx=ast.Load()),
+                        ctx=ast.Load(),
                     )
+                mask_arg = (
+                    mask_expr
+                    if mask_expr is not None
+                    else ast.Name(id=mask_name, ctx=ast.Load())
+                )
 
+                if same_operation:
                     jnp_call = ast.Call(
                         func=ast.Attribute(
                             value=ast.Name(id="jnp", ctx=ast.Load()),
@@ -1431,87 +1506,76 @@ class _ConditionalLowering:
                     )
                     jnp_call = self.visit(ast.fix_missing_locations(jnp_call))
 
-                    if same_operation:
-                        value = ast.Call(
-                            func=stmt_true.value.func, args=[jnp_call], keywords=[]
+                    value = ast.Call(
+                        func=stmt_true.value.func, args=[jnp_call], keywords=[]
+                    )
+                    new_assign = ast.Assign(targets=[stmt_true.targets[0]], value=value)
+                else:
+                    if operation_true is None or operation_false is None:
+                        raise NotImplementedError(
+                            "Both branch assignments must use an attribute-call array "
+                            "operation (e.g. .add/.set) when operations differ."
                         )
-                        new_assign = ast.Assign(
-                            targets=[stmt_true.targets[0]], value=value
+                    target_stmt = self.visit_Subscript(target_true)
+                    target_stmt.ctx = ast.Load()
+                    old_val_name = ast.Name(id="old_val", ctx=ast.Load())
+                    old_val = ast.Assign(
+                        targets=[ast.Name(id="old_val", ctx=ast.Store())],
+                        value=target_stmt,
+                    )
+
+                    ops = {
+                        "add": ast.Add,
+                        "subtract": ast.Sub,
+                        "multiply": ast.Mult,
+                        "divide": ast.Div,
+                        "power": ast.Pow,
+                    }
+
+                    if operation_true in ops:
+                        true_expr = ast.BinOp(
+                            left=old_val_name,
+                            op=ops[operation_true](),
+                            right=true_args,
                         )
                     else:
-                        if operation_true is None or operation_false is None:
-                            raise NotImplementedError(
-                                "Both branch assignments must use an attribute-call array "
-                                "operation (e.g. .add/.set) when operations differ."
-                            )
-                        target_stmt = self.visit_Subscript(target_true)
-                        target_stmt.ctx = ast.Load()
-                        old_val_name = ast.Name(id="old_val", ctx=ast.Load())
-                        old_val = ast.Assign(
-                            targets=[ast.Name(id="old_val", ctx=ast.Store())],
-                            value=target_stmt,
+                        true_expr = true_args
+
+                    if operation_false in ops:
+                        false_expr = ast.BinOp(
+                            left=old_val_name,
+                            op=ops[operation_false](),
+                            right=false_args,
                         )
+                    else:
+                        false_expr = false_args
 
-                        ops = {
-                            "add": ast.Add,
-                            "subtract": ast.Sub,
-                            "multiply": ast.Mult,
-                            "divide": ast.Div,
-                            "power": ast.Pow,
-                        }
+                    jnp_call = ast.Call(
+                        func=ast.Attribute(
+                            value=ast.Name(id="jnp", ctx=ast.Load()),
+                            attr="where",
+                            ctx=ast.Load(),
+                        ),
+                        args=[
+                            mask_arg,
+                            true_expr,
+                            false_expr,
+                        ],
+                        keywords=[],
+                    )
+                    jnp_call = self.visit(ast.fix_missing_locations(jnp_call))
 
-                        if operation_true in ops:
-                            true_expr = ast.BinOp(
-                                left=old_val_name,
-                                op=ops[operation_true](),
-                                right=true_args,
-                            )
-                        else:
-                            true_expr = true_args
+                    stmt_true.value.func.attr = "set"
+                    value = ast.Call(
+                        func=stmt_true.value.func, args=[jnp_call], keywords=[]
+                    )
+                    new_assign = ast.Assign(targets=[stmt_true.targets[0]], value=value)
+                    preamble.append(old_val)
 
-                        if operation_false in ops:
-                            false_expr = ast.BinOp(
-                                left=old_val_name,
-                                op=ops[operation_false](),
-                                right=false_args,
-                            )
-                        else:
-                            false_expr = false_args
+            new_assign = ast.fix_missing_locations(new_assign)
+            final_assigns.append(new_assign)
 
-                        jnp_call = ast.Call(
-                            func=ast.Attribute(
-                                value=ast.Name(id="jnp", ctx=ast.Load()),
-                                attr="where",
-                                ctx=ast.Load(),
-                            ),
-                            args=[
-                                mask_arg,
-                                true_expr,
-                                false_expr,
-                            ],
-                            keywords=[],
-                        )
-                        jnp_call = self.visit(ast.fix_missing_locations(jnp_call))
-
-                        stmt_true.value.func.attr = "set"
-                        value = ast.Call(
-                            func=stmt_true.value.func, args=[jnp_call], keywords=[]
-                        )
-                        new_assign = ast.Assign(
-                            targets=[stmt_true.targets[0]], value=value
-                        )
-                        new_nodes.append(old_val)
-
-                new_assign = ast.fix_missing_locations(new_assign)
-                new_nodes.append(new_assign)
-
-            return new_nodes if len(new_nodes) > 1 else new_nodes[0]
-
-        except NotImplementedError:
-            raise
-        except Exception as e:
-            self.logger.exception("Exception in _lower_masked_branch_pair:", e)
-            raise
+        return preamble, final_assigns
 
     def _lower_vector_condition(
         self,

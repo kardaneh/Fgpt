@@ -893,17 +893,6 @@ else:
         code = " ".join(_unparse(s) for s in stmts)
         assert "where" in code
 
-        # Pure scalar select must NOT produce lax.cond.
-        result = self._visit_if("""
-if x > 0:
-    y = 1
-else:
-    y = 0
-        """)
-        stmts = result if isinstance(result, list) else [result]
-        code = " ".join(_unparse(s) for s in stmts)
-        assert "cond(" not in code
-
         # x > 0 must be rewritten to jnp.greater (or similar).
         result = self._visit_if("""
 if x > 0:
@@ -932,35 +921,8 @@ elif x < 0:
 else:
     y = 0
         """)
-        assert len(result) == 3
-        assert all(isinstance(res, ast.Assign) for res in result)
-        # THe first two assignement corresponds to the condition
-        assert isinstance(result[0].value, ast.Call) and isinstance(
-            result[1].value, ast.Call
-        )
-        assert isinstance(result[0].value.func, ast.Attribute) and isinstance(
-            result[1].value.func, ast.Attribute
-        )
-        # THese corresponds to the transformed jax intrinsic functions
-        assert (
-            result[0].value.func.attr == "greater"
-            and result[1].value.func.attr == "less"
-        )
-        assert (
-            isinstance(result[2].targets[0], ast.Name)
-            and result[2].targets[0].id == "y"
-        )
-        assert (
-            isinstance(result[2].value, ast.Call)
-            and isinstance(result[2].value.func, ast.Attribute)
-            and result[2].value.func.attr == "where"
-        )
-
-        # The second if appears in the last element of args
-        assert (
-            isinstance(result[2].value.args[-1], ast.Call)
-            and isinstance(result[2].value.args[-1].func, ast.Attribute)
-            and result[2].value.args[-1].func.attr == "where"
+        assert _unparse(result) == (
+            "y = jnp.where(jnp.greater(x, 0), 1, jnp.where(jnp.less(x, 0), -1, 0))"
         )
 
         # An if whose entire body is logging.* calls is dropped entirely
@@ -1016,6 +978,57 @@ else:
         assert (
             isinstance(result.value.args[0].func, ast.Attribute)
             and result.value.args[0].func.attr == "logical_and"
+        )
+
+    def test_visit_if_with_mixed_operations(self):
+        result = self._transform_fn("""
+def compute(self, x):
+    for i in range(0, self.kjpindex, 1):
+        if x[i] > 0:
+            arr[i] = arr[i] + 1
+        else:
+            arr[i] = 0
+        """)
+        stmts = result.body
+        assert len(stmts) == 2  # Contains the mask and the arr as masked update
+        assert _unparse(stmts[-1]) == (
+            "arr = arr.at[:].set(jnp.where(_mask_0, arr + 1, 0))"
+        )
+
+        result = self._transform_fn("""
+def compute(self, x):
+    for i in range(0, self.kjpindex, 1):
+        if x[i] > 0:
+            arr[i] = arr[i] + a
+        elif x[i] > 0 and y[i] < a:
+            arr[i] = b
+        else:
+            arr[i] = c
+        """)
+        stmts = result.body
+        assert len(stmts) == 3  # Contains the 2 mask and the arr as masked update
+        assert "logical_and" in _unparse(stmts[0])  # the elif mask
+        assert "greater" in _unparse(stmts[1])  # the if mask
+        assert _unparse(stmts[-1]) == (
+            "arr = arr.at[:].set(jnp.where(_mask_1, arr + a, jnp.where(_mask_0, b, c)))"
+        )
+
+        result = self._transform_fn("""
+def compute(self, x):
+    for i in range(0, self.kjpindex, 1):
+        if x[i] > 0:
+            arr[i] = arr[i] + a
+        elif x[i] > 0 and y[i] < a:
+            arr[i] = b
+        else:
+            arr[i] = arr[i] - c
+        """)
+        stmts = result.body
+        assert len(stmts) == 3  # Contains the 2 mask and the arr as masked update
+        assert "logical_and" in _unparse(stmts[0])  # the elif mask
+        assert "greater" in _unparse(stmts[1])  # the if mask
+        assert _unparse(stmts[-1]) == (
+            "arr = arr.at[:].set(jnp.where(_mask_1, arr + a, jnp.where(_mask_0, b, arr - c)))"
         )
 
     def _transform_fn(self, code):

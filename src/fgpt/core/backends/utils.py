@@ -3167,27 +3167,126 @@ class VectorizationAnalyzer(ast.NodeVisitor):
         except Exception:
             raise
 
-    def _is_index_selection_if(self, node: ast.If, loop_vars: set[str]) -> bool:
+    def _targets_match(self, t1: ast.AST, t2: ast.AST, loop_vars: set[str]) -> bool:
         """
-        Determine whether a conditional represents a masked selection.
+        Determine whether two assignment targets refer to the "same slot".
 
-        Identifies patterns where both branches assign to the same target
-        and differ only in the value selected. Such constructs are
-        potential candidates for lowering to masked assignments or
-        ``jnp.where`` operations.
+        Extracted from the original inline logic in
+        :meth:`_is_index_selection_if` so it can be reused when comparing
+        every branch of an ``if/elif/.../else`` chain against a single
+        reference target, not just an isolated ``if``/``else`` pair.
 
         Parameters
         ----------
-        node : ast.If
-            Conditional statement to inspect.
+        t1 : ast.AST
+            First assignment target.
+        t2 : ast.AST
+            Second assignment target.
         loop_vars : set[str]
             Active loop-variable names.
 
         Returns
         -------
         bool
-            ``True`` if the conditional matches a maskable selection
-            pattern; otherwise ``False``.
+            ``True`` if *t1* and *t2* are considered the same assignment
+            slot (same name, same attribute, or same array subscripted by
+            a loop-variable-dependent index); otherwise ``False``.
+        """
+        # Case 1: simple scalar name
+        if isinstance(t1, ast.Name) and isinstance(t2, ast.Name):
+            return t1.id == t2.id
+
+        # Case 2: attribute assignment
+        if isinstance(t1, ast.Attribute) and isinstance(t2, ast.Attribute):
+            return ast.dump(t1) == ast.dump(t2)  # safer full match
+
+        # Case 3: subscript assignment
+        if isinstance(t1, ast.Subscript) and isinstance(t2, ast.Subscript):
+            # Must be same array
+            if ast.dump(t1.value) != ast.dump(t2.value):
+                return False
+
+            # indices MUST use loop vars, or else it's not maskable
+            if not (
+                self._index_uses_loop_vars(t1.slice, loop_vars)
+                or self._index_uses_loop_vars(t2.slice, loop_vars)
+            ):
+                return False
+
+            return True
+
+        return False
+
+    def _collect_chain_targets(self, node: ast.If) -> list[ast.AST] | None:
+        """
+        Collect assignment targets across an entire ``if/elif/.../else`` chain.
+
+        Walks the ``orelse`` of *node*: as long as it is exactly one nested
+        :class:`ast.If` (i.e. an ``elif``), recurse into it; once it
+        bottoms out at a single terminal :class:`ast.Assign` (the final
+        ``else``), collect its target. Every branch along the way must
+        consist of a single ``Assign`` statement, and the chain must end
+        in an explicit ``else`` — otherwise coverage isn't guaranteed and
+        the chain does not qualify as a pure selection.
+
+        Parameters
+        ----------
+        node : ast.If
+            Head of the (possibly single) ``if``/``elif`` chain.
+
+        Returns
+        -------
+        list[ast.AST] or None
+            Ordered list of assignment targets, one per branch (including
+            the final ``else``), or ``None`` if any branch fails to
+            qualify (multiple statements, non-``Assign`` statement, or a
+            chain with no terminal ``else``).
+        """
+        if len(node.body) != 1 or not isinstance(node.body[0], ast.Assign):
+            return None
+
+        targets: list[ast.AST] = [node.body[0].targets[0]]
+
+        if not node.orelse:
+            # No else -> branches don't fully cover the condition space,
+            # so we can't treat this as a pure selection pattern.
+            return None
+
+        if len(node.orelse) == 1 and isinstance(node.orelse[0], ast.If):
+            nested = self._collect_chain_targets(node.orelse[0])
+            if nested is None:
+                return None
+            targets.extend(nested)
+            return targets
+
+        if len(node.orelse) == 1 and isinstance(node.orelse[0], ast.Assign):
+            targets.append(node.orelse[0].targets[0])
+            return targets
+
+        return None
+
+    def _is_index_selection_if(self, node: ast.If, loop_vars: set[str]) -> bool:
+        """
+        Determine whether a conditional represents a masked selection.
+
+        Identifies patterns where every branch of an ``if``/``elif``/
+        ``else`` chain assigns to the same target and differs only in the
+        value selected. Such constructs are potential candidates for
+        lowering to masked assignments or ``jnp.where``/``jnp.select``
+        operations.
+
+        Parameters
+        ----------
+        node : ast.If
+            Conditional statement to inspect (head of the chain).
+        loop_vars : set[str]
+            Active loop-variable names.
+
+        Returns
+        -------
+        bool
+            ``True`` if every branch in the chain matches a maskable
+            selection pattern; otherwise ``False``.
 
         Raises
         ------
@@ -3197,47 +3296,22 @@ class VectorizationAnalyzer(ast.NodeVisitor):
         Notes
         -----
         Subscript assignments must reference loop-variable indices in
-        order to qualify.
+        order to qualify. Unlike the original implementation, this now
+        looks *through* nested ``elif`` branches instead of bailing out
+        as soon as ``orelse`` isn't a literal ``Assign`` -- so every
+        branch of a multi-way ``if/elif/.../else`` ladder is classified
+        consistently rather than depending on its position in the chain.
         """
         try:
-            # must have exactly one assign in body and orelse
-            if len(node.body) != 1 or len(node.orelse) != 1:
-                return False
-            if not isinstance(node.body[0], ast.Assign):
-                return False
-            if node.orelse == []:
+            targets = self._collect_chain_targets(node)
+            if not targets or len(targets) < 2:
                 return False
 
-            if not isinstance(node.orelse[0], ast.Assign):
-                return False
-
-            t1 = node.body[0].targets[0]
-            t2 = node.orelse[0].targets[0]
-
-            # Case 1: simple scalar name
-            if isinstance(t1, ast.Name) and isinstance(t2, ast.Name):
-                return t1.id == t2.id
-
-            # Case 2: attribute assignment
-            if isinstance(t1, ast.Attribute) and isinstance(t2, ast.Attribute):
-                return ast.dump(t1) == ast.dump(t2)  # safer full match
-
-            # Case 3: subscript assignment
-            if isinstance(t1, ast.Subscript) and isinstance(t2, ast.Subscript):
-                # Must be same array
-                if ast.dump(t1.value) != ast.dump(t2.value):
-                    return False
-
-                # indices MUST use loop vars, or else it's not maskable
-                if not (
-                    self._index_uses_loop_vars(t1.slice, loop_vars)
-                    or self._index_uses_loop_vars(t2.slice, loop_vars)
-                ):
-                    return False
-
-                return True
-
-            return False
+            reference = targets[0]
+            return all(
+                self._targets_match(reference, other, loop_vars)
+                for other in targets[1:]
+            )
         except Exception:
             raise
 
