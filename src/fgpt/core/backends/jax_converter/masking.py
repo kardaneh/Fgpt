@@ -370,8 +370,15 @@ class _Masking:
             if self.is_arr_at_op_call(assign.value, var_name):
                 value = assign.value.func.args[0]
 
-            if var_name in self._local_defaults or self._chain_pre_existing.get(
-                var_name, False
+            pre_existing = self._chain_pre_existing.get(var_name, False)
+            if (
+                var_name in self._local_defaults
+                or pre_existing
+                or (
+                    not pre_existing
+                    and self._scan_stack
+                    and var_name in self._scan_stack[-1].get("carry", set())
+                )
             ):
                 old_val = ast.Name(id=var_name, ctx=ast.Load())
             else:
