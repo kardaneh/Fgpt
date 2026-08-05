@@ -490,6 +490,57 @@ class TestF2NP:
         assert result.slice.lower is None
         assert result.slice.upper is None
 
+        # Vector subscipts B = A((/1, 3, 5/))
+        # meaning pick out elements 1, 3, and 5 of A
+        code = """
+        subroutine do_neg()
+            b = a((/1, 3, 5/))
+        end subroutine do_neg
+        """
+        stmt = self.parse_and_get(code, F23.Part_Ref)
+        self.f2np.extractor.all_array_info = {"test": {"a": []}}
+        result = self.f2np.handle_part_ref(stmt)
+
+        assert isinstance(result, ast.Subscript)
+        assert isinstance(result.slice, ast.List)
+        assert [e.value for e in result.slice.elts] == [0, 2, 4]  # shifted -1
+
+        # Bracket syntax equivalent
+        code = """
+        subroutine do_neg()
+            b = a([2, 4])
+        end subroutine do_neg
+        """
+        stmt = self.parse_and_get(code, F23.Part_Ref)
+        self.f2np.extractor.all_array_info = {"test": {"a": []}}
+        result = self.f2np.handle_part_ref(stmt)
+
+        assert [e.value for e in result.slice.elts] == [1, 3]
+
+        expr = "a((/1, 3, 5/))"
+        code = (
+            "subroutine t(a, b)\n"
+            "  real :: a(6), b(3)\n"
+            f"  b = {expr}\n"
+            "end subroutine t\n"
+        )
+        tree = Processor(logger=Logger()).parse_fortran_string(code)
+        self.f2np.extractor.all_array_info = {"test": {"a": []}}
+        func = self.f2np.recursive_ast(walk(tree, F23.Subroutine_Subprogram)[0])[2][0]
+        func.body.append(ast.Return(value=ast.Name(id="b", ctx=ast.Load())))
+        code_out = ast.unparse(ast.fix_missing_locations(func))
+        namespace = {
+            "np": np,
+        }
+        exec(compile(code_out, "<emitted>", "exec"), namespace)
+
+        a = np.array([10, 20, 30, 40, 50, 60], dtype=np.float64)
+        b = np.zeros(3)
+        b = namespace["t"](a, b)
+
+        # Fortran indices 1,3,5 -> values 10, 30, 50
+        assert list(b) == [10.0, 30.0, 50.0]
+
     def test_handle_level_4expr(self):
         code = """
         subroutine do_neg()
@@ -703,6 +754,83 @@ class TestF2NP:
         assert isinstance(result, ast.Name)
         assert result.id == "nslm"
 
+        # Array constructor:
+        # Basic multi-element literal: (/2, 3/)
+        code = """
+        subroutine test_assign()
+            b = RESHAPE(a, (/2, 3/))
+        end subroutine test_assign
+        """
+        stmt = self.parse_and_get(code, F23.Array_Constructor)
+        result = self.f2np.handle_expr(stmt)
+
+        assert isinstance(result, ast.List)
+        assert len(result.elts) == 2
+        assert all(isinstance(e, ast.Constant) for e in result.elts)
+        assert [e.value for e in result.elts] == [2, 3]
+
+        # Single-element literal: (/5/)
+        code = """
+        subroutine test_assign()
+            b = RESHAPE(a, (/5/))
+        end subroutine test_assign
+        """
+        # (/5/) is still considered as array_constructor
+        stmt = self.parse_and_get(code, F23.Array_Constructor)
+        result = self.f2np.handle_expr(stmt)
+
+        assert isinstance(result, ast.List)
+        assert len(result.elts) == 1
+        assert result.elts[0].value == 5
+
+        # Literal used as SOURCE (not just SHAPE)
+        code = """
+        subroutine test_assign()
+            b = RESHAPE((/1, 2, 3, 4, 5, 6/), shp)
+        end subroutine test_assign
+        """
+        stmt = self.parse_and_get(code, F23.Array_Constructor)
+        result = self.f2np.handle_expr(stmt)
+
+        assert isinstance(result, ast.List)
+        assert [e.value for e in result.elts] == [1, 2, 3, 4, 5, 6]
+
+        # Array constructor brackets[] instead of (//) style
+        code = """
+        subroutine test_assign()
+            b = RESHAPE(a, [2, 3])
+        end subroutine test_assign
+        """
+        stmt = self.parse_and_get(code, F23.Array_Constructor)
+        result = self.f2np.handle_expr(stmt)
+        assert isinstance(result, ast.List)
+        assert [e.value for e in result.elts] == [2, 3]
+
+        # Works fine for the expressions in the array constuctor
+        code = """
+        subroutine test_assign()
+            b = RESHAPE(a, (/n, m + 1/))
+        end subroutine test_assign
+        """
+        stmt = self.parse_and_get(code, F23.Array_Constructor)
+        result = self.f2np.handle_expr(stmt)
+        assert isinstance(result, ast.List)
+        assert len(result.elts) == 2
+        assert isinstance(result.elts[0], ast.Name) and result.elts[0].id == "n"
+        assert isinstance(result.elts[1], ast.BinOp)  # m + 1
+
+        code = """
+        subroutine test_assign()
+            b = RESHAPE((/1.0, 2.0, 3.0, 4.0, 5.0, 6.0/), SHP)
+        end subroutine test_assign
+        """
+        stmt = self.parse_and_get(code, F23.Array_Constructor)
+        result = self.f2np.handle_expr(stmt)
+        assert all(
+            isinstance(e, ast.Constant) and isinstance(e.value, float)
+            for e in result.elts
+        )
+
     def test_recursive_ast(self):
         # Simple case
         code = """
@@ -912,9 +1040,9 @@ class TestF2NPIntrinsicLowering:
 
     def unparse_intrinsic(self, expr):
         code = (
-            "subroutine t(a, b, shp, m)\n"
+            "subroutine t(a, b, shp, m, n, k)\n"
             "  real :: a(6), b(6)\n"
-            "  integer :: shp(2)\n"
+            "  integer :: shp(2), n, k\n"
             "  logical :: m(6)\n"
             f"  b = {expr}\n"
             "end subroutine t\n"
@@ -938,6 +1066,14 @@ class TestF2NPIntrinsicLowering:
             ("SUM(A, MASK=M)", "np.sum(A, where=M)"),
             ("MAXVAL(A)", "np.max(A)"),
             ("SQRT(A)", "np.sqrt(A)"),
+            # reshape with inline literals
+            ("RESHAPE(A, (/2, 3/))", "np.reshape(A, [2, 3], order='F')"),
+            ("RESHAPE(A, [2, 3])", "np.reshape(A, [2, 3], order='F')"),
+            ("RESHAPE(A, (/n, k + 1/))", "np.reshape(A, [n, k + 1], order='F')"),
+            (
+                "RESHAPE((/1.0, 2.0, 3.0, 4.0, 5.0, 6.0/), SHP)",
+                "np.reshape([1.0, 2.0, 3.0, 4.0, 5.0, 6.0], SHP, order='F')",
+            ),
         ],
     )
     def test_emitted_call_matches_numpy_signature(self, fortran, expected):
@@ -959,6 +1095,10 @@ class TestF2NPIntrinsicLowering:
             "SQRT(A)",
             "MIN(A, B)",
             "MAX(A, B)",
+            "RESHAPE(A, (/2, 3/))",
+            "RESHAPE(A, [2, 3])",
+            "RESHAPE(A, (/n, k + 1/))",
+            "RESHAPE((/1.0, 2.0, 3.0, 4.0, 5.0, 6.0/), SHP)",
         ],
     )
     def test_emitted_call_is_executable(self, fortran):
@@ -969,5 +1109,7 @@ class TestF2NPIntrinsicLowering:
             "B": np.arange(6.0) + 1.0,
             "SHP": (2, 3),
             "M": np.arange(6.0) > 2.0,
+            "n": 2,
+            "k": 2,
         }
         eval(compile(self.unparse_intrinsic(fortran), "<emitted>", "eval"), namespace)

@@ -2456,6 +2456,14 @@ class F2NP:
 
             return ("slice", lb, ub, dim)
 
+        # NOTE: Vector subscript case, e.g. A((/1, 3, 5/)) or A([1,3,5]).
+        # This is Fortran's "fancy indexing": each element is itself a
+        # 1-based Fortran index into the array being subscripted, so it
+        # needs the same -1 shift applied to every element, mirroring the
+        # slice-bound handling above.
+        if isinstance(dim, F23.Array_Constructor):
+            return ("vector", None, None, dim)
+
         # Index case
         return ("index", text.strip(), None, dim)
 
@@ -2487,8 +2495,51 @@ class F2NP:
                 upper=self.handle_expr(node.children[1]) if ub else None,
             )
 
+        if kind == "vector":
+            return self._build_vector_subscript(node)
+
         # index
         return self.handle_expr(node)
+
+    def _build_vector_subscript(self, node: F23.Array_Constructor) -> ast.List:
+        """
+        Convert a Fortran vector-subscript array constructor (e.g.
+        ``A((/1, 3, 5/))``) into a Python list of 0-based indices.
+
+        Each element is a 1-based Fortran index, so ``-1`` is applied to
+        every element individually — integer literals are folded directly
+        into a new constant; any other expression is wrapped in an
+        ``ast.BinOp`` subtraction, mirroring :meth:`adjust_start`'s
+        treatment of loop-start bounds.
+
+        Parameters
+        ----------
+        node : F23.Array_Constructor
+            The Fortran array constructor used as a vector subscript.
+
+        Returns
+        -------
+        ast.List
+            A list of 0-based index expressions.
+        """
+        array_list = walk(node, F23.Ac_Value_List)[0]
+
+        elements = []
+        for val in array_list.children:
+            if isinstance(val, F23.Int_Literal_Constant):
+                elements.append(ast.Constant(value=int(val.string) - 1))
+            elif isinstance(val, F23.Real_Literal_Constant):
+                raise ValueError("Vector subscripts needs to be integers")
+            else:
+                elements.append(
+                    ast.BinOp(
+                        left=self.handle_expr(val),
+                        op=ast.Sub(),
+                        right=ast.Constant(value=1),
+                    )
+                )
+
+        return ast.List(elts=elements, ctx=ast.Load())
 
     def _make_subscript(self, name: str, args: list[ast.AST]) -> ast.Subscript:
         """
@@ -3421,6 +3472,16 @@ class F2NP:
                     args.append(expr_node)
 
             return args
+
+        elif isinstance(expr_node, F23.Array_Constructor):
+            # Inline literal like (/2, 3/) or [2, 3] used as an intrinsic argument
+            # (RESHAPE(A, (/2, 3/))). Unlike _build_array_from_constructor
+            # (used for typed array declarations), this returns a bare Python
+            # list since it's just a literal argument value,
+            # not a declared array.
+            array_list = walk(expr_node, F23.Ac_Value_List)[0]
+            elements = [self.handle_expr(val) for val in array_list.children]
+            return ast.List(elts=elements, ctx=ast.Load())
 
         elif isinstance(expr_node, F23.Assignment_Stmt):
             return self.handle_assignment(expr_node)
