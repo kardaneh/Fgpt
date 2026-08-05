@@ -615,7 +615,7 @@ class _LoopLowering:
                 escaping = ctx["mutated"] & parent["parent_reads"]
                 parent["introduced"].update(escaping)
 
-                parent["carry"].update(set(new_carry))
+                parent["carry"].update(set(new_carry) - self._seen_assigned_names)
 
             # Construct the initial carry
             updated_inputs = []
