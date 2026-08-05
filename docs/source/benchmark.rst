@@ -8,6 +8,31 @@ corresponding outputs can be generated independently, allowing the
 correctness of the transpiled implementation to be validated against the
 original Fortran code.
 
+.. note::
+
+   **Generating benchmark input/output data**
+
+   To generate the reference input/output data used for benchmarking,
+   FGPT automatically instruments the original Fortran source code by
+   inserting the appropriate ``WRITE`` statements at the required locations
+   within each isolated procedure. Before making these modifications, FGPT
+   preserves a copy of the original source file with the ``.fgpt`` extension.
+
+   After instrumentation, the user must recompile the application and execute
+   the original simulation. During execution, the inputs and outputs of each
+   isolated procedure are written to the ``benchmark`` directory. These
+   reference datasets are then used to validate the transpiled implementation
+   against the original Fortran code.
+
+   Instrumenting procedures that are executed inside large or deeply nested
+   loops can generate a very large number of ``WRITE`` operations, resulting
+   in significant execution overhead and large benchmark datasets. When
+   possible, users are encouraged to generate the reference data from
+   simulations or configurations in which the instrumented procedures are not
+   called within performance-critical loops. Alternatively, representative
+   test cases that sufficiently exercise the procedure can be used to produce
+   the benchmark data while keeping the I/O overhead manageable.
+
 The same validation strategy is then applied to the JAX transformation.
 Rather than comparing the JAX implementation against the intermediate
 Python version, its outputs are compared directly with those produced by
@@ -84,7 +109,7 @@ transpilation pipeline. The module consists of the following procedures:
 Several of these procedures also invoke additional child procedures,
 which are likewise isolated and transpiled. Consequently, the current
 version of the project is capable of transforming the complete
-``hydrol_main`` workflow from Fortran to both Python and JAX.
+``hydrology`` workflow from Fortran to both Python and JAX.
 
 These procedures exercise a wide variety of Fortran language features,
 including multidimensional arrays, conditional logic, loops, intrinsic
