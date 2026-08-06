@@ -162,6 +162,7 @@ class F2NP:
         self.logger.show_header("F2NP")
 
         self.func_name = None
+        self.needs_fortran_reshape_helper = False
 
     def append_to_current_parent(self, stmt: ast.AST, control_stack: list) -> None:
         """
@@ -2074,6 +2075,63 @@ class F2NP:
 
         return values
 
+    def _build_reshape_call(self, normalized: dict) -> ast.Call:
+        """
+        Build the emitted call for RESHAPE.
+
+        When neither PAD= nor ORDER= was supplied, emits the direct
+        ``np.reshape(source, shape, order='F')`` — matching Fortran's
+        default column-major fill with no permutation, and the cheapest
+        correct translation for the common case.
+
+        When either PAD= or ORDER= is present, routes through the
+        ``fortran_reshape`` runtime helper instead, since NumPy's own
+        ``order=`` argument only accepts 'C'/'F'/'A' and has no equivalent
+        for PAD='s fill-and-tile semantics or ORDER='s axis permutation.
+        Sets :attr:`needs_fortran_reshape_helper` so the enclosing module
+        assembly step knows to splice in the helper's definition.
+
+        Parameters
+        ----------
+        normalized : dict
+            Normalized RESHAPE arguments, with 'pad'/'order' as ``None``
+            when not supplied by the user.
+
+        Returns
+        -------
+        ast.Call
+            Either ``np.reshape(...)`` or ``fortran_reshape(...)``.
+        """
+        source = normalized["source"]
+        shape = normalized["shape"]
+        pad = normalized.get("pad")
+        order = normalized.get("order")
+
+        if pad is None and order is None:
+            return ast.Call(
+                func=ast.Attribute(
+                    value=ast.Name(id="np", ctx=ast.Load()),
+                    attr="reshape",
+                    ctx=ast.Load(),
+                ),
+                args=[source, shape],
+                keywords=[ast.keyword(arg="order", value=ast.Constant(value="F"))],
+            )
+
+        self.needs_fortran_reshape_helper = True
+
+        keywords = []
+        if pad is not None:
+            keywords.append(ast.keyword(arg="pad", value=pad))
+        if order is not None:
+            keywords.append(ast.keyword(arg="order", value=order))
+
+        return ast.Call(
+            func=ast.Name(id="fortran_reshape", ctx=ast.Load()),
+            args=[source, shape],
+            keywords=keywords,
+        )
+
     def handle_intrinsic_function_reference(
         self,
         intrinsic_function_reference: F23.Intrinsic_Function_Reference | list,
@@ -2221,6 +2279,16 @@ class F2NP:
                         for v in values[1:]:
                             expr = ast.Call(func=func, args=[expr, v], keywords=[])
                         return expr
+
+                    if signature.name == "RESHAPE":
+                        # NOTE: Fortran's RESHAPE is not equivalent to NumPy's reshape. NumPy only
+                        # changes the view/shape (with order='C'/'F'), whereas Fortran's RESHAPE
+                        # also supports PAD= (fill/tile semantics) and ORDER= (dimension
+                        # permutation). `_build_reshape_call()` therefore emits a direct
+                        # `np.reshape(..., order="F")` only for the simple case, and otherwise
+                        # routes through the `fortran_reshape` runtime helper.
+                        return self._build_reshape_call(normalized)
+
                     intrinsic_func = ast.Call(
                         func=func, args=final_args, keywords=final_keywords
                     )

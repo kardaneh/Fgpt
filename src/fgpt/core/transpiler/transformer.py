@@ -48,6 +48,7 @@ from fgpt.core.common.utils import (
     update_methods,
 )
 from fgpt.core.transpiler.f2np import F2NP
+from fgpt.core.transpiler.intrinsic import build_fortran_reshape_helper
 
 DEFAULT_TEMPLATE = Path(__file__).parent / "templates" / "default.yaml"
 
@@ -3852,6 +3853,9 @@ class Transformer:
                     if not has_valid_intent:
                         continue
 
+                if not dec_statement:
+                    continue
+
                 varname = self._is_scalar_var(dec_statement)
                 if varname:
                     self.scalar.append(varname)
@@ -4902,6 +4906,37 @@ ffile = FortranFile(path, 'r')
                 if not (isinstance(item, ast.FunctionDef) and item.name == name)
             ]
 
+    def _maybe_insert_fortran_reshape_helper(self, tree: ast.Module) -> None:
+        """
+        Splice the ``fortran_reshape`` runtime helper into *tree*'s top level
+        if the translation that produced *tree* emitted a call to it (i.e.
+        :attr:`f2np`'s ``needs_fortran_reshape_helper`` flag is set).
+
+        No-ops if the flag is unset, or if a function named
+        ``fortran_reshape`` is already present in *tree* (defensive guard
+        against double-insertion if this is ever called more than once on
+        the same tree).
+
+        Parameters
+        ----------
+        tree : ast.Module
+            The finalized module AST, mutated in place.
+        """
+        if not getattr(self.f2np, "needs_fortran_reshape_helper", False):
+            return
+
+        already_present = any(
+            isinstance(node, ast.FunctionDef) and node.name == "fortran_reshape"
+            for node in tree.body
+        )
+        if already_present:
+            return
+
+        helper_def = build_fortran_reshape_helper()
+        class_positions = self._find_positions(tree.body, ast.ClassDef)
+        insert_pos = class_positions[0] if class_positions else len(tree.body)
+        tree.body.insert(insert_pos, helper_def)
+
     def update_global_python(
         self, subroutine_key: str, cls_mode: bool = True
     ) -> ast.Module:
@@ -4933,6 +4968,7 @@ ffile = FortranFile(path, 'r')
             # Step 1: Configure global transformation state
             self.cls_mode = cls_mode
             self.global_state = True
+            self.f2np.needs_fortran_reshape_helper = False
             if not cls_mode:
                 raise NotImplementedError(
                     "Only class-based global transformation is currently supported."
@@ -5021,6 +5057,11 @@ ffile = FortranFile(path, 'r')
                 arg_names = [arg.arg for arg in func.args.args]
                 if "self" not in arg_names:
                     func.args.args.insert(0, ast.arg(arg="self"))
+
+            # Step 11: Splice in fortran_reshape helper if any translated
+            # subroutine (including collected descendants) used RESHAPE with
+            # PAD=/ORDER=.
+            self._maybe_insert_fortran_reshape_helper(tree)
 
             return ast.fix_missing_locations(tree)
         except Exception as e:
@@ -5430,6 +5471,7 @@ ffile = FortranFile(path, 'r')
 
         """
         self.global_state = False
+        self.f2np.needs_fortran_reshape_helper = False
         try:
             # 1. Load main template and locate main()
             out_main_template = self.out_main_python()
@@ -5575,6 +5617,9 @@ ffile = FortranFile(path, 'r')
             # 8. Now we add the functions into the class module
             for functions in function_stmts:
                 self.insert_at(None, functions, out_main_template)
+
+            # In the case, we have reshape inside the main script
+            self._maybe_insert_fortran_reshape_helper(out_main_template)
 
             return ast.fix_missing_locations(out_main_template)
 

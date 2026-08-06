@@ -879,3 +879,47 @@ x: int = 5
             self.transformer.insert_all_assign_nodes(
                 [bad_node], module, method_name="foo"
             )
+
+    def test_maybe_insert_fortran_reshape_helper(self):
+        # Flag unset -> module untouched
+        self.transformer.f2np.needs_fortran_reshape_helper = False
+        module = ast.Module(body=[], type_ignores=[])
+        self.transformer._maybe_insert_fortran_reshape_helper(module)
+        assert module.body == []
+
+        # Flag set -> helper spliced in
+        self.transformer.f2np.needs_fortran_reshape_helper = True
+        module = ast.Module(body=[], type_ignores=[])
+        self.transformer._maybe_insert_fortran_reshape_helper(module)
+
+        helper_defs = [
+            n
+            for n in module.body
+            if isinstance(n, ast.FunctionDef) and n.name == "fortran_reshape"
+        ]
+        assert len(helper_defs) == 1
+
+        # calling again on the same tree doesn't duplicate it
+        self.transformer._maybe_insert_fortran_reshape_helper(module)
+        helper_defs = [
+            n
+            for n in module.body
+            if isinstance(n, ast.FunctionDef) and n.name == "fortran_reshape"
+        ]
+        assert len(helper_defs) == 1
+
+        self.transformer.f2np.needs_fortran_reshape_helper = True
+        class_node = ast.ClassDef(
+            name="Global_module_test",
+            bases=[],
+            keywords=[],
+            body=[ast.Pass()],
+            decorator_list=[],
+        )
+        import_node = ast.Import(names=[ast.alias(name="numpy", asname="np")])
+        module = ast.Module(body=[import_node, class_node], type_ignores=[])
+        self.transformer._maybe_insert_fortran_reshape_helper(module)
+        assert any(
+            isinstance(n, ast.FunctionDef) and n.name == "fortran_reshape"
+            for n in module.body
+        )

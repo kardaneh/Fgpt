@@ -74,7 +74,26 @@ class TestIntrinsic:
         assert result["source"] == "A"
         # `shape`, not `newshape`: NumPy 2.1 deprecated the `newshape` keyword.
         assert result["shape"] == (2, 2)
-        assert result["order"].value == "F"
+
+        # positional args given for the whole intrinsic function
+        result = normalize_intrinsic_call(
+            sig, positional_args=["A", (2, 2), (-1, -2), (2, 1)], keyword_args={}
+        )
+        assert result["source"] == "A"
+        assert result["shape"] == (2, 2)
+        assert result["pad"] == (-1, -2)
+        assert result["order"] == (2, 1)
+
+        # positional and keyword arguments
+        result = normalize_intrinsic_call(
+            sig,
+            positional_args=["A", (2, 2)],
+            keyword_args={"pad": (-1, -2), "order": (2, 1)},
+        )
+        assert result["source"] == "A"
+        assert result["shape"] == (2, 2)
+        assert result["pad"] == (-1, -2)
+        assert result["order"] == (2, 1)
 
     def test_matmul(self):
         sig = intrinsic_signatures["MATMUL"]
