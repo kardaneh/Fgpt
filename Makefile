@@ -62,14 +62,14 @@ OTHER_OBJ  = $(patsubst $(SRC_DIR)/%,$(OBJ_DIR)/%,$(OTHER_SRC:.f90=.o))
 
 # Only Tapenade stack mechanism
 ifdef AUTO_DIFF
-  $(info 🧮 Automatic differentiation enabled: including Tapenade runtime)
+  $(info Automatic differentiation enabled: including Tapenade runtime)
   # Tapenade installation
   TAPENADE_HOME = /home/kardaneh/tapenade/tapenade_3.16
   TAPENADE_LIB  = $(TAPENADE_HOME)/ADFirstAidKit
   TAPENADE_OBJ = $(OBJ_DIR)/adStack.o
   TAPENADE_SRC = $(TAPENADE_LIB)/adStack.c
 else
-  $(info ⚙️  Automatic differentiation disabled)
+  $(info Automatic differentiation disabled)
   TAPENADE_OBJ =
   TAPENADE_SRC =
 endif
@@ -90,12 +90,12 @@ COMPILER_REPORT = $(SRC_DIR)/$(EXECUTABLE).txt
 all: clean $(EXECUTABLE)
 
 $(EXECUTABLE): $(ALL_OBJ)
-	@echo "🔗 Linking $(EXECUTABLE) ..."
+	@echo "Linking $(EXECUTABLE) ..."
 ifdef AUTO_DIFF
-	@echo "🧮 Including Tapenade object files for automatic differentiation."
+	@echo "Including Tapenade object files for automatic differentiation."
 endif
 	$(FC_NVIDIA) $(FFLAGS_NVIDIA) $^ $(LDFLAGS) -o $@ >> $(COMPILER_REPORT) 2>&1
-	@echo "✅ Build complete: $(EXECUTABLE)"
+	@echo "Build complete: $(EXECUTABLE)"
 
 # -----------------------------
 # Compilation rules
@@ -115,4 +115,4 @@ endif
 # -----------------------------
 clean:
 	rm -rf $(OBJ_DIR) $(EXECUTABLE) $(MOD_DIR) $(COMPILER_REPORT)
-	@echo "🧹 Cleaned build artifacts."
+	@echo "Cleaned build artifacts."

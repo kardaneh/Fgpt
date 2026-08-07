@@ -66,10 +66,174 @@ class Processor:
         current_dir = os.getcwd()
         self.benchmark_dir = os.path.join(current_dir, "benchmark")
         os.makedirs(self.benchmark_dir, exist_ok=True)
+        # Fortran intrinsic functions and subroutines (common ones)
+        self.fortran_intrinsics = {
+            # Numeric
+            "ABS",
+            "AIMAG",
+            "AINT",
+            "ANINT",
+            "CEILING",
+            "CMPLX",
+            "DBLE",
+            "DIM",
+            "DPROD",
+            "FLOOR",
+            "INT",
+            "NINT",
+            "REAL",
+            "MASK",
+            # Mathematical
+            "ACOS",
+            "ACOSH",
+            "ASIN",
+            "ASINH",
+            "ATAN",
+            "ATAN2",
+            "ATANH",
+            "COS",
+            "COSH",
+            "SIN",
+            "SINH",
+            "TAN",
+            "TANH",
+            "EXP",
+            "LOG",
+            "LOG10",
+            "SQRT",
+            "ERF",
+            "ERFC",
+            "ERFC_SCALED",
+            "GAMMA",
+            "LOG_GAMMA",
+            "HYPOT",
+            "MAX",
+            "MIN",
+            "MOD",
+            "MODULO",
+            "SIGN",
+            # Character
+            "ACHAR",
+            "ADJUSTL",
+            "ADJUSTR",
+            "CHAR",
+            "IACHAR",
+            "ICHAR",
+            "INDEX",
+            "LEN",
+            "LEN_TRIM",
+            "NEW_LINE",
+            "REPEAT",
+            "SCAN",
+            "TRIM",
+            "VERIFY",
+            # Array
+            "ALL",
+            "ANY",
+            "COUNT",
+            "CSHIFT",
+            "DOT_PRODUCT",
+            "EOSHIFT",
+            "FINDLOC",
+            "LBOUND",
+            "MATMUL",
+            "MAXLOC",
+            "MAXVAL",
+            "MERGE",
+            "MINLOC",
+            "MINVAL",
+            "PACK",
+            "PRODUCT",
+            "RESHAPE",
+            "SHAPE",
+            "SIZE",
+            "SPREAD",
+            "SUM",
+            "TRANSPOSE",
+            "UBOUND",
+            "UNPACK",
+            # Bit manipulation
+            "BIT_SIZE",
+            "BTEST",
+            "IAND",
+            "IBCLR",
+            "IBITS",
+            "IBSET",
+            "IEOR",
+            "IOR",
+            "ISHFT",
+            "ISHFTC",
+            "LEADZ",
+            "MASKL",
+            "MASKR",
+            "MERGE_BITS",
+            "NOT",
+            "POPCNT",
+            "POPPAR",
+            "SHIFTA",
+            "SHIFTL",
+            "SHIFTR",
+            "TRAILZ",
+            # Numeric inquiry
+            "DIGITS",
+            "EPSILON",
+            "EXPONENT",
+            "FRACTION",
+            "HUGE",
+            "KIND",
+            "MAXEXPONENT",
+            "MINEXPONENT",
+            "NEAREST",
+            "PRECISION",
+            "RADIX",
+            "RANGE",
+            "RRSPACING",
+            "SCALE",
+            "SET_EXPONENT",
+            "SPACING",
+            "TINY",
+            # Kind selection
+            "SELECTED_CHAR_KIND",
+            "SELECTED_INT_KIND",
+            "SELECTED_REAL_KIND",
+            "STORAGE_SIZE",
+            # Pointer / allocation
+            "ALLOCATED",
+            "ASSOCIATED",
+            "MOVE_ALLOC",
+            "NULL",
+            # Type inquiry
+            "EXTENDS_TYPE_OF",
+            "SAME_TYPE_AS",
+            # Miscellaneous
+            "COMMAND_ARGUMENT_COUNT",
+            "COMPILER_OPTIONS",
+            "COMPILER_VERSION",
+            "CPU_TIME",
+            "DATE_AND_TIME",
+            "EXECUTE_COMMAND_LINE",
+            "GET_COMMAND",
+            "GET_COMMAND_ARGUMENT",
+            "GET_ENVIRONMENT_VARIABLE",
+            "IS_CONTIGUOUS",
+            "PRESENT",
+            "RANDOM_NUMBER",
+            "RANDOM_SEED",
+            "SYSTEM_CLOCK",
+            "TRANSFER",
+        }
+        # Convert intrinsics to lowercase for case-insensitive comparison
+        self.fortran_intrinsics_lower = {
+            func.lower(): func.upper() for func in self.fortran_intrinsics
+        }
 
     def parse_fortran_file(self, file_path: str) -> F23.Program:
         """
         Parses a Fortran source file and returns its Abstract Syntax Tree (AST).
+        The AST is automatically normalized after parsing:
+        - Intrinsic function names → UPPERCASE
+        - Variable names → lowercase
+        - Declared intrinsic names used as variables → lowercase
 
         Parameters
         ----------
@@ -90,6 +254,12 @@ class Processor:
             reader = FortranFileReader(file_path, ignore_comments=False)
             parse_tree = self.parser(reader)
             self.logger.info(f"Successfully parsed file: {file_path}")
+
+            # Automatically normalize all names in the parsed AST
+            self.logger.info(f"Normalizing names in parsed file: {file_path}")
+            parse_tree = self.normalize_module_names(parse_tree)
+            # self.write_fortran_code_to_file
+
             return parse_tree
         except Exception as e:
             self.logger.exception(f"Failed to parse file: Error: {file_path}", e)
@@ -214,6 +384,83 @@ class Processor:
                         return comment_node
         except Exception as e:
             self.logger.exception(f"Failed to parse comment: {stmt_str}", e)
+            raise
+
+    def normalize_module_names(self, module_tree: F23.Module) -> F23.Module:
+        """
+        Normalize all names in a Fortran module AST.
+
+        This method walks through the entire module AST and normalizes:
+        - Intrinsic function names → UPPERCASE
+        - Variable names → lowercase
+        - Declared intrinsic names that are used as variables → lowercase
+
+        This should be called ONCE at the module level before any extraction.
+        """
+        try:
+            # First pass: collect all declared names in the module
+            declared_names = set()
+
+            # Walk through ALL specification parts
+            # This captures: module variables, procedure variables, dummy arguments,
+            # derived types, and any other declarations
+            for spec_part in walk(module_tree, F23.Specification_Part):
+                # Type declarations
+                for decl in walk(spec_part, F23.Type_Declaration_Stmt):
+                    for entity in walk(decl, F23.Entity_Decl):
+                        var_name = entity.children[0].tostr()
+                        declared_names.add(var_name.lower())
+
+                # Derived type definitions
+                for type_def in walk(spec_part, F23.Derived_Type_Def):
+                    # Get the type name
+                    for stmt in walk(type_def, F23.Derived_Type_Stmt):
+                        for child in stmt.children:
+                            if isinstance(child, F23.Type_Name):
+                                declared_names.add(child.tostr().lower())
+
+                    # Get the component names inside the derived type
+                    for comp_part in walk(type_def, F23.Component_Part):
+                        for comp in walk(comp_part, F23.Component_Decl):
+                            for child in comp.children:
+                                if isinstance(child, F23.Name):
+                                    declared_names.add(child.tostr().lower())
+
+                # Interface declarations (for external procedures)
+                for interface in walk(spec_part, F23.Interface_Block):
+                    for stmt in walk(interface, F23.Interface_Stmt):
+                        for child in stmt.children:
+                            if isinstance(child, F23.Name):
+                                declared_names.add(child.tostr().lower())
+
+            # Second pass: normalize all names
+            for name_node in walk(module_tree, F23.Name):
+                original_name = name_node.string
+                lower_name = original_name.lower()
+
+                # Check if declared
+                if lower_name in declared_names:
+                    # Variable → lowercase
+                    if original_name != lower_name:
+                        # self.logger.warning(f"Normalizing variable name: {original_name} → {lower_name}")
+                        name_node.string = lower_name
+                elif lower_name in self.fortran_intrinsics_lower:
+                    # Intrinsic → UPPERCASE
+                    correct_case = self.fortran_intrinsics_lower[lower_name]
+                    if original_name != correct_case:
+                        # self.logger.warning(f"Normalizing intrinsic name: {original_name} → {correct_case}")
+                        name_node.string = correct_case
+                else:
+                    # Other names → lowercase
+                    if original_name != lower_name:
+                        # self.logger.warning(f"Normalizing other name: {original_name} → {lower_name}")
+                        name_node.string = lower_name
+
+            self.logger.info("Successfully normalized all names in the module")
+            return module_tree
+
+        except Exception as e:
+            self.logger.exception("Failed to normalize module names: ", e)
             raise
 
     def find_enclosing_parent(self, node: F23.Base, parent_type: type) -> type | None:
@@ -343,10 +590,10 @@ class Processor:
                 if isinstance(child, F23.Entity_Decl_List | F23.Component_Decl_List):
                     if isinstance(child, F23.Entity_Decl_List):
                         for child_child in walk(child, F23.Entity_Decl):
-                            right_part.append(child_child.string)
+                            right_part.append(child_child.tostr())
                     else:
                         for child_child in walk(child, F23.Component_Decl):
-                            right_part.append(child_child.string)
+                            right_part.append(child_child.tostr())
 
             left_part_merged = ", ".join([name for name in left_part])
             new_decl = []
@@ -396,9 +643,9 @@ class Processor:
                     left_part.append(child.tostr())
                 if isinstance(child, F23.Entity_Decl_List):
                     for child_child in walk(child, F23.Entity_Decl):
-                        right_part.append(child_child.string)
-                        if child_child.string in var_modif:
-                            right_part.append(child_child.string + "_copy")
+                        right_part.append(child_child.tostr())
+                        if child_child.tostr() in var_modif:
+                            right_part.append(child_child.tostr() + "_copy")
 
             left_part_merged = ", ".join([name for name in left_part])
             right_part_merged = ", ".join([name for name in right_part])
@@ -1404,7 +1651,7 @@ class Processor:
             )
             custom_module_name = walk(walk(self.out_module, F23.Module_Stmt), F23.Name)[
                 0
-            ].string
+            ].tostr()
 
             assert procedure_tree is not None, "procedure_tree must be provided"
             assert isinstance(
@@ -1667,7 +1914,6 @@ class Processor:
             i = 0
             while i < len(specification_part.content):
                 child = specification_part.content[i]
-
                 if isinstance(child, F23.Type_Declaration_Stmt | F23.Component_Part):
                     if isinstance(child, F23.Type_Declaration_Stmt):
                         entity_decls = walk(child, F23.Entity_Decl)
@@ -2057,7 +2303,7 @@ class Processor:
 
             while queue:
                 element = queue.popleft()
-                attr_spec = [case.string for case in walk(element, F23.Attr_Spec)]
+                attr_spec = [case.tostr() for case in walk(element, F23.Attr_Spec)]
                 is_allocatable = "ALLOCATABLE" in attr_spec
                 is_array = bool(walk(element, F23.Explicit_Shape_Spec))
 

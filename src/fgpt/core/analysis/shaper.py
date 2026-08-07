@@ -179,7 +179,7 @@ class Shaper:
                     call_stmt = walk(sub, F23.Call_Stmt)
                     if call_stmt:
                         for item in call_stmt:
-                            call_name = walk(item, F23.Name)[0].string
+                            call_name = walk(item, F23.Name)[0].tostr()
                             if call_name == subroutine_key:
                                 self.processor.logger.info(
                                     f"Subroutine '{call_name}' is called inside module '{file_base}'!"
@@ -250,7 +250,7 @@ class Shaper:
                 "Error: actual_arg_spec_list is None!"
             )
             assert self.call_subroutines is not None, "Error: call_subroutines is None!"
-            name = walk(walk(node, F23.Entity_Decl), F23.Name)[0].string
+            name = walk(walk(node, F23.Entity_Decl), F23.Name)[0].tostr()
             if name not in self.dummy_arg_list[subroutine_key]:
                 raise ValueError(
                     f"An implicit array '{name}' with an unknown shape is declared locally!"
@@ -260,7 +260,7 @@ class Shaper:
                 subroutine_key not in self.actual_arg_spec_list
                 or subroutine_key not in self.call_subroutines
             ):
-                self.current_module_imp = walk(node.get_root(), F23.Name)[0].string
+                self.current_module_imp = walk(node.get_root(), F23.Name)[0].tostr()
                 self.processor.logger.info(
                     f"The subroutine '{subroutine_key}' is called outside of the module '{self.current_module_imp}'. Searching the module..."
                 )
@@ -276,7 +276,7 @@ class Shaper:
 
                 subroutine_key = walk(
                     walk(enclosing_subroutine, F23.Subroutine_Stmt), F23.Name
-                )[0].string
+                )[0].tostr()
                 declaration_part = walk(enclosing_subroutine, F23.Specification_Part)
 
                 self.processor.logger.info(
@@ -286,7 +286,7 @@ class Shaper:
                 if declaration_part:
                     for decl in walk(declaration_part, F23.Type_Declaration_Stmt):
                         declarations = [
-                            name.children[0].string
+                            name.children[0].tostr()
                             for name in walk(decl, F23.Entity_Decl)
                         ]
                         if act_arg in declarations:
@@ -300,7 +300,7 @@ class Shaper:
                                 return self.shaper_subroutine(decl, subroutine_key)
 
             self.module_tree_imp = call.get_root()
-            module_name = walk(self.module_tree_imp, F23.Name)[0].string
+            module_name = walk(self.module_tree_imp, F23.Name)[0].tostr()
             self.processor.logger.info(
                 f"'{act_arg}' is not a dummy argument in subroutine '{subroutine_key}'. Searching in module '{module_name}'..."
             )
@@ -368,7 +368,7 @@ class Shaper:
         """
         try:
             self.module_tree_imp = node.get_root()
-            self.current_module_imp = walk(self.module_tree_imp, F23.Name)[0].string
+            self.current_module_imp = walk(self.module_tree_imp, F23.Name)[0].tostr()
             last_processed_module_dir = None
             function_assignment_stmt = None
             act_arg_list = None

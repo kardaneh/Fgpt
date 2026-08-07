@@ -195,6 +195,7 @@ class Extractor:
             self.module_path = {}
             self.org_files_loaded = set()
             self.processor = Processor(logger=self.logger)
+            self.exclude.update(self.processor.fortran_intrinsics)
             self.procedure_search = FortranSearcher(
                 self.module_path,
                 self.parsed_modules,
@@ -1321,7 +1322,7 @@ class Extractor:
         # later referenced as fup, see multilevel_matrix). Normalizing the names
         # prevents such variables from being incorrectly identified as global variables.
         # TODO: Check if all tests pass
-        declared_names_str = {name.string.lower() for name in names_declared}
+        declared_names_str = {name.tostr() for name in names_declared}
 
         seen = {}
 
@@ -1341,9 +1342,9 @@ class Extractor:
         while names_queue:
             name = names_queue.popleft()
 
-            if name.string.lower() == subroutine_key.lower():
+            if name.tostr().lower() == subroutine_key.lower():
                 self.processor.logger.warning(
-                    f"Variable name '{name.string}' matches subroutine name '{subroutine_key}'. "
+                    f"Variable name '{name.tostr()}' matches subroutine name '{subroutine_key}'. "
                     f"This mean that the procedure is a function."
                 )
                 assert isinstance(subroutine_tree, F23.Function_Subprogram), (
@@ -1402,10 +1403,10 @@ class Extractor:
             # prevents such variables from being incorrectly identified as global variables.
             # TODO: Check if all tests pass
             if (
-                name.string.lower() not in declared_names_str
-                and name.string.lower() not in self.exclude
+                name.tostr() not in declared_names_str
+                and name.tostr() not in self.exclude
             ):
-                seen[name.string.lower()] = name
+                seen[name.tostr()] = name
 
         self.var_global[subroutine_key] = list(seen.values())
         for idx, node in enumerate(specification_part.children):
@@ -1902,7 +1903,7 @@ class Extractor:
                         f"Attention: there are additional variables to search: {var_initial}"
                     )
                     self.processor.logger.warning(f"In the directory: {module_dir}")
-                    ffile = walk(module_tree, F23.Name)[0].string
+                    ffile = walk(module_tree, F23.Name)[0].tostr()
                     self.processor.logger.warning(f"In the module: {ffile}")
                     self.find_global_variables(
                         module_dir, module_tree, var_initial, subroutine_key
@@ -2005,7 +2006,7 @@ class Extractor:
                     self.processor.logger.warning(
                         f"In the directory: '{self.finder.module_dir_sc}'"
                     )
-                    ffile = walk(self.finder.module_tree_sc, F23.Name)[0].string
+                    ffile = walk(self.finder.module_tree_sc, F23.Name)[0].tostr()
                     self.processor.logger.warning(f"In the module: '{ffile}'")
                     self.find_global_variables(
                         self.finder.module_dir_sc,
@@ -2249,7 +2250,7 @@ class Extractor:
                     else walk(walk(item, F23.Explicit_Shape_Spec), F23.Name)
                 )
                 if shape:
-                    seen = {n.string for n in self.shapes_variables[subroutine_key]}
+                    seen = {n.tostr() for n in self.shapes_variables[subroutine_key]}
                     for name in shape:
                         if (
                             name is not None
@@ -2260,12 +2261,14 @@ class Extractor:
                             and name.tostr() not in seen
                         ):
                             self.shapes_variables[subroutine_key].append(name)
-                            seen.add(name.string)
+                            seen.add(name.tostr())
                 else:
                     assert dec_stmt, "The scalar must be a Type_Declaration_Stmt!"
                     array = walk(item, F23.Dimension_Attr_Spec)
                     if not array:
-                        seen = {n.string for n in self.scalar_variables[subroutine_key]}
+                        seen = {
+                            n.tostr() for n in self.scalar_variables[subroutine_key]
+                        }
                         names = walk(walk(item, F23.Entity_Decl), F23.Name)
                         for name in names:
                             if (
@@ -2277,7 +2280,7 @@ class Extractor:
                                 and name.tostr() not in seen
                             ):
                                 self.scalar_variables[subroutine_key].append(name)
-                                seen.add(name.string)
+                                seen.add(name.tostr())
 
     def organize_code_components(
         self, subroutine_key: str, input_dict: dict, openacc: bool = False

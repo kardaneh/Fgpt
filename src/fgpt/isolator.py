@@ -288,18 +288,18 @@ class Isolator:
                     cls.dec_global[child_procedure][key], child_procedure
                 )
 
-        scalar_names = {var.string for var in cls.scalar_variables[child_procedure]}
-        global_names = {var.string for var in cls.var_global[child_procedure]}
+        scalar_names = {var.tostr() for var in cls.scalar_variables[child_procedure]}
+        global_names = {var.tostr() for var in cls.var_global[child_procedure]}
         shape_to_search = [
             var
             for var in cls.shapes_variables[child_procedure]
-            if var.string not in scalar_names and var.string not in global_names
+            if var.tostr() not in scalar_names and var.tostr() not in global_names
         ]
 
         # this is for fully in/out procedure
         # shape_to_read = [
         #         var for var in cls.shapes_variables[child_procedure]
-        #         if var.string in scalar_names and var.string not in global_names
+        #         if var.tostr() in scalar_names and var.tostr() not in global_names
         #         ]
 
         if shape_to_search:

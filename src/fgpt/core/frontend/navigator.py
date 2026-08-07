@@ -133,12 +133,12 @@ class Navigator:
         - Updates return_key_sc to True if variable is found with valid allocation
         """
         try:
-            module_name = walk(self.module_tree_sc, F23.Name)[0].string
+            module_name = walk(self.module_tree_sc, F23.Name)[0].tostr()
             names = walk(self.module_tree_sc, F23.Name)
-            name_strings = [name.string.lower() for name in names]
+            name_strings = [name.tostr().lower() for name in names]
             if self.variable_name_sc in name_strings:
                 for child in names:
-                    if child.string.lower() == self.variable_name_sc:
+                    if child.tostr().lower() == self.variable_name_sc:
                         stmts = child.parent.parent.parent
                         any_allocate = walk(self.var_declaration, F23.Allocate_Stmt)
                         any_declarat = walk(
@@ -161,7 +161,7 @@ class Navigator:
                                 | F23.Module,
                             ):
                                 current = getattr(current, "parent", None)
-                            morr = walk(current, F23.Name)[0].string
+                            morr = walk(current, F23.Name)[0].tostr()
                             if (
                                 isinstance(stmts, F23.Type_Declaration_Stmt)
                                 and len(walk(stmts, F23.Entity_Decl)) > 1
@@ -293,9 +293,9 @@ class Navigator:
             if interfaces:
                 for interface in interfaces:
                     for node in walk(interface, F23.Interface_Stmt):
-                        interface_name = walk(node, F23.Name)[0].string
+                        interface_name = walk(node, F23.Name)[0].tostr()
                         if interface_name == self.variable_name_sc:
-                            module_name = walk(self.module_tree_sc, F23.Name)[0].string
+                            module_name = walk(self.module_tree_sc, F23.Name)[0].tostr()
                             use_stmt = (
                                 f"use {module_name}, ONLY: {self.variable_name_sc}"
                             )
@@ -307,9 +307,9 @@ class Navigator:
                             return
             for sub in walk(self.module_tree_sc, F23.Subroutine_Subprogram):
                 for node in walk(sub, F23.Subroutine_Stmt):
-                    subroutine_name = walk(node, F23.Name)[0].string
+                    subroutine_name = walk(node, F23.Name)[0].tostr()
                     if subroutine_name == self.variable_name_sc:
-                        module_name = walk(self.module_tree_sc, F23.Name)[0].string
+                        module_name = walk(self.module_tree_sc, F23.Name)[0].tostr()
                         use_stmt = f"use {module_name}, ONLY: {self.variable_name_sc}"
                         self.var_declaration.append(F23.Use_Stmt(use_stmt))
                         self.return_key_sc = True
@@ -345,7 +345,7 @@ class Navigator:
         """
         try:
             self.variable_name_sc = variable_name
-            module_name = walk(self.module_tree_sc, F23.Name)[0].string
+            module_name = walk(self.module_tree_sc, F23.Name)[0].tostr()
             self.module_set_sc.add(module_name)
             self.child_modules_sc.add(module_name)
             self.visited_modules_sc.add(module_name)
@@ -392,7 +392,7 @@ class Navigator:
                 self.processor.logger.info(
                     f"'{self.variable_name_sc}' is not found in the current module. Searching in child modules..."
                 )
-                module_name = walk(self.module_tree_sc, F23.Name)[0].string
+                module_name = walk(self.module_tree_sc, F23.Name)[0].tostr()
                 self.module_set_sc.add(module_name)
                 self.child_modules_sc.add(module_name)
                 self.visited_modules_sc.add(module_name)
@@ -429,7 +429,7 @@ class Navigator:
                 module_name = None
                 for entity in module.children:
                     if isinstance(entity, F23.Name):
-                        module_name = entity.string
+                        module_name = entity.tostr()
                         break
                 if module_name is None:
                     self.processor.logger.error(
@@ -475,7 +475,7 @@ class Navigator:
                 node = self.queue_sc.popleft()
                 for entity in node.children:
                     if isinstance(entity, F23.Name):
-                        module_name = entity.string
+                        module_name = entity.tostr()
                         self.processor.logger.info(
                             f"Checking the child module ...'{module_name}'"
                         )
