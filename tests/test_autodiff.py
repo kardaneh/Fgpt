@@ -2,10 +2,11 @@ import ast
 import os
 import tempfile
 
+import jax.numpy as jnp
 import pytest
 
 from fgpt.autodiff import AutoDiff
-from fgpt.core.backends.utils import contains_name, get_name
+from fgpt.core.backends.utils import contains_name, convert_np_jnp, get_name
 from fgpt.core.common.logger import Logger
 
 
@@ -655,3 +656,80 @@ class Model:
         tree = ast.parse("my_variable = 99")
         self.autodiff.write_to_file(str(out), tree)
         assert "my_variable = 99" in out.read_text()
+
+    def test_fortran_reshape_to_jax(self):
+        code = """
+import numpy as np
+
+def fortran_reshape(source, shape, pad=None, order=None):
+    source = np.asarray(source)
+    shape = tuple(shape)
+    total = 1
+    for s in shape:
+        total *= s
+    flat = source.reshape(-1, order="F")
+    if flat.size < total:
+        if pad is None:
+            raise ValueError("SOURCE too small and no PAD given")
+        pad_flat = np.asarray(pad).reshape(-1, order="F")
+        needed = total - flat.size
+        reps = -(-needed // pad_flat.size)
+        flat = np.concatenate([flat, np.tile(pad_flat, reps)[:needed]])
+    else:
+        flat = flat[:total]
+    if order is None:
+        return flat.reshape(shape, order="F")
+    order0 = [o - 1 for o in order]
+    tmp_shape = tuple(shape[i] for i in order0)
+    tmp = flat.reshape(tmp_shape, order="F")
+    perm = sorted(range(len(order0)), key=lambda i: order0[i])
+    return tmp.transpose(perm)
+
+class Global_module_test:
+    def __init__(self):
+        self.a = np.zeros((6,), dtype=np.float64)
+"""
+        class_module = ast.parse(code)
+        module_helpers = self.autodiff._split_module_level_functions(class_module)
+
+        for i, stmt in enumerate(class_module.body):
+            if isinstance(stmt, ast.FunctionDef) and stmt in module_helpers:
+                if stmt.name == "fortran_reshape":
+                    class_module.body[i] = convert_np_jnp(stmt)
+
+        reshape_fn = next(
+            n
+            for n in class_module.body
+            if isinstance(n, ast.FunctionDef) and n.name == "fortran_reshape"
+        )
+        src = ast.unparse(reshape_fn)
+
+        # Must still use jnp for actual array-data operations
+        assert "jnp.asarray" in src
+        assert "jnp.concatenate" in src
+        assert "jnp.tile" in src
+
+        # Executable correctness check: shape/order bookkeeping stays concrete,
+        # actual computation still matches the NumPy reference for the same
+        # inputs used in our earlier worked example.
+        namespace = {"jnp": jnp}
+        exec(
+            compile(
+                ast.fix_missing_locations(
+                    ast.Module(body=[reshape_fn], type_ignores=[])
+                ),
+                "<test>",
+                "exec",
+            ),
+            namespace,
+        )
+        result = namespace["fortran_reshape"]([1, 2, 3, 4, 5, 6], (2, 3), order=[2, 1])
+        assert result.tolist() == [[1, 2, 3], [4, 5, 6]]
+
+        # Executes fine even under jit, confirming no tracer-leakage from the
+        # bookkeeping arithmetic
+        import jax
+
+        jitted = jax.jit(namespace["fortran_reshape"], static_argnums=(1, 3))
+        result_jit = jitted(jnp.array([1, 2, 3, 4, 5, 6]), (2, 3), None, (2, 1))
+        assert result_jit.tolist() == [[1, 2, 3], [4, 5, 6]]
