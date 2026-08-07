@@ -243,6 +243,30 @@ class AutoDiff:
             self.logger.exception("Exception in _add_jax_imports", e)
             raise
 
+    def _split_module_level_functions(
+        self, class_module: ast.Module
+    ) -> list[ast.FunctionDef]:
+        """
+        Identify FunctionDefs that sit directly at module level (siblings of
+        the class), as opposed to methods nested inside a class body.
+
+        Used to exclude injected runtime helpers (e.g. ``fortran_reshape``)
+        from the class-method JAX-conversion pipeline: these are plain
+        utility functions.
+
+        Parameters
+        ----------
+        class_module : ast.Module
+            The module AST being prepared.
+
+        Returns
+        -------
+        list[ast.FunctionDef]
+            FunctionDef nodes that are direct children of *class_module*'s
+            body (not nested inside any class).
+        """
+        return [node for node in class_module.body if isinstance(node, ast.FunctionDef)]
+
     def _prepare_class(self, class_module: ast.AST, main_details: dict) -> tuple:
         """
         Transform a class AST into an Equinox-compatible module.
@@ -360,6 +384,17 @@ class AutoDiff:
             ]
             for fn in declaration_initalization:
                 self._add_jax_for_file_reading(fn)
+
+            # Module-level helper functions (e.g. an injected `fortran_reshape`)
+            # get np->jnp conversion only — they're excluded from the class-method
+            # call graph / shape propagation / JaxConverter loop-cond rewriting,
+            # since they aren't translated Fortran subroutines.
+            module_helpers = self._split_module_level_functions(class_module)
+            for i, stmt in enumerate(class_module.body):
+                if not (isinstance(stmt, ast.FunctionDef) and stmt in module_helpers):
+                    continue
+                if stmt.name == "fortran_reshape":
+                    class_module.body[i] = convert_np_jnp(stmt)
 
             # Transformation 5 — convert procedure bodies to JAX
             functions = [

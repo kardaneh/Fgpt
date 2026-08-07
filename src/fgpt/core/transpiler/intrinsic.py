@@ -204,12 +204,13 @@ RESHAPE = IntrinsicSignature(
     name="RESHAPE",
     args=["source", "shape", "pad", "order"],
     optional={"pad", "order"},
-    defaults={"pad": None, "order": ast.Constant(value="F")},
-    arg_map={"source": "a", "shape": "shape", "order": "order"},
+    defaults={"pad": None, "order": None},
+    arg_map={"source": "a", "shape": "shape", "pad": "pad", "order": "order"},
     positional=["source", "shape"],
     transform=lambda args: {
         "source": args["source"],
         "shape": args["shape"],
+        "pad": args["pad"],
         "order": args["order"],
     },
 )
@@ -280,3 +281,49 @@ intrinsic_signatures = {
     "MAX": MAX,
     "SQRT": SQRT,
 }
+
+# Reference implementation for RESHAPE calls that use PAD= and/or ORDER=,
+# which have no direct NumPy equivalent. Parsed into an ast.FunctionDef
+# via build_fortran_reshape_helper() and conditionally added into a
+# generated module's top level by whichever pass assembles the final
+# module (only when F2NP.needs_fortran_reshape_helper is True), rather
+# than being unconditionally emitted or imported from a runtime package.
+FORTRAN_RESHAPE_SRC = """
+def fortran_reshape(source, shape, pad=None, order=None):
+    source = np.asarray(source)
+    shape = tuple(shape)
+    total = 1
+    for s in shape:
+        total *= s
+    flat = source.reshape(-1, order="F")
+    if flat.size < total:
+        if pad is None:
+            raise ValueError("SOURCE too small and no PAD given")
+        pad_flat = np.asarray(pad).reshape(-1, order="F")
+        needed = total - flat.size
+        reps = -(-needed // pad_flat.size)
+        flat = np.concatenate([flat, np.tile(pad_flat, reps)[:needed]])
+    else:
+        flat = flat[:total]
+    if order is None:
+        return flat.reshape(shape, order="F")
+    order0 = [o - 1 for o in order]
+    tmp_shape = tuple(shape[i] for i in order0)
+    tmp = flat.reshape(tmp_shape, order="F")
+    perm = sorted(range(len(order0)), key=lambda i: order0[i])
+    return tmp.transpose(perm)
+"""
+
+
+def build_fortran_reshape_helper() -> ast.FunctionDef:
+    """
+    Parse the reference ``fortran_reshape`` implementation into an
+    ``ast.FunctionDef`` suitable for splicing into a generated module's
+    top-level body.
+
+    Returns
+    -------
+    ast.FunctionDef
+        The parsed helper function definition.
+    """
+    return ast.parse(FORTRAN_RESHAPE_SRC).body[0]

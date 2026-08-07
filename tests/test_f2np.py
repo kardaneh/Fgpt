@@ -9,6 +9,7 @@ from fparser.two.utils import walk
 from fgpt.core.common.logger import Logger
 from fgpt.core.frontend.processor import Processor
 from fgpt.core.transpiler.f2np import F2NP
+from fgpt.core.transpiler.intrinsic import build_fortran_reshape_helper
 
 
 @pytest.fixture(scope="class")
@@ -1038,6 +1039,17 @@ class TestF2NPIntrinsicLowering:
     accepts positionally.
     """
 
+    # Test out if the reshape helper flag is True when PAD and/or ORDER is
+    # present
+    def test_reshape_sets_helper_flag_only_when_needed(self):
+        assert self.f2np.needs_fortran_reshape_helper is False
+
+        self.unparse_intrinsic("RESHAPE(A, SHP)")
+        assert self.f2np.needs_fortran_reshape_helper is False
+
+        self.unparse_intrinsic("RESHAPE(A, SHP, PAD=B)")
+        assert self.f2np.needs_fortran_reshape_helper is True
+
     def unparse_intrinsic(self, expr):
         code = (
             "subroutine t(a, b, shp, m, n, k)\n"
@@ -1066,13 +1078,28 @@ class TestF2NPIntrinsicLowering:
             ("SUM(A, MASK=M)", "np.sum(A, where=M)"),
             ("MAXVAL(A)", "np.max(A)"),
             ("SQRT(A)", "np.sqrt(A)"),
-            # reshape with inline literals
+            # np.reshape with inline literals
             ("RESHAPE(A, (/2, 3/))", "np.reshape(A, [2, 3], order='F')"),
             ("RESHAPE(A, [2, 3])", "np.reshape(A, [2, 3], order='F')"),
             ("RESHAPE(A, (/n, k + 1/))", "np.reshape(A, [n, k + 1], order='F')"),
             (
                 "RESHAPE((/1.0, 2.0, 3.0, 4.0, 5.0, 6.0/), SHP)",
                 "np.reshape([1.0, 2.0, 3.0, 4.0, 5.0, 6.0], SHP, order='F')",
+            ),
+            # np.reshape with PAD and ORDER correction
+            ("RESHAPE(A, SHP)", "np.reshape(A, SHP, order='F')"),
+            ("RESHAPE(A, SHP, PAD=B)", "fortran_reshape(A, SHP, pad=B)"),
+            (
+                "RESHAPE(A, SHP, ORDER=(/2, 1/))",
+                "fortran_reshape(A, SHP, order=[2, 1])",
+            ),
+            (
+                "RESHAPE(A, SHP, PAD=B, ORDER=(/2, 1/))",
+                "fortran_reshape(A, SHP, pad=B, order=[2, 1])",
+            ),
+            (
+                "RESHAPE((/1,2,3,4,5,6/), (/3,5/), (/-1,-2/), (/2,1/))",
+                "fortran_reshape([1, 2, 3, 4, 5, 6], [3, 5], pad=[-1, -2], order=[2, 1])",
             ),
         ],
     )
@@ -1113,3 +1140,207 @@ class TestF2NPIntrinsicLowering:
             "k": 2,
         }
         eval(compile(self.unparse_intrinsic(fortran), "<emitted>", "eval"), namespace)
+
+    def test_reshape_with_order_executable(self):
+        code = (
+            "subroutine t(a, shp, ord)\n"
+            "  real :: a(6), b(2,3)\n"
+            "  integer :: shp(2), ord(2)\n"
+            "  b = RESHAPE(a, shp, ORDER=ord)\n"
+            "end subroutine t\n"
+        )
+        tree = Processor(logger=Logger()).parse_fortran_string(code)
+        func = self.f2np.recursive_ast(walk(tree, F23.Subroutine_Subprogram)[0])[2][0]
+        func.body.append(ast.Return(value=ast.Name(id="b", ctx=ast.Load())))
+        assert self.f2np.needs_fortran_reshape_helper is True
+
+        # Simulate what Transformer's module-assembly step will do: splice
+        # the helper's FunctionDef in ahead of the subroutine and exec both
+        # together, rather than importing fortran_reshape from a package.
+        helper_def = build_fortran_reshape_helper()
+        module = ast.Module(body=[helper_def, func], type_ignores=[])
+        ast.fix_missing_locations(module)
+
+        namespace = {"np": np}
+        exec(compile(module, "<emitted>", "exec"), namespace)
+
+        a = np.array([1, 2, 3, 4, 5, 6], dtype=np.float64)
+        b = np.zeros((2, 3))
+        b = namespace["t"](a, (2, 3), [2, 1])
+
+        # Matches the manually-worked Fortran RESHAPE(A,[2,3],ORDER=[2,1])
+        # example: fills column-major per ORDER, then restores declared shape.
+        assert b.tolist() == [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]
+
+    def test_reshape_with_pad_executable(self):
+        code = (
+            "subroutine t(a, shp, p)\n"
+            "  real :: a(4), b(2,3), p(2)\n"
+            "  integer :: shp(2)\n"
+            "  b = RESHAPE(a, shp, PAD=p)\n"
+            "end subroutine t\n"
+        )
+        tree = Processor(logger=Logger()).parse_fortran_string(code)
+        func = self.f2np.recursive_ast(walk(tree, F23.Subroutine_Subprogram)[0])[2][0]
+        func.body.append(ast.Return(value=ast.Name(id="b", ctx=ast.Load())))
+
+        helper_def = build_fortran_reshape_helper()
+        module = ast.Module(body=[helper_def, func], type_ignores=[])
+        ast.fix_missing_locations(module)
+
+        namespace = {"np": np}
+        exec(compile(module, "<emitted>", "exec"), namespace)
+
+        a = np.array([1, 2, 3, 4], dtype=np.float64)
+        p = np.array([99, 100], dtype=np.float64)
+        b = np.zeros((2, 3))
+        b = namespace["t"](a, (2, 3), p)
+
+        # 6 elements needed, only 4 in SOURCE -> pad cycles [99,100] for the
+        # remaining 2, then fills column-major into (2,3).
+        expected_flat = np.array([1, 2, 3, 4, 99, 100], dtype=np.float64)
+        assert b.tolist() == expected_flat.reshape((2, 3), order="F").tolist()
+
+    def test_reshape_pad_and_order_combined_executable(self):
+        # Taken from the example: https://www.ibm.com/docs/fr/xl-fortran-aix/16.1.0?topic=procedures-reshapesource-shape-pad-order
+        code = (
+            "subroutine t()\n"
+            "  real :: b(3,5)\n"
+            "  b = RESHAPE((/1,2,3,4,5,6/), (/3,5/), (/-1,-2/), (/2,1/))\n"
+            "end subroutine t\n"
+        )
+        tree = Processor(logger=Logger()).parse_fortran_string(code)
+        func = self.f2np.recursive_ast(walk(tree, F23.Subroutine_Subprogram)[0])[2][0]
+        func.body.append(ast.Return(value=ast.Name(id="b", ctx=ast.Load())))
+
+        helper_def = build_fortran_reshape_helper()
+        module = ast.Module(body=[helper_def, func], type_ignores=[])
+        ast.fix_missing_locations(module)
+
+        namespace = {"np": np}
+        exec(compile(module, "<emitted>", "exec"), namespace)
+
+        b = np.zeros((3, 5))
+        b = namespace["t"]()
+
+        expected = namespace["fortran_reshape"](
+            [1, 2, 3, 4, 5, 6], [3, 5], pad=[-1, -2], order=[2, 1]
+        )
+        assert b.tolist() == expected.tolist()
+
+    def test_reshape_2d_source_executable(self):
+        code = (
+            "subroutine t(a)\n"
+            "  real :: a(2,3), b(3,2)\n"
+            "  b = RESHAPE(a, (/3,2/))\n"
+            "end subroutine t\n"
+        )
+
+        tree = Processor(logger=Logger()).parse_fortran_string(code)
+        func = self.f2np.recursive_ast(walk(tree, F23.Subroutine_Subprogram)[0])[2][0]
+        func.body.append(ast.Return(value=ast.Name(id="b", ctx=ast.Load())))
+
+        helper_def = build_fortran_reshape_helper()
+        module = ast.Module(body=[helper_def, func], type_ignores=[])
+        ast.fix_missing_locations(module)
+
+        namespace = {"np": np}
+        exec(compile(module, "<emitted>", "exec"), namespace)
+
+        # Fortran arrays are column-major
+        a = np.array([[1, 3, 5], [2, 4, 6]], dtype=np.float64)
+
+        b = namespace["t"](a)
+
+        expected = np.reshape(a, (3, 2), order="F")
+        assert b.tolist() == expected.tolist()
+
+    def test_reshape_3d_source_executable(self):
+        code = (
+            "subroutine t(a)\n"
+            "  real :: a(2,2,3), b(3,2,2)\n"
+            "  b = RESHAPE(a, (/3,2,2/))\n"
+            "end subroutine t\n"
+        )
+
+        tree = Processor(logger=Logger()).parse_fortran_string(code)
+        func = self.f2np.recursive_ast(walk(tree, F23.Subroutine_Subprogram)[0])[2][0]
+        func.body.append(ast.Return(value=ast.Name(id="b", ctx=ast.Load())))
+
+        helper_def = build_fortran_reshape_helper()
+        module = ast.Module(body=[helper_def, func], type_ignores=[])
+        ast.fix_missing_locations(module)
+
+        namespace = {"np": np}
+        exec(compile(module, "<emitted>", "exec"), namespace)
+
+        a = np.arange(1, 13, dtype=np.float64).reshape((2, 2, 3), order="F")
+
+        b = namespace["t"](a)
+
+        expected = np.reshape(a, (3, 2, 2), order="F")
+        assert b.tolist() == expected.tolist()
+
+    def test_reshape_2d_to_2d_with_pad_and_order_executable(self):
+        code = (
+            "subroutine t(a)\n"
+            "  real :: a(2,2), b(3,3)\n"
+            "  b = RESHAPE(a, (/3,3/), (/99,100/), (/2,1/))\n"
+            "end subroutine t\n"
+        )
+
+        tree = Processor(logger=Logger()).parse_fortran_string(code)
+        func = self.f2np.recursive_ast(walk(tree, F23.Subroutine_Subprogram)[0])[2][0]
+        func.body.append(ast.Return(value=ast.Name(id="b", ctx=ast.Load())))
+
+        helper_def = build_fortran_reshape_helper()
+        module = ast.Module(body=[helper_def, func], type_ignores=[])
+        ast.fix_missing_locations(module)
+
+        namespace = {"np": np}
+        exec(compile(module, "<emitted>", "exec"), namespace)
+
+        # Fortran column-major 2D input
+        a = np.array([[1, 3], [2, 4]], dtype=np.float64)
+
+        b = namespace["t"](a)
+        expected = namespace["fortran_reshape"](
+            a,
+            [3, 3],
+            pad=[99, 100],
+            order=[2, 1],
+        )
+        assert b.tolist() == expected.tolist()
+
+    def test_reshape_3d_to_3d_with_pad_and_order_executable(self):
+        code = (
+            "subroutine t(a)\n"
+            "  real :: a(2,2,2), b(3,2,2)\n"
+            "  b = RESHAPE(a, (/3,2,2/), (/99,100/), (/3,1,2/))\n"
+            "end subroutine t\n"
+        )
+
+        tree = Processor(logger=Logger()).parse_fortran_string(code)
+        func = self.f2np.recursive_ast(walk(tree, F23.Subroutine_Subprogram)[0])[2][0]
+        func.body.append(ast.Return(value=ast.Name(id="b", ctx=ast.Load())))
+
+        helper_def = build_fortran_reshape_helper()
+        module = ast.Module(body=[helper_def, func], type_ignores=[])
+        ast.fix_missing_locations(module)
+
+        namespace = {"np": np}
+        exec(compile(module, "<emitted>", "exec"), namespace)
+
+        # 8-element 3D Fortran-style array
+        a = np.arange(1, 9, dtype=np.float64).reshape((2, 2, 2), order="F")
+
+        b = namespace["t"](a)
+
+        expected = namespace["fortran_reshape"](
+            a,
+            [3, 2, 2],
+            pad=[99, 100],
+            order=[3, 1, 2],
+        )
+
+        assert b.tolist() == expected.tolist()
