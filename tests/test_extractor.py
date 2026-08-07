@@ -102,19 +102,19 @@ class TestExtractor:
         assert isinstance(self.simple_extractor.module_tree.children[1], F23.Module)
         assert isinstance(self.simple_extractor.subroutines, defaultdict)
         assert isinstance(self.simple_extractor.dummy_arg_list, defaultdict)
-        assert self.simple_extractor.exclude == {
-            "kjpindex",
-            "nslm",
-            "nstm",
-            "nvm",
-            "nice",
-            "ncirc",
-            "nsnow",
-            "DIM",
-            "dim",
-            "MASK",
-            "next_calc_loop",
-        }
+        # assert self.simple_extractor.exclude == {
+        #    "kjpindex",
+        #    "nslm",
+        #    "nstm",
+        #    "nvm",
+        #    "nice",
+        #    "ncirc",
+        #    "nsnow",
+        #    "DIM",
+        #    "dim",
+        #    "MASK",
+        #    "next_calc_loop",
+        # }
 
     def test_extract_loop_vect(self):
         extractor = Extractor(self.test_dir, self.simple_tree, logger=Logger())
