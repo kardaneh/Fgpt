@@ -171,6 +171,17 @@ def _run_isolate(args):
         py2jx=args.py2jx,
     )
 
+    if args.tapenade:
+        isolator.logger.warning(
+            "Tapenade automatic differentiation is active. "
+            "Please ensure the following requirements are met:\n"
+            "  - Tapenade is installed (version 3.16+ recommended)\n"
+            "  - TAPENADE_HOME environment variable is set\n"
+            "  - Tapenade executable is available in PATH\n"
+            "  - C compiler (mpicc) is available for building the runtime\n"
+            "  - Tapenade runtime (adStack.c) can be compiled"
+        )
+
     isolator.run(
         benchmark_dir=args.benchmark_dir,
         config_path=args.config_path,
@@ -239,6 +250,13 @@ def main():
     _add_autodiff_args(autodiff_parser)
 
     args = parser.parse_args()
+
+    if args.openacc:
+        raise RuntimeError(
+            "FGPT Fortran GPU porting via OpenACC is not available in the public version.\n"
+            "Contact Kazem Ardaneh (kardaneh@ipsl.fr) for more information about "
+            "the GPU-enabled version."
+        )
 
     if args.command == "isolate":
         _run_isolate(args)

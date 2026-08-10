@@ -28,7 +28,7 @@ TARGET_SUBROUTINES="albedo_surface_main" #"multilevel_matrix" #"albedo_surface_m
 # Isolation options
 OPENACC="False"
 F2PY="False"
-TAPENADE="False"
+TAPENADE="True"
 PY2JX="False"
 
 # Autodiff configuration

@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-echo "Starting isolation: 20260807_160718"
+echo "Starting isolation: 20260810_101522"
 echo "Target module: condveg"
 echo "Parent subroutine: condveg_main"
 echo "Target subroutines: albedo_surface_main"
-echo "OpenACC: False, F2PY: False, Tapenade: False", PY2JX: False
+echo "OpenACC: False, F2PY: False, Tapenade: True", PY2JX: False
 echo "=========================================="
 fgpt isolate \
     --work "/scratchu/kardaneh" \
@@ -13,7 +13,7 @@ fgpt isolate \
     --target_subroutines albedo_surface_main \
     --openacc "False" \
     --f2py "False" \
-    --tapenade "False" \
+    --tapenade "True" \
     --py2jx "False" \
     --config_path "template.yaml" \
     --vectorize kjpindex \
