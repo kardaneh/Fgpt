@@ -108,6 +108,7 @@ can later be optimized, vectorized, or lowered to specialized numerical backends
     architecture
     transformation
     isolator
+    tapenade
     extractor
     jax_conversion
     configuration
