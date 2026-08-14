@@ -165,17 +165,6 @@ class Extractor:
                 "write",
                 "albedo_surface_soilalb",
             ]
-            self.allowed_external_subroutines = {
-                "ipslerr_p",
-                "histwrite_p",
-                "xios_orchidee_send_field",
-                "xios_orchidee_recv_field",
-                "flinget",
-                "flininfo",
-                "scatter",
-                "getin",
-                "bcast",
-            }
             self.dec_global = defaultdict(lambda: defaultdict(list))
             self.all_array_info = defaultdict(lambda: defaultdict(list))
             self.imp_shape = defaultdict(dict)
@@ -196,6 +185,9 @@ class Extractor:
             self.org_files_loaded = set()
             self.processor = Processor(logger=self.logger)
             self.exclude.update(self.processor.fortran_intrinsics)
+            self.allowed_external_subroutines = (
+                self.processor.allowed_external_subroutines
+            )
             self.procedure_search = FortranSearcher(
                 self.module_path,
                 self.parsed_modules,

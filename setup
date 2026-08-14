@@ -1,5 +1,12 @@
 #!/usr/bin/env bash
 
+# Check fgpt installation
+if ! command -v fgpt &> /dev/null; then
+    echo "ERROR: fgpt command not found. Please install the package first using: uv pip install -e ."
+    echo "       or activate the virtual environment if already installed using: source arch_* "
+    exit 1
+fi
+
 DATE=$(date +"%Y%m%d")
 TODAY=$(date +"%Y%m%d_%H%M%S")
 

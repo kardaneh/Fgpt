@@ -7,7 +7,9 @@
 # http://creativecommons.org/licenses/by-nc-sa/4.0/
 
 # from .modifier import Modifier
+from .tapenade import TapenadePass
 
-# __all__ = [
-#     "Modifier",
-# ]
+__all__ = [
+    "TapenadePass",
+    # "Modifier"  # Modifier is not available in the public version!
+]

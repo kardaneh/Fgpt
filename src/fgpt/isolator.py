@@ -18,6 +18,7 @@ from fgpt.autodiff import AutoDiff
 from fgpt.core.common.logger import Logger
 from fgpt.core.frontend.extractor import Extractor
 from fgpt.core.frontend.processor import Processor
+from fgpt.core.passes.tapenade import TapenadePass
 from fgpt.core.transpiler.transformer import Transformer
 
 
@@ -388,8 +389,39 @@ class Isolator:
             child_procedure,
             procedure_tree,
             sub_trees,
-            auto_diff=self.tapenade,
+            # auto_diff=self.tapenade,
         )
+
+        if self.tapenade:
+            self.logger.info(
+                "Initializing TapenadePass for automatic differentiation using Tapenade..."
+            )
+            child_procedure_array_info = cls.all_array_info[child_procedure]
+            if nested_procedures:
+                for grand_child_procedure in nested_procedures:
+                    grand_child_procedure_array_info = cls.all_array_info[
+                        grand_child_procedure
+                    ]
+                    self.collect_global_vars_decl(
+                        grand_child_procedure_array_info,
+                        child_procedure_array_info,
+                    )
+
+            tapenade_pass = TapenadePass(
+                logger=self.logger,
+                allowed_external_subroutines=cls.allowed_external_subroutines,
+                all_array_info=child_procedure_array_info,
+            )
+
+            self.logger.info("Generating tangent and adjoint code using Tapenade...")
+            tapenade_pass.generate_adjoint_and_tangent(
+                file_path=os.path.join(
+                    subroutine_dir, f"module_global_{child_procedure}.f90"
+                ),
+                module_name=f"module_global_{child_procedure}",
+                subroutine_name=child_procedure,
+            )
+
         if transformer is not None:
             self.logger.info("Transforming global module to Python...")
             out_module = transformer.update_global_python(

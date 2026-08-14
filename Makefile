@@ -60,18 +60,24 @@ MODULE_OBJ = $(patsubst $(SRC_DIR)/%,$(OBJ_DIR)/%,$(MODULE_SRC:.f90=.o))
 MAIN_OBJ   = $(patsubst $(SRC_DIR)/%,$(OBJ_DIR)/%,$(MAIN_SRC:.f90=.o))
 OTHER_OBJ  = $(patsubst $(SRC_DIR)/%,$(OBJ_DIR)/%,$(OTHER_SRC:.f90=.o))
 
-# Only Tapenade stack mechanism
-ifdef AUTO_DIFF
-  $(info Automatic differentiation enabled: including Tapenade runtime)
-  # Tapenade installation
+# Check if Tapenade files exist and need adStack.o
+# Detect both adjoint (_b) and tangent (_d) Tapenade-generated files
+TAPENADE_ADJOINT_FILES = $(wildcard $(SRC_DIR)/module_*_b.f90)
+TAPENADE_TANGENT_FILES = $(wildcard $(SRC_DIR)/module_*_d.f90)
+TAPENADE_FILES = $(TAPENADE_ADJOINT_FILES) $(TAPENADE_TANGENT_FILES)
+
+ifneq ($(TAPENADE_FILES),)
+  $(info Tapenade files detected (adjoint: $(notdir $(TAPENADE_ADJOINT_FILES)), tangent: $(notdir $(TAPENADE_TANGENT_FILES))) - enabling Tapenade runtime)
   TAPENADE_HOME = /home/kardaneh/tapenade/tapenade_3.16
   TAPENADE_LIB  = $(TAPENADE_HOME)/ADFirstAidKit
   TAPENADE_OBJ = $(OBJ_DIR)/adStack.o
   TAPENADE_SRC = $(TAPENADE_LIB)/adStack.c
+  NEEDS_TAPENADE = 1
 else
   $(info Automatic differentiation disabled)
   TAPENADE_OBJ =
   TAPENADE_SRC =
+  NEEDS_TAPENADE =
 endif
 
 ALL_OBJ = $(MODULE_OBJ) $(OTHER_OBJ) $(MAIN_OBJ) $(TAPENADE_OBJ)
@@ -91,7 +97,7 @@ all: clean $(EXECUTABLE)
 
 $(EXECUTABLE): $(ALL_OBJ)
 	@echo "Linking $(EXECUTABLE) ..."
-ifdef AUTO_DIFF
+ifdef NEEDS_TAPENADE
 	@echo "Including Tapenade object files for automatic differentiation."
 endif
 	$(FC_NVIDIA) $(FFLAGS_NVIDIA) $^ $(LDFLAGS) -o $@ >> $(COMPILER_REPORT) 2>&1
@@ -104,12 +110,13 @@ $(OBJ_DIR)/%.o: $(SRC_DIR)/%.f90
 	@mkdir -p $(OBJ_DIR) $(MOD_DIR)
 	$(FC_NVIDIA) $(FFLAGS_NVIDIA) $(FFLAGS) -c $< -o $@ -module $(MOD_DIR) >> $(COMPILER_REPORT) 2>&1
 
-# Tapenade object
-ifdef AUTO_DIFF
+# Tapenade object - build if needed
+ifdef NEEDS_TAPENADE
 $(OBJ_DIR)/adStack.o: $(TAPENADE_SRC)
 	@mkdir -p $(OBJ_DIR)
 	$(CC) $(CFLAGS_NVIDIA) -fopenmp -c $< -o $@ >> $(COMPILER_REPORT) 2>&1
 endif
+
 # -----------------------------
 # Clean
 # -----------------------------
