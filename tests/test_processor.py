@@ -282,7 +282,7 @@ class TestProcessor:
     def test_out_module_fortran(self):
         # Test generating module code
         module_tree = self.processor.out_module_fortran("test_sub")
-        assert isinstance(module_tree.children[1], F23.Module)
+        assert isinstance(module_tree.children[2], F23.Module)
         assert "module_global" in module_tree.tostr()
         # self.assertIn("declaration_initialization", module_tree.tostr())
 
