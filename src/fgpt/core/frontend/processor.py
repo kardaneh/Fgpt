@@ -848,24 +848,26 @@ class Processor:
                 raise ValueError("variable name is not present!")
 
             if dimensions is None:
-                assert explicit_dec is not None, (
-                    "explicit_dec must be provided when assumed_shape is not None."
-                )
-                if walk(explicit_dec, F23.Explicit_Shape_Spec):
-                    shape = []
-                    for dim in walk(explicit_dec, F23.Explicit_Shape_Spec):
-                        shape.append(dim.tostr())
-                    dimensions = ", ".join([name for name in shape])
-                else:
-                    raise ValueError("array shape is not present!")
+                if explicit_dec is not None:
+                    if walk(explicit_dec, F23.Explicit_Shape_Spec):
+                        shape = []
+                        for dim in walk(explicit_dec, F23.Explicit_Shape_Spec):
+                            shape.append(dim.tostr())
+                        dimensions = ", ".join([name for name in shape])
+                    else:
+                        raise ValueError("array shape is not present!")
 
             if walk(implicit_dec, F23.Intent_Attr_Spec):
                 intent_attr = walk(implicit_dec, F23.Intent_Attr_Spec)[0].tostr()
-                new_decl = f"{type_and_attributes}, DIMENSION({dimensions}), {intent_attr} :: {array_name}"
+                if dimensions is not None:
+                    new_decl = f"{type_and_attributes}, DIMENSION({dimensions}), {intent_attr} :: {array_name}"
+                else:
+                    new_decl = f"{type_and_attributes}, {intent_attr} :: {array_name}"
             else:
-                new_decl = (
-                    f"{type_and_attributes}, DIMENSION({dimensions}) :: {array_name}"
-                )
+                if dimensions is not None:
+                    new_decl = f"{type_and_attributes}, DIMENSION({dimensions}) :: {array_name}"
+                else:
+                    new_decl = f"{type_and_attributes} :: {array_name}"
 
             self.logger.info(f"Mapped declaration: {new_decl}")
             parsed_decl = F23.Type_Declaration_Stmt(new_decl)
