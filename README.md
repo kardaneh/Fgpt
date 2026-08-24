@@ -13,7 +13,12 @@
 **FGPT** is a source-to-source transpiler that converts production scientific
 Fortran code into executable NumPy-based Python, and optionally into
 JAX/Equinox-compatible modules for GPU-accelerated and differentiable
-computation. The current state of the project is a proof of concept, which has been tested on large modules of the IPSL land surface model.
+computation. In addition, FGPT provides optional Fortran-level optimizations,
+including **OpenACC GPU porting** for accelerated execution on GPUs and
+**Tapenade integration** for automatic differentiation (AD) directly at the
+Fortran level, generating tangent-linear and adjoint derivative code.
+
+The current state of the project is a proof of concept, which has been tested on large modules of the IPSL land surface model.
 The project has received support from the AI4PEX project.
 
 ---
@@ -40,11 +45,24 @@ three stages:
 1. **Isolation** : A target Fortran subroutine is extracted from its
    module, its cross-module dependencies are resolved, and a standalone
    compilable unit is produced and validated.
-2. **Transpilation** : The isolated Fortran AST is translated
+2. **Fortran Optimizations (optional)** : After isolation, the corrected
+   Fortran AST can be optionally processed through two parallel paths:
+
+   - **OpenACC GPU Porting** : OpenACC directives are integerated and
+     checked, producing GPU-ready Fortran code that can be compiled for
+     accelerated execution on NVIDIA/AMD GPUs.
+
+   - **Tapenade AD Integration** : The isolated Fortran code is prepared
+     for automatic differentiation using Tapenade. The `TapenadePass`
+     class post-processes the generated code to clean external statements,
+     resolve 'isize' dimensions, and map declarations to correct shapes,
+     producing tangent-linear (forward mode) and adjoint (reverse mode)
+     derivative code ready for compilation with the Tapenade runtime.
+3. **Transpilation** : The isolated Fortran AST is translated
    statement-by-statement and expression-by-expression into a structurally
    equivalent NumPy-based Python class, preserving the original numerical
    semantics.
-3. **JAX conversion** : The generated Python class is rewritten into a
+4. **JAX conversion** : The generated Python class is rewritten into a
    JAX/Equinox module: loops become `lax.scan` or `vmap`, conditionals
    become `lax.cond` or `jnp.where`, and in-place array updates become
    `.at[].set()`, enabling XLA compilation and automatic differentiation.
@@ -82,7 +100,8 @@ and enabling precise, auditable transformations at every stage.
    │       │   │
    │       │   ├── passes/
    |       |   |   ├── __init__.py
-   │       │   │   └── modifier.py        # Fortran AST transformation passes
+   │       │   │   └── modifier.py        # Fortran AST transformation passes for OpenACC GPU porting
+   │       │   │   └── tapenade.py        # Fortran AST transformation passes for tapenade AD
    │       │   │
    │       │   ├── lowering/
    |       |   |   ├── __init__.py
@@ -165,8 +184,32 @@ and enabling precise, auditable transformations at every stage.
 │       ├── Navigator  ─┐                 │
 │       └── Extractor ◄─┘                 │
 └────────────────────┬────────────────────┘
-                     │ corrected Fortran AST
+                     │
                      ▼
+        ┌──────────────────────────┐
+        │   corrected Fortran AST  │
+        └──────────────────────────┘
+           │                     │
+           ▼                     ▼
+┌─────────────────────┐  ┌─────────────────────────┐
+│  OpenACC GPU Port   │  │  Tapenade AD Integration│
+│  (--openacc True)   │  │  (--tapenade True)      │
+│                     │  │                         │
+│  ├── OpenACC        │  │  ├── Tangent code       │
+│                     │  │                         │
+│                     │  │  ├── Adjoint code.      │
+│  ├── GPU Fortran    │  │                         │
+│                     │  │  ├── Clean statements   │
+│                     │  │                         │
+│  └── Accelerate     │  │  ├── Resolve 'isize'    │
+│      computations   │  │                         │
+│                     │  │  └── Map declarations   │
+│                     │  │                         │
+└─────────────────────┘  └─────────────────────────┘
+           │                     │
+           └──────────┬──────────┘
+                      │
+                      ▼
 ┌─────────────────────────────────────────┐
 │  Stage 2 — Transpilation                │
 │  F2NP → Transformer                     │
@@ -256,7 +299,7 @@ isolator.run(
 
 The CLI exposes two subcommands corresponding to the two stages of the pipeline.
 
-**Stage 1 - 3 — Isolation, transpilation and JAX conversion**
+**Stage 1 - 3 — Isolation, porting, and transpilation and JAX conversion**
 
 ```bash
 fgpt isolate \
@@ -284,7 +327,37 @@ The key flags control which transformation path is taken:
 | `--tapenade` | `False` | Prepare output for Tapenade automatic differentiation |
 | `--py2jx` | `False` | Prepare output for JAX transformation and optimization |
 
-These three flags are mutually independent, except that `py2jx` requires `f2py` to be enabled. For example, `--f2py True --openacc True` produces both a Python translation and an OpenACC-annotated Fortran output.
+
+These flags are mutually independent, except that `py2jx` requires `f2py` to be enabled. For example, `--f2py True --openacc True` produces both a Python translation and an OpenACC-annotated Fortran output. `--f2py True --tapenade True` produces both a Python translation and Tapenade-differentiated Fortran code (tangent and adjoint versions).
+
+**Tapenade Post-Processing Features:**
+
+- **Module-level array extraction**: Extracts array declarations from the module specification part
+- **Subroutine-level processing**: Processes each subroutine individually to avoid variable name conflicts
+- **Array shape inference**: Determines array shapes from RHS expressions and reduction operations
+- **'isize' dimension replacement**: Replaces Tapenade-generated 'isize' dimensions with actual array bounds
+- **ALLOCATABLE array handling**: Inherits shapes from base arrays for derived arrays
+- **Reduction chain tracking**: Handles nested reductions (SUM, MINLOC, MAXLOC, etc.)
+- **CALL statement processing**: Replaces 'isize' arguments with actual dimension sizes
+- **Clean external statements**: Removes unnecessary USE and EXTERNAL statements
+
+**Requirements:**
+
+1. Tapenade installed and available in PATH
+2. C compiler configured for Tapenade runtime
+
+**Using Tapenade with FGPT:**
+
+```bash
+fgpt isolate \
+    --rest_of_path modipsl/modeles/ORCHIDEE/src_sechiba/ \
+    --target_module hydrol \
+    --work /scratch/user/runs \
+    --parent_subroutine hydrol_main \
+    --target_subroutines hydrol_soil hydrol_alma \
+    --tapenade True \
+    --mode jax
+```
 
 **Stage 3 — JAX conversion:**
 
