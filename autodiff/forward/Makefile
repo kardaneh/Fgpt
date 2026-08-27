@@ -101,7 +101,7 @@ endif
 # Clean
 # -----------------------------
 clean:
-	rm -rf $(OBJ_DIR) $(EXECUTABLE) $(MOD_DIR)
+	rm -rf $(OBJ_DIR) $(EXECUTABLE) $(MOD_DIR) *.png *.txt
 	@echo "Cleaned build artifacts."
 
 # -----------------------------
