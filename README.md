@@ -144,10 +144,12 @@ and enabling precise, auditable transformations at every stage.
    │   ├── test_processor.py
    │   ├── test_shaper.py
    │   ├── test_utils.py
+   │   ├── test_tapenade.py
    │   └── test_transformer.py
    |
    ├── notebooks/                         # Example notebooks, tutorials, and development prototypes
    │   ├── autodiff_principles.ipynb      # Introduction to JVP and VJP concepts
+   │   ├── isolator.ipynb                 # FGPT interactive exploration
    │   ├── prototype.ipynb                # Experimental notebook with autodifferenciation
    │   ├── fortran_to_numpy.ipynb         # F2NP translation examples
    │   ├── jax_converter.ipynb            # JAX conversion pipeline examples
@@ -160,9 +162,7 @@ and enabling precise, auditable transformations at every stage.
    │   └── ci.yaml
    |
    ├── setup                     # Setup file for transformation
-   ├── arch-nvhpc_HAL.env
-   ├── arch-nvhpc_LEONARDO.env
-   ├── arch-nvhpc_spirit.env
+   ├── arch-nvhpc.env
    ├── Makefile                  # Run isolated procedures
    ├── template.yaml             # Code generation templates(user-facing, can be customised freely)
    ├── pyproject.toml            # Package configuration

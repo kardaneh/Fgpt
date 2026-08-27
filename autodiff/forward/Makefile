@@ -9,59 +9,32 @@
 # -----------------------------
 # Environment
 # -----------------------------
-WORK = /scratchu/kardaneh/tmp
 FC_NVIDIA = mpif90
 CC        = mpicc
 
 # -----------------------------
-# Libraries
-# -----------------------------
-NETCDF_INCDIR = -I$(NETCDF_C_ROOT)/include -I$(NETCDF_FORTRAN_ROOT)/include
-NETCDF_LIBDIR = -L$(NETCDF_C_ROOT)/lib -lnetcdf -L$(NETCDF_FORTRAN_ROOT)/lib -lnetcdff
-
-IOIPSL_INCDIR = -I$(WORK)/modipsl_truck_opt/modeles/IOIPSL/inc
-IOIPSL_LIBDIR = -L$(WORK)/modipsl_truck_opt/modeles/IOIPSL/lib -lioipsl
-
-XIOS_INCDIR = -I$(WORK)/modipsl_truck_opt/modeles/XIOS/inc
-XIOS_LIBDIR = -L$(WORK)/modipsl_truck_opt/modeles/XIOS/lib -lxios -lstdc++
-
-ORCHIDEE_INCDIR = -I$(WORK)/modipsl_truck_opt/modeles/ORCHIDEE/inc
-ORCHIDEE_LIBDIR = -L$(WORK)/modipsl_truck_opt/modeles/ORCHIDEE/lib -lorchidee
-
-# -----------------------------
 # Flags
 # -----------------------------
-FFLAGS = $(IOIPSL_INCDIR) $(XIOS_INCDIR) $(ORCHIDEE_INCDIR) $(NETCDF_INCDIR)
-LDFLAGS = $(ORCHIDEE_LIBDIR) $(IOIPSL_LIBDIR) $(XIOS_LIBDIR) $(NETCDF_LIBDIR)
-
-# Fortran flags
+# Fortran flags (CPU only)
 FFLAGS_COMMON = -Wall -g -O0 -Kieee -Ktrap=fp -Mbounds -traceback
 FFLAGS_CPU    = $(FFLAGS_COMMON) -r8 -i4
-FFLAGS_GPU    = $(FFLAGS_COMMON) -r8 -i4 -acc -gpu=cc80
+FFLAGS        = $(FFLAGS_CPU)
 
-# C flags
+# C flags (CPU only)
 CFLAGS_COMMON = -Wall -g -O0 -Kieee -Ktrap=fp -traceback -DUNDERSCORE
 CFLAGS_CPU    = $(CFLAGS_COMMON)
-CFLAGS_GPU    = $(CFLAGS_COMMON) -acc -gpu=cc80
-
-ifeq ($(strip $(MODE)),GPU)
-	FFLAGS_NVIDIA = $(FFLAGS_GPU)
-	CFLAGS_NVIDIA = $(CFLAGS_GPU)
-else
-	FFLAGS_NVIDIA = $(FFLAGS_CPU)
-	CFLAGS_NVIDIA = $(CFLAGS_CPU)
-endif
+CFLAGS        = $(CFLAGS_CPU)
 
 # -----------------------------
 # Directories and sources
 # -----------------------------
 OBJ_DIR = obj
 MOD_DIR = mod
-SRC_DIR = $(SUBDIR_PATH)
+SRC_DIR = .
 
 # Fortran sources
 MODULE_SRC = $(wildcard $(SRC_DIR)/module_*.f90)
-MAIN_SRC   = $(wildcard $(SRC_DIR)/main_*.f90)
+MAIN_SRC   = $(wildcard $(SRC_DIR)/calibrate.f90)
 OTHER_SRC  = $(filter-out $(MODULE_SRC) $(MAIN_SRC), $(wildcard $(SRC_DIR)/*.f90))
 
 MODULE_OBJ = $(patsubst $(SRC_DIR)/%,$(OBJ_DIR)/%,$(MODULE_SRC:.f90=.o))
@@ -91,24 +64,23 @@ endif
 ALL_OBJ = $(MODULE_OBJ) $(OTHER_OBJ) $(MAIN_OBJ) $(TAPENADE_OBJ)
 
 # -----------------------------
-# Executable and report
+# Executable
 # -----------------------------
-EXECUTABLE = $(notdir $(CURDIR))
-COMPILER_REPORT = $(SRC_DIR)/$(EXECUTABLE).txt
+EXECUTABLE = calibrate
 
 # -----------------------------
 # Targets
 # -----------------------------
-.PHONY: all clean
+.PHONY: all clean run
 
-all: clean $(EXECUTABLE)
+all: $(EXECUTABLE)
 
 $(EXECUTABLE): $(ALL_OBJ)
 	@echo "Linking $(EXECUTABLE) ..."
 ifdef NEEDS_TAPENADE
 	@echo "Including Tapenade object files for automatic differentiation."
 endif
-	$(FC_NVIDIA) $(FFLAGS_NVIDIA) $^ $(LDFLAGS) -o $@ >> $(COMPILER_REPORT) 2>&1
+	$(FC_NVIDIA) $(FFLAGS) $^ -o $@
 	@echo "Build complete: $(EXECUTABLE)"
 
 # -----------------------------
@@ -116,18 +88,39 @@ endif
 # -----------------------------
 $(OBJ_DIR)/%.o: $(SRC_DIR)/%.f90
 	@mkdir -p $(OBJ_DIR) $(MOD_DIR)
-	$(FC_NVIDIA) $(FFLAGS_NVIDIA) $(FFLAGS) -c $< -o $@ -module $(MOD_DIR) >> $(COMPILER_REPORT) 2>&1
+	$(FC_NVIDIA) $(FFLAGS) -c $< -o $@ -module $(MOD_DIR)
 
 # Tapenade object - build if needed
 ifdef NEEDS_TAPENADE
 $(OBJ_DIR)/adStack.o: $(TAPENADE_SRC)
 	@mkdir -p $(OBJ_DIR)
-	$(CC) $(CFLAGS_NVIDIA) -fopenmp -c $< -o $@ >> $(COMPILER_REPORT) 2>&1
+	$(CC) $(CFLAGS) -fopenmp -c $< -o $@
 endif
 
 # -----------------------------
 # Clean
 # -----------------------------
 clean:
-	rm -rf $(OBJ_DIR) $(EXECUTABLE) $(MOD_DIR) $(COMPILER_REPORT)
+	rm -rf $(OBJ_DIR) $(EXECUTABLE) $(MOD_DIR)
 	@echo "Cleaned build artifacts."
+
+# -----------------------------
+# Run
+# -----------------------------
+run: $(EXECUTABLE)
+	./$(EXECUTABLE)
+
+# -----------------------------
+# Run and visualize
+# -----------------------------
+viz: $(EXECUTABLE)
+	./$(EXECUTABLE)
+	@echo "Generating visualization plots..."
+	python3 plots.py || python plots.py
+	@echo "Visualization complete!"
+
+# -----------------------------
+# Just visualize (if data already exists)
+# -----------------------------
+plot:
+	python3 plot_results.py || python plot_results.py
