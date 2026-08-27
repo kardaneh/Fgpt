@@ -66,6 +66,17 @@ def read_true_parameters(filename="true_parameters.txt"):
     return data
 
 
+def read_flux_comparison(filename="fluxes_comparison.txt"):
+    data = np.loadtxt(filename, skiprows=3)
+    return {
+        "day": data[:, 0].astype(int),
+        "fup1": data[:, 1],
+        "fup1_obs": data[:, 2],
+        "fup2": data[:, 3],
+        "fup2_obs": data[:, 4],
+    }
+
+
 def plot_optimization_history(history, true_w=0.2, true_d=0.8):
     fig = Figure(figsize=(12, 14), dpi=300)
     canvas = FigureCanvasAgg(fig)
@@ -136,13 +147,51 @@ def plot_optimization_history(history, true_w=0.2, true_d=0.8):
     ax6 = fig.add_subplot(gs[2, 1])
     linestyles = mpltex.linestyle_generator()
     mask = history["rho"] >= 0
-    ax6.plot(history["iter"][mask], history["rho"][mask], **next(linestyles))
+    ax6.plot(
+        history["iter"][mask], history["rho"][mask], label="$\\rho$", **next(linestyles)
+    )
     ax6.axhline(y=1, **next(linestyles))
+    ax6.axhline(
+        y=0.75, label="$\\rho > 0.75$ (decrease $\\lambda$)", **next(linestyles)
+    )
+    ax6.axhline(
+        y=0.25, label="$\\rho < 0.25$ (increase $\\lambda$)", **next(linestyles)
+    )
     ax6.set_xlabel("Iteration")
     ax6.set_ylabel("$\\rho$")
     ax6.set_title("Gain Ratio ($\\rho$)")
+    ax6.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0))
     ax6.grid(True, alpha=0.3)
     canvas.print_figure("optimization_history.png", dpi=300, bbox_inches="tight")
+    return fig
+
+
+def plot_flux_comparison(fluxes):
+    fig = Figure(figsize=(14, 6), dpi=300)
+    canvas = FigureCanvasAgg(fig)
+
+    gs = gridspec.GridSpec(1, 2, figure=fig, hspace=0.3, wspace=0.3)
+    linestyles = mpltex.linestyle_generator(markers=[])
+
+    ax1 = fig.add_subplot(gs[0, 0])
+    ax1.plot(fluxes["day"], fluxes["fup1_obs"], label="Observed", **next(linestyles))
+    ax1.plot(fluxes["day"], fluxes["fup1"], label="Recovered", **next(linestyles))
+    ax1.set_xlabel("Day")
+    ax1.set_ylabel("Upward Flux")
+    ax1.set_title("Site 1: Upward Flux Comparison")
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
+
+    ax2 = fig.add_subplot(gs[0, 1])
+    linestyles = mpltex.linestyle_generator(markers=[])
+    ax2.plot(fluxes["day"], fluxes["fup2_obs"], label="Observed", **next(linestyles))
+    ax2.plot(fluxes["day"], fluxes["fup2"], label="Recovered", **next(linestyles))
+    ax2.set_xlabel("Day")
+    ax2.set_ylabel("Upward Flux")
+    ax2.set_title("Site 2: Upward Flux Comparison")
+    ax2.legend()
+    ax2.grid(True, alpha=0.3)
+    canvas.print_figure("flux_comparison.png", dpi=300, bbox_inches="tight")
     return fig
 
 
@@ -156,8 +205,8 @@ def log_summary(logger, history, true_w=0.2, true_d=0.8):
     logger.info("=" * 60)
     logger.info(f"Total iterations: {len(history['iter'])}")
     logger.info(f"Final cost: {final_cost:.6e}")
-    logger.info("Parameter Recovery:")
     logger.info("")
+    logger.info("Parameter Recovery:")
     logger.info(f"  w_true = {true_w:.6f}")
     logger.info(f"  w_recovered = {final_w:.6f}")
     logger.info(
@@ -183,18 +232,27 @@ def main():
         logger.show_header("Plot initialized")
 
         history = read_optimization_history("optimization_history.txt")
+
         true_params = read_true_parameters("true_parameters.txt")
         true_w = true_params.get("True_w", 0.25)
         true_d = true_params.get("True_d", 0.6)
 
         logger.info(f"True parameters from file: w={true_w:.6f}, d={true_d:.6f}")
-        logger.info("Generating optimization history plots...")
+        logger.info("")
 
+        logger.info("Generating optimization history plots...")
         plot_optimization_history(history, true_w, true_d)
         log_summary(logger, history, true_w, true_d)
 
+        logger.info("Generating flux comparison plots...")
+        fluxes = read_flux_comparison("fluxes_comparison.txt")
+        plot_flux_comparison(fluxes)
+        logger.info("  - flux_comparison.png")
+
+        logger.info("")
         logger.info("Plots saved as:")
         logger.info("  - optimization_history.png")
+        logger.info("  - flux_comparison.png")
 
     except FileNotFoundError as e:
         logger.info(

@@ -123,4 +123,4 @@ viz: $(EXECUTABLE)
 # Just visualize (if data already exists)
 # -----------------------------
 plot:
-	python3 plot_results.py || python plot_results.py
+	python3 plots.py || python plots.py
