@@ -6,6 +6,8 @@
 # To view a copy of this license, visit
 # http://creativecommons.org/licenses/by-nc-sa/4.0/
 
+import argparse
+
 import matplotlib as mpl
 import matplotlib.gridspec as gridspec
 import mpltex
@@ -69,11 +71,10 @@ def read_true_parameters(filename="true_parameters.txt"):
 def read_flux_comparison(filename="fluxes_comparison.txt"):
     data = np.loadtxt(filename, skiprows=3)
     return {
-        "day": data[:, 0].astype(int),
-        "fup1": data[:, 1],
-        "fup1_obs": data[:, 2],
-        "fup2": data[:, 3],
-        "fup2_obs": data[:, 4],
+        "site": data[:, 0].astype(int),
+        "day": data[:, 1].astype(int),
+        "fup_model": data[:, 2],
+        "fup_obs": data[:, 3],
     }
 
 
@@ -166,33 +167,40 @@ def plot_optimization_history(history, true_w=0.2, true_d=0.8):
     return fig
 
 
-def plot_flux_comparison(fluxes):
-    fig = Figure(figsize=(14, 6), dpi=300)
-    canvas = FigureCanvasAgg(fig)
+def plot_flux_comparison(fluxes, n_sites=8, logger=None):
+    try:
+        n_cols = 4
+        n_rows = (n_sites + n_cols - 1) // n_cols
+        fig = Figure(figsize=(n_cols * 5, n_rows * 4), dpi=300)
+        canvas = FigureCanvasAgg(fig)
+        gs = gridspec.GridSpec(n_rows, n_cols, figure=fig, hspace=0.4, wspace=0.3)
+        unique_sites = np.unique(fluxes["site"])
 
-    gs = gridspec.GridSpec(1, 2, figure=fig, hspace=0.3, wspace=0.3)
-    linestyles = mpltex.linestyle_generator(markers=[])
+        for idx, site in enumerate(unique_sites):
+            linestyles = mpltex.linestyle_generator(markers=[])
+            row = idx // n_cols
+            col = idx % n_cols
+            ax = fig.add_subplot(gs[row, col])
 
-    ax1 = fig.add_subplot(gs[0, 0])
-    ax1.plot(fluxes["day"], fluxes["fup1_obs"], label="Observed", **next(linestyles))
-    ax1.plot(fluxes["day"], fluxes["fup1"], label="Recovered", **next(linestyles))
-    ax1.set_xlabel("Day")
-    ax1.set_ylabel("Upward Flux")
-    ax1.set_title("Site 1: Upward Flux Comparison")
-    ax1.legend()
-    ax1.grid(True, alpha=0.3)
+            mask = fluxes["site"] == site
+            day = fluxes["day"][mask]
+            fup_model = fluxes["fup_model"][mask]
+            fup_obs = fluxes["fup_obs"][mask]
 
-    ax2 = fig.add_subplot(gs[0, 1])
-    linestyles = mpltex.linestyle_generator(markers=[])
-    ax2.plot(fluxes["day"], fluxes["fup2_obs"], label="Observed", **next(linestyles))
-    ax2.plot(fluxes["day"], fluxes["fup2"], label="Recovered", **next(linestyles))
-    ax2.set_xlabel("Day")
-    ax2.set_ylabel("Upward Flux")
-    ax2.set_title("Site 2: Upward Flux Comparison")
-    ax2.legend()
-    ax2.grid(True, alpha=0.3)
-    canvas.print_figure("flux_comparison.png", dpi=300, bbox_inches="tight")
-    return fig
+            ax.plot(day, fup_obs, label="Observed", **next(linestyles))
+            ax.plot(day, fup_model, label="Recovered", **next(linestyles))
+            ax.set_xlabel("Day")
+            ax.set_ylabel("Upward Flux")
+            ax.set_title(f"Site {site}")
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+
+        canvas.print_figure("flux_comparison.png", dpi=300, bbox_inches="tight")
+        return fig
+    except Exception as e:
+        if logger:
+            logger.error(f"Fatal error in plot_flux_comparison: {e}")
+            raise
 
 
 def log_summary(logger, history, true_w=0.2, true_d=0.8):
@@ -227,6 +235,10 @@ def log_summary(logger, history, true_w=0.2, true_d=0.8):
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Plot optimization results")
+    parser.add_argument("--n_sites", type=int, default=8, help="Number of sites")
+    args = parser.parse_args()
+
     try:
         logger = Logger()
         logger.show_header("Plot initialized")
@@ -246,7 +258,7 @@ def main():
 
         logger.info("Generating flux comparison plots...")
         fluxes = read_flux_comparison("fluxes_comparison.txt")
-        plot_flux_comparison(fluxes)
+        plot_flux_comparison(fluxes, n_sites=args.n_sites, logger=logger)
         logger.info("  - flux_comparison.png")
 
         logger.info("")

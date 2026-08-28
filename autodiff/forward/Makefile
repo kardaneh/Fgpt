@@ -7,6 +7,12 @@
 # http://creativecommons.org/licenses/by-nc-sa/4.0/
 
 # -----------------------------
+# Configurable parameters
+# -----------------------------
+N_SITES ?= 8
+export N_SITES
+
+# -----------------------------
 # Environment
 # -----------------------------
 FC_NVIDIA = mpif90
@@ -16,8 +22,8 @@ CC        = mpicc
 # Flags
 # -----------------------------
 # Fortran flags (CPU only)
-FFLAGS_COMMON = -Wall -g -O0 -Kieee -Ktrap=fp -Mbounds -traceback
-FFLAGS_CPU    = $(FFLAGS_COMMON) -r8 -i4
+FFLAGS_COMMON = -Wall -g -O0 -Kieee -Ktrap=fp -Mbounds -traceback -Mpreprocess
+FFLAGS_CPU    = $(FFLAGS_COMMON) -r8 -i4 -DN_SITES=$(N_SITES)
 FFLAGS        = $(FFLAGS_CPU)
 
 # C flags (CPU only)
@@ -116,11 +122,11 @@ run: $(EXECUTABLE)
 viz: $(EXECUTABLE)
 	./$(EXECUTABLE)
 	@echo "Generating visualization plots..."
-	python3 plots.py || python plots.py
+	python3 plots.py --n_sites $(N_SITES) || python plots.py --n_sites $(N_SITES)
 	@echo "Visualization complete!"
 
 # -----------------------------
 # Just visualize (if data already exists)
 # -----------------------------
 plot:
-	python3 plots.py || python plots.py
+	python3 plots.py --n_sites $(N_SITES) || python plots.py --n_sites $(N_SITES)

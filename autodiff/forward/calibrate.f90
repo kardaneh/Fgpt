@@ -6,7 +6,7 @@
 ! To view a copy of this license, visit
 ! http://creativecommons.org/licenses/by-nc-sa/4.0/
 
-PROGRAM calibrate_w_d_timeseries
+PROGRAM calibrate_w_d_multisite
 
   USE module_global_multilevel_matrixmodule_global_multilevel_matrix_tgt
   IMPLICIT NONE
@@ -16,23 +16,31 @@ PROGRAM calibrate_w_d_timeseries
 
   INTEGER, PARAMETER :: nl = 10
   INTEGER, PARAMETER :: n_days = 365
+  #ifndef N_SITES
+  #define N_SITES 8
+  #endif
+  INTEGER, PARAMETER :: n_sites = N_SITES
   REAL(KIND=r_std), PARAMETER :: pi = 3.14159265358979_r_std
 
-  ! Site-level fixed properties (canopy structure, surface reflectance)
-  REAL(KIND=r_std) :: rs1, rs2
+  ! Site-level fixed properties: (nlevels_tot, n_sites) and (n_sites)
+  REAL(KIND=r_std), ALLOCATABLE :: t(:,:)          ! (nlevels_tot, n_sites)
+  REAL(KIND=r_std), ALLOCATABLE :: rs(:)           ! (n_sites)
+  REAL(KIND=r_std), ALLOCATABLE :: td_zero(:)
   REAL(KIND=r_std) :: mud0, rsd0
-  REAL(KIND=r_std), ALLOCATABLE :: t1(:), t2(:), td_zero(:)
 
-  ! Daily-varying solar geometry, per site
-  REAL(KIND=r_std), ALLOCATABLE :: mu1(:), mu2(:)
+  ! Daily-varying solar geometry, per site: (n_days, n_sites)
+  REAL(KIND=r_std), ALLOCATABLE :: mu(:,:)
 
-  ! Parameters being calibrated (shared across all days/sites)
+  ! Optional per-site seasonal amplitude/offset (lets sites differ in latitude)
+  REAL(KIND=r_std), ALLOCATABLE :: mu_offset(:), mu_amp(:)
+
+  ! Parameters being calibrated (shared across all sites/days)
   REAL(KIND=r_std) :: w, d, w_true, d_true
 
-  ! Observations: one fup value per day, per site
-  REAL(KIND=r_std), ALLOCATABLE :: fup_obs_1(:), fup_obs_2(:)
+  ! Observations: (n_days, n_sites)
+  REAL(KIND=r_std), ALLOCATABLE :: fup_obs(:,:)
 
-  ! Per-call working arrays (reused each day)
+  ! Per-call working arrays (reused each day/site)
   REAL(KIND=r_std), ALLOCATABLE :: fup(:), fdn(:), fab(:)
   REAL(KIND=r_std), ALLOCATABLE :: fup_w(:), fdn_w(:), fab_w(:)
   REAL(KIND=r_std), ALLOCATABLE :: fup_d(:), fdn_d(:), fab_d(:)
@@ -68,34 +76,22 @@ PROGRAM calibrate_w_d_timeseries
 
   LOGICAL :: accepted, converged
 
-  INTEGER :: j   ! day index
+  INTEGER :: j, isite   ! day index, site index
 
-  !
-  ! File unit numbers and output files
-  !
+  ! Output files
   INTEGER, PARAMETER :: unit_history = 10
   INTEGER, PARAMETER :: unit_true = 11
   INTEGER, PARAMETER :: unit_fluxes = 12
-
   CHARACTER(LEN=100) :: history_file = 'optimization_history.txt'
   CHARACTER(LEN=100) :: true_params_file = 'true_parameters.txt'
   CHARACTER(LEN=100) :: fluxes_file = 'fluxes_comparison.txt'
 
-  ! For saving history
   INTEGER :: n_history
   INTEGER, PARAMETER :: max_history = 1000
-  REAL(KIND=r_std) :: fup1_final
-  REAL(KIND=r_std) :: fup2_final
-  REAL(KIND=r_std), DIMENSION(:), ALLOCATABLE :: history_cost
-  REAL(KIND=r_std), DIMENSION(:), ALLOCATABLE :: history_w
-  REAL(KIND=r_std), DIMENSION(:), ALLOCATABLE :: history_d
-  REAL(KIND=r_std), DIMENSION(:), ALLOCATABLE :: history_gw
-  REAL(KIND=r_std), DIMENSION(:), ALLOCATABLE :: history_gd
-  REAL(KIND=r_std), DIMENSION(:), ALLOCATABLE :: history_lambda
-  REAL(KIND=r_std), DIMENSION(:), ALLOCATABLE :: history_rho
+  REAL(KIND=r_std), DIMENSION(:), ALLOCATABLE :: history_cost, history_w, history_d
+  REAL(KIND=r_std), DIMENSION(:), ALLOCATABLE :: history_gw, history_gd
+  REAL(KIND=r_std), DIMENSION(:), ALLOCATABLE :: history_lambda, history_rho
 
-  !
-  ! Random seed
   !
   CALL RANDOM_SEED(SIZE=seed_size)
   ALLOCATE(seed(seed_size))
@@ -108,69 +104,67 @@ PROGRAM calibrate_w_d_timeseries
   nlevels_tot = nl + 1
 
   !
-  ! Allocate
+  ! Allocate — everything site-indexed now
   !
-  ALLOCATE(t1(nlevels_tot), t2(nlevels_tot), td_zero(nlevels_tot))
-  ALLOCATE(mu1(n_days), mu2(n_days))
-  ALLOCATE(fup_obs_1(n_days), fup_obs_2(n_days))
+  ALLOCATE(t(nlevels_tot, n_sites), rs(n_sites), td_zero(nlevels_tot))
+  ALLOCATE(mu(n_days, n_sites))
+  ALLOCATE(mu_offset(n_sites), mu_amp(n_sites))
+  ALLOCATE(fup_obs(n_days, n_sites))
 
   ALLOCATE(fup(nlevels_tot), fdn(nlevels_tot), fab(nlevels_tot))
   ALLOCATE(fup_w(nlevels_tot), fdn_w(nlevels_tot), fab_w(nlevels_tot))
   ALLOCATE(fup_d(nlevels_tot), fdn_d(nlevels_tot), fab_d(nlevels_tot))
   ALLOCATE(fup_trial(nlevels_tot), fdn_trial(nlevels_tot), fab_trial(nlevels_tot))
 
-  ALLOCATE(history_cost(max_history))
-  ALLOCATE(history_w(max_history))
-  ALLOCATE(history_d(max_history))
-  ALLOCATE(history_gw(max_history))
-  ALLOCATE(history_gd(max_history))
-  ALLOCATE(history_lambda(max_history))
-  ALLOCATE(history_rho(max_history))
+  ALLOCATE(history_cost(max_history), history_w(max_history), history_d(max_history))
+  ALLOCATE(history_gw(max_history), history_gd(max_history))
+  ALLOCATE(history_lambda(max_history), history_rho(max_history))
 
-n_history = 0
-
+  n_history = 0
   td_zero = 0.0_r_std
   mud0    = 0.0_r_std
   rsd0    = 0.0_r_std
 
   !
-  ! Site properties (fixed for the whole year: canopy structure + soil)
+  ! Per-site fixed properties: optical depth profile + surface reflectance
+  ! Each site gets its own random canopy structure and soil reflectance.
   !
-  CALL RANDOM_NUMBER(t1)
-  t1 = 0.1_r_std + (8.0_r_std - 0.1_r_std) * t1
-  CALL RANDOM_NUMBER(rs1)
+  DO isite = 1, n_sites
+     CALL RANDOM_NUMBER(t(:,isite))
+     ! vary the depth-scale range a bit per site so they're not identical
+     t(:,isite) = 0.1_r_std + (2.0_r_std + REAL(isite,r_std) - 0.1_r_std) * t(:,isite)
+     CALL RANDOM_NUMBER(rs(isite))
 
-  CALL RANDOM_NUMBER(t2)
-  t2 = 0.1_r_std + (3.0_r_std - 0.1_r_std) * t2
-  CALL RANDOM_NUMBER(rs2)
-
-  !
-  ! Daily solar geometry: mu = cos(solar zenith angle at noon)
-  ! Simple seasonal model, mu_min at winter solstice (day 355),
-  ! mu_max at summer solstice (day 172). Adjust amplitude/offset
-  ! to whatever is realistic for your site's latitude.
-  !
-  DO j = 1, n_days
-     mu1(j) = 0.55_r_std + 0.35_r_std * COS(2.0_r_std*pi*(REAL(j,r_std) - 172.0_r_std)/365.0_r_std)
-     mu2(j) = 0.50_r_std + 0.30_r_std * COS(2.0_r_std*pi*(REAL(j,r_std) - 172.0_r_std)/365.0_r_std)
+     ! per-site seasonal solar-geometry parameters (e.g. different latitudes)
+     CALL RANDOM_NUMBER(mu_offset(isite))
+     mu_offset(isite) = 0.45_r_std + 0.15_r_std * mu_offset(isite)   ! ~0.45-0.60
+     CALL RANDOM_NUMBER(mu_amp(isite))
+     mu_amp(isite) = 0.20_r_std + 0.20_r_std * mu_amp(isite)          ! ~0.20-0.40
   END DO
 
   !
-  ! True parameters (synthetic twin experiment)
+  ! Daily solar geometry per site: mu = cos(solar zenith angle at noon)
+  !
+  DO isite = 1, n_sites
+     DO j = 1, n_days
+        mu(j,isite) = mu_offset(isite) + mu_amp(isite) * &
+             COS(2.0_r_std*pi*(REAL(j,r_std) - 172.0_r_std)/365.0_r_std)
+     END DO
+  END DO
+
+  !
+  ! True parameters (synthetic twin experiment) — shared across all sites
   !
   CALL RANDOM_NUMBER(w_true)
   CALL RANDOM_NUMBER(d_true)
   d_true = 0.1_r_std + (3.0_r_std - 0.1_r_std) * d_true
 
   WRITE(*,'(A)') ''
-  WRITE(*,'(A)') '============================================================'
-  WRITE(*,'(A)') ' TWO-SITE, FULL-YEAR (365 noon obs) CALIBRATION'
-  WRITE(*,'(A)') '============================================================'
+  WRITE(*,'(A)') '-------------------------------------------------------------------'
+  WRITE(*,'(A,I0,A)') ' ', n_sites, '-SITE, FULL-YEAR (365 noon obs) CALIBRATION'
+  WRITE(*,'(A)') '-------------------------------------------------------------------'
   WRITE(*,'(A,F12.8,A,F12.8)') 'True parameters: w = ', w_true, ', d = ', d_true
 
-  !
-  ! Write true parameters to file
-  !
   OPEN(unit_true, FILE=true_params_file, STATUS='REPLACE', ACTION='WRITE')
   WRITE(unit_true, '(A,ES18.10)') 'True_w = ', w_true
   WRITE(unit_true, '(A,ES18.10)') 'True_d = ', d_true
@@ -178,17 +172,17 @@ n_history = 0
   WRITE(*,'(A)') 'True parameters written to: ' // TRIM(true_params_file)
 
   !
-  ! Generate synthetic observations: one fup(nlevels_tot) per day, per site
+  ! Generate synthetic observations: fup(nlevels_tot) per day, per site
   !
-  DO j = 1, n_days
-     CALL multilevel_matrix(nl, mu1(j), rs1, t1, w_true, d_true, fup, fdn, fab)
-     fup_obs_1(j) = fup(nlevels_tot)
-
-     CALL multilevel_matrix(nl, mu2(j), rs2, t2, w_true, d_true, fup, fdn, fab)
-     fup_obs_2(j) = fup(nlevels_tot)
+  DO isite = 1, n_sites
+     DO j = 1, n_days
+        CALL multilevel_matrix(nl, mu(j,isite), rs(isite), t(:,isite), &
+             w_true, d_true, fup, fdn, fab)
+        fup_obs(j,isite) = fup(nlevels_tot)
+     END DO
   END DO
 
-  WRITE(*,'(A,I0,A)') 'Generated ', 2*n_days, ' synthetic observations (2 sites x 365 days).'
+  WRITE(*,'(A,I0,A)') 'Generated ', n_sites*n_days, ' synthetic observations.'
 
   !
   ! Initial guess
@@ -205,9 +199,9 @@ n_history = 0
   converged  = .FALSE.
 
   WRITE(*,'(A)') ''
-  WRITE(*,'(A)') '============================================================'
-  WRITE(*,'(A)') ' LEVENBERG-MARQUARDT OPTIMIZATION (365-day time series)'
-  WRITE(*,'(A)') '============================================================'
+  WRITE(*,'(A)') '-------------------------------------------------------------------'
+  WRITE(*,'(A,I0,A)') ' LEVENBERG-MARQUARDT OPTIMIZATION (', n_sites, ' sites x 365 days)'
+  WRITE(*,'(A)') '-------------------------------------------------------------------'
   WRITE(*,'(A,F12.8,A,F12.8)') 'Initial guess: w = ', w, ', d = ', d
   WRITE(*,'(A)') ''
 
@@ -223,52 +217,30 @@ n_history = 0
      h_wd = 0.0_r_std
      h_dd = 0.0_r_std
 
-     ! --- SITE 1: accumulate over all 365 days ---
-     DO j = 1, n_days
+     ! --- accumulate over ALL sites and ALL days ---
+     DO isite = 1, n_sites
+        DO j = 1, n_days
 
-        CALL multilevel_matrix_d( &
-             nl, mu1(j), mud0, rs1, rsd0, t1, td_zero, &
-             w, 1.0_r_std, d, 0.0_r_std, &
-             fup, fup_w, fdn, fdn_w, fab, fab_w)
+           CALL multilevel_matrix_d( &
+                nl, mu(j,isite), mud0, rs(isite), rsd0, t(:,isite), td_zero, &
+                w, 1.0_r_std, d, 0.0_r_std, &
+                fup, fup_w, fdn, fdn_w, fab, fab_w)
 
-        CALL multilevel_matrix_d( &
-             nl, mu1(j), mud0, rs1, rsd0, t1, td_zero, &
-             w, 0.0_r_std, d, 1.0_r_std, &
-             fup, fup_d, fdn, fdn_d, fab, fab_d)
+           CALL multilevel_matrix_d( &
+                nl, mu(j,isite), mud0, rs(isite), rsd0, t(:,isite), td_zero, &
+                w, 0.0_r_std, d, 1.0_r_std, &
+                fup, fup_d, fdn, fdn_d, fab, fab_d)
 
-        r_val = fup(nlevels_tot) - fup_obs_1(j)
+           r_val = fup(nlevels_tot) - fup_obs(j,isite)
 
-        cost = cost + 0.5_r_std * r_val**2
-        gJ_w = gJ_w + r_val * fup_w(nlevels_tot)
-        gJ_d = gJ_d + r_val * fup_d(nlevels_tot)
-        h_ww = h_ww + fup_w(nlevels_tot)**2
-        h_wd = h_wd + fup_w(nlevels_tot) * fup_d(nlevels_tot)
-        h_dd = h_dd + fup_d(nlevels_tot)**2
+           cost = cost + 0.5_r_std * r_val**2
+           gJ_w = gJ_w + r_val * fup_w(nlevels_tot)
+           gJ_d = gJ_d + r_val * fup_d(nlevels_tot)
+           h_ww = h_ww + fup_w(nlevels_tot)**2
+           h_wd = h_wd + fup_w(nlevels_tot) * fup_d(nlevels_tot)
+           h_dd = h_dd + fup_d(nlevels_tot)**2
 
-     END DO
-
-     ! --- SITE 2: accumulate over all 365 days ---
-     DO j = 1, n_days
-
-        CALL multilevel_matrix_d( &
-             nl, mu2(j), mud0, rs2, rsd0, t2, td_zero, &
-             w, 1.0_r_std, d, 0.0_r_std, &
-             fup, fup_w, fdn, fdn_w, fab, fab_w)
-
-        CALL multilevel_matrix_d( &
-             nl, mu2(j), mud0, rs2, rsd0, t2, td_zero, &
-             w, 0.0_r_std, d, 1.0_r_std, &
-             fup, fup_d, fdn, fdn_d, fab, fab_d)
-
-        r_val = fup(nlevels_tot) - fup_obs_2(j)
-
-        cost = cost + 0.5_r_std * r_val**2
-        gJ_w = gJ_w + r_val * fup_w(nlevels_tot)
-        gJ_d = gJ_d + r_val * fup_d(nlevels_tot)
-        h_ww = h_ww + fup_w(nlevels_tot)**2
-        h_wd = h_wd + fup_w(nlevels_tot) * fup_d(nlevels_tot)
-        h_dd = h_dd + fup_d(nlevels_tot)**2
-
+        END DO
      END DO
 
      grad_norm = SQRT(gJ_w**2 + gJ_d**2)
@@ -279,7 +251,6 @@ n_history = 0
         jac_corr = 0.0_r_std
      END IF
 
-     ! --- Convergence checks ---
      IF (cost < cost_tolerance) THEN
         WRITE(*,'(A)') 'Converged: cost tolerance reached.'
         converged = .TRUE.
@@ -314,7 +285,7 @@ n_history = 0
         END IF
      END IF
 
-     ! --- Backtracking line search (uses plain forward model, no tangent needed) ---
+     ! --- Backtracking line search (plain forward model, all sites) ---
      alpha = 1.0_r_std
      accepted = .FALSE.
 
@@ -325,12 +296,12 @@ n_history = 0
 
         cost_new = 0.0_r_std
 
-        DO j = 1, n_days
-           CALL multilevel_matrix(nl, mu1(j), rs1, t1, w_trial, d_trial, fup_trial, fdn_trial, fab_trial)
-           cost_new = cost_new + 0.5_r_std * (fup_trial(nlevels_tot) - fup_obs_1(j))**2
-
-           CALL multilevel_matrix(nl, mu2(j), rs2, t2, w_trial, d_trial, fup_trial, fdn_trial, fab_trial)
-           cost_new = cost_new + 0.5_r_std * (fup_trial(nlevels_tot) - fup_obs_2(j))**2
+        DO isite = 1, n_sites
+           DO j = 1, n_days
+              CALL multilevel_matrix(nl, mu(j,isite), rs(isite), t(:,isite), &
+                   w_trial, d_trial, fup_trial, fdn_trial, fab_trial)
+              cost_new = cost_new + 0.5_r_std * (fup_trial(nlevels_tot) - fup_obs(j,isite))**2
+           END DO
         END DO
 
         IF (cost_new < cost) THEN
@@ -390,9 +361,6 @@ n_history = 0
         END IF
      END IF
 
-     !
-     ! Save history every iteration
-     !
      n_history = n_history + 1
      history_cost(n_history) = cost
      history_w(n_history) = w
@@ -401,9 +369,9 @@ n_history = 0
      history_gd(n_history) = gJ_d
      history_lambda(n_history) = lambda
      IF (accepted) THEN
-         history_rho(n_history) = rho
+        history_rho(n_history) = rho
      ELSE
-         history_rho(n_history) = -1.0_r_std
+        history_rho(n_history) = -1.0_r_std
      END IF
 
   END DO
@@ -412,9 +380,9 @@ n_history = 0
   ! Results
   !
   WRITE(*,'(A)') ''
-  WRITE(*,'(A)') '============================================================'
+  WRITE(*,'(A)') '-------------------------------------------------------------------'
   WRITE(*,'(A)') ' OPTIMIZATION COMPLETE'
-  WRITE(*,'(A)') '============================================================'
+  WRITE(*,'(A)') '-------------------------------------------------------------------'
   IF (converged) THEN
      WRITE(*,'(A)') 'Status: CONVERGED'
   ELSE
@@ -428,62 +396,40 @@ n_history = 0
   WRITE(*,'(A,ES14.6)') 'Absolute error d = ', ABS(d - d_true)
   WRITE(*,'(A,ES18.10)') 'Final cost = ', cost
 
-  ! Approximate parameter uncertainty from Gauss-Newton Hessian
   jac_det = h_ww*h_dd - h_wd**2
   IF (jac_det > 1.0e-30_r_std) THEN
      WRITE(*,'(A,F10.6)') 'Approx. std. error on w = ', SQRT(h_dd/jac_det)
      WRITE(*,'(A,F10.6)') 'Approx. std. error on d = ', SQRT(h_ww/jac_det)
   END IF
 
-  !
-  ! Write optimization history to file
-  !
   OPEN(unit_history, FILE=history_file, STATUS='REPLACE', ACTION='WRITE')
   WRITE(unit_history, '(A)') '# Optimization History'
   WRITE(unit_history, '(A)') '# Columns: iter cost w d gJ_w gJ_d lambda rho'
   DO iter = 1, n_history
-      WRITE(unit_history, '(I6,7(ES18.10))') &
-         iter, &
-         history_cost(iter), &
-         history_w(iter), &
-         history_d(iter), &
-         history_gw(iter), &
-         history_gd(iter), &
-         history_lambda(iter), &
-         history_rho(iter)
+     WRITE(unit_history, '(I6,7(ES18.10))') &
+        iter, history_cost(iter), history_w(iter), history_d(iter), &
+        history_gw(iter), history_gd(iter), history_lambda(iter), history_rho(iter)
   END DO
   CLOSE(unit_history)
   WRITE(*,'(A)') 'Optimization history written to: ' // TRIM(history_file)
 
-  !
-  ! Write flux comparison to file
-  !
+  ! Final flux comparison, all sites
   OPEN(unit_fluxes, FILE=fluxes_file, STATUS='REPLACE', ACTION='WRITE')
-  WRITE(unit_fluxes, '(A)') '# Flux Comparison (Timeseries)'
-  WRITE(unit_fluxes, '(A)') '# Columns: day fup1 fup1_obs fup2 fup2_obs'
-  WRITE(unit_fluxes, '(A)') '# =========================================='
-
-  DO j = 1, n_days
-      ! Recalculate final fluxes for site 1
-      CALL multilevel_matrix(nl, mu1(j), rs1, t1, w, d, fup, fdn, fab)
-      fup1_final = fup(nlevels_tot)
-
-      ! Recalculate final fluxes for site 2
-      CALL multilevel_matrix(nl, mu2(j), rs2, t2, w, d, fup, fdn, fab)
-      fup2_final = fup(nlevels_tot)
-
-      WRITE(unit_fluxes, '(I6,4(ES18.10))') &
-         j, &
-         fup1_final, fup_obs_1(j), &
-         fup2_final, fup_obs_2(j)
+  WRITE(unit_fluxes, '(A)') '# Flux Comparison (Timeseries, multi-site)'
+  WRITE(unit_fluxes, '(A)') '# Columns: site day fup_model fup_obs'
+  DO isite = 1, n_sites
+     DO j = 1, n_days
+        CALL multilevel_matrix(nl, mu(j,isite), rs(isite), t(:,isite), w, d, fup, fdn, fab)
+        WRITE(unit_fluxes, '(2I6,2(ES18.10))') isite, j, fup(nlevels_tot), fup_obs(j,isite)
+     END DO
   END DO
   CLOSE(unit_fluxes)
   WRITE(*,'(A)') 'Flux comparison written to: ' // TRIM(fluxes_file)
 
-  DEALLOCATE(t1, t2, td_zero, mu1, mu2, fup_obs_1, fup_obs_2)
+  DEALLOCATE(t, rs, td_zero, mu, mu_offset, mu_amp, fup_obs)
   DEALLOCATE(fup, fdn, fab, fup_w, fdn_w, fab_w, fup_d, fdn_d, fab_d)
   DEALLOCATE(fup_trial, fdn_trial, fab_trial)
   DEALLOCATE(history_cost, history_w, history_d)
   DEALLOCATE(history_gw, history_gd, history_lambda, history_rho)
 
-END PROGRAM calibrate_w_d_timeseries
+END PROGRAM calibrate_w_d_multisite
