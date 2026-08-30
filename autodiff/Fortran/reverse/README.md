@@ -57,7 +57,7 @@ The damping parameter $\lambda$ is dynamically adjusted using the ratio between 
 
 The optimization uses several convergence tests:
 
-- **Gradient tolerance**: $\|\nabla J\| < \text{gradient\_tolerance}$ (adaptive, based on initial gradient)
+- **Gradient tolerance**: $\|\nabla J\| < \text{gradient_tolerance}$ (adaptive, based on initial gradient)
 - **Parameter-step tolerance**: $\|\Delta p\| < 1.0 \times 10^{-10} (1 + \|p\|)$
 - **Cost tolerance**: $J < 1.0 \times 10^{-16}$
 - **Maximum iterations**: 200
@@ -74,8 +74,8 @@ The full Jacobian is then assembled by looping over all sites and days:
 
 1. For each (site, day), compute the raw sensitivity row
 2. Compute the residual $r = f_{\text{up}} - f_{\text{obs}}$
-3. Accumulate: $\nabla J = \nabla J + r \cdot \text{row\_grad}$
-4. Accumulate: $H = H + \text{row\_grad}^T \cdot \text{row\_grad}$
+3. Accumulate: $\nabla J = \nabla J + r \cdot \text{row_grad}$
+4. Accumulate: $H = H + \text{row_grad}^T \cdot \text{row_grad}$
 
 ## Identifiability Diagnostics
 
