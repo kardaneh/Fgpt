@@ -22,21 +22,21 @@ We use a multisite calibration framework based on a multilevel two-stream radiat
 
 The calibration minimizes the multisite objective function:
 
-$$J(p) = \frac{1}{2} \sum_{i=1}^{N_{\text{sites}}} \sum_{j=1}^{365} \left[ f_{\text{up},i,j}(p) - f_{\text{ref},i,j} \right]^2$$
+$$J(p) = \frac{1}{2} \sum_{i=1}^{N_{\rm{sites}}} \sum_{j=1}^{365} \left[ f_{\rm{up},i,j}(p) - f_{\rm{ref},i,j} \right]^2$$
 
 where the parameter vector is:
 
-$$p = \begin{bmatrix} w \\ d \\ rs_1 \\ rs_2 \\ \vdots \\ rs_{N_{\text{sites}}} \end{bmatrix}$$
+$$p = \begin{bmatrix} w \\ d \\ rs_1 \\ rs_2 \\ \vdots \\ rs_{N_{\rm{sites}}} \end{bmatrix}$$
 
 and $i$ indexes sites and $j$ indexes days.
 
 The Jacobian is:
 
 $$J(p) = \begin{bmatrix}
-\frac{\partial f_{\text{up},1,1}}{\partial w} & \frac{\partial f_{\text{up},1,1}}{\partial d} & \frac{\partial f_{\text{up},1,1}}{\partial rs_1} & \cdots & \frac{\partial f_{\text{up},1,1}}{\partial rs_{N_{\text{sites}}}} \\
-\frac{\partial f_{\text{up},1,2}}{\partial w} & \frac{\partial f_{\text{up},1,2}}{\partial d} & \frac{\partial f_{\text{up},1,2}}{\partial rs_1} & \cdots & \frac{\partial f_{\text{up},1,2}}{\partial rs_{N_{\text{sites}}}} \\
+\frac{\partial f_{\rm{up},1,1}}{\partial w} & \frac{\partial f_{\rm{up},1,1}}{\partial d} & \frac{\partial f_{\rm{up},1,1}}{\partial rs_1} & \cdots & \frac{\partial f_{\rm{up},1,1}}{\partial rs_{N_{\rm{sites}}}} \\
+\frac{\partial f_{\rm{up},1,2}}{\partial w} & \frac{\partial f_{\rm{up},1,2}}{\partial d} & \frac{\partial f_{\rm{up},1,2}}{\partial rs_1} & \cdots & \frac{\partial f_{\rm{up},1,2}}{\partial rs_{N_{\rm{sites}}}} \\
 \vdots & \vdots & \vdots & \ddots & \vdots \\
-\frac{\partial f_{\text{up},N_{\text{sites}},365}}{\partial w} & \frac{\partial f_{\text{up},N_{\text{sites}},365}}{\partial d} & \frac{\partial f_{\text{up},N_{\text{sites}},365}}{\partial rs_1} & \cdots & \frac{\partial f_{\text{up},N_{\text{sites}},365}}{\partial rs_{N_{\text{sites}}}}
+\frac{\partial f_{\rm{up},N_{\rm{sites}},365}}{\partial w} & \frac{\partial f_{\rm{up},N_{\rm{sites}},365}}{\partial d} & \frac{\partial f_{\rm{up},N_{\rm{sites}},365}}{\partial rs_1} & \cdots & \frac{\partial f_{\rm{up},N_{\rm{sites}},365}}{\partial rs_{N_{\rm{sites}}}}
 \end{bmatrix}$$
 
 The Gauss-Newton Hessian approximation is:
@@ -49,7 +49,7 @@ $$(H + \lambda I) \Delta p = -\nabla J$$
 
 where:
 
-$$\Delta p = \begin{bmatrix} \Delta w \\ \Delta d \\ \Delta rs_1 \\ \vdots \\ \Delta rs_{N_{\text{sites}}} \end{bmatrix}$$
+$$\Delta p = \begin{bmatrix} \Delta w \\ \Delta d \\ \Delta rs_1 \\ \vdots \\ \Delta rs_{N_{\rm{sites}}} \end{bmatrix}$$
 
 The damping parameter $\lambda$ is dynamically adjusted using the ratio between the actual and predicted cost reduction.
 
@@ -57,7 +57,7 @@ The damping parameter $\lambda$ is dynamically adjusted using the ratio between 
 
 The optimization uses several convergence tests:
 
-- **Gradient tolerance**: $\|\nabla J\| < \text{gradient_tolerance}$ (adaptive, based on initial gradient)
+- **Gradient tolerance**: $\|\nabla J\| < \rm{gradient\_tolerance}$ (adaptive, based on initial gradient)
 - **Parameter-step tolerance**: $\|\Delta p\| < 1.0 \times 10^{-10} (1 + \|p\|)$
 - **Cost tolerance**: $J < 1.0 \times 10^{-16}$
 - **Maximum iterations**: 200
@@ -66,22 +66,22 @@ The optimization uses several convergence tests:
 
 The Jacobian rows are computed using the adjoint model by seeding `fupb(nlevels_tot) = 1.0`:
 
-$$\text{row\_grad} = \begin{bmatrix} w_b & d_b & rs_{b,1} & \cdots & rs_{b,N_{\text{sites}}} \end{bmatrix}$$
+$$\rm{row\_grad} = \begin{bmatrix} w_b & d_b & rs_{b,1} & \cdots & rs_{b,N_{\rm{sites}}} \end{bmatrix}$$
 
 where `wb`, `db`, and `rsb` are the adjoint variables returned by `multilevel_matrix_b`.
 
 The full Jacobian is then assembled by looping over all sites and days:
 
 1. For each (site, day), compute the raw sensitivity row
-2. Compute the residual $r = f_{\text{up}} - f_{\text{obs}}$
-3. Accumulate: $\nabla J = \nabla J + r \cdot \text{row_grad}$
-4. Accumulate: $H = H + \text{row_grad}^T \cdot \text{row_grad}$
+2. Compute the residual $r = f_{\rm{up}} - f_{\rm{obs}}$
+3. Accumulate: $\nabla J = \nabla J + r \cdot \rm{row\_grad}$
+4. Accumulate: $H = H + \rm{row\_grad}^T \cdot \rm{row\_grad}$
 
 ## Identifiability Diagnostics
 
 The LM algorithm automatically handles parameter correlations through the damping term $\lambda I$. The gain ratio $\rho$ indicates the quality of the quadratic model:
 
-$$\rho = \frac{\text{actual reduction}}{\text{predicted reduction}}$$
+$$\rho = \frac{\rm{actual reduction}}{\rm{predicted reduction}}$$
 
 - $\rho > 0.75$: Good agreement, decrease $\lambda$
 - $\rho < 0.25$: Poor agreement, increase $\lambda$
@@ -101,10 +101,10 @@ make N_SITES=M
 The total number of calibrated parameters is:
 
 $$
-N_{\text{params}} = N_{\text{sites}} + 2
+N_{\rm{params}} = N_{\rm{sites}} + 2
 $$
 
-where $N_{\text{sites}}$ is configurable.
+where $N_{\rm{sites}}$ is configurable.
 
 ## Tapenade Integration
 
