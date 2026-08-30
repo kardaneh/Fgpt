@@ -57,7 +57,7 @@ The damping parameter $\lambda$ is dynamically adjusted using the ratio between 
 
 The optimization uses several convergence tests:
 
-- **Gradient tolerance**: $\|\nabla J\| < \rm{gradient\_tolerance}$ (adaptive, based on initial gradient)
+- **Gradient tolerance**: $\|\nabla J\| < \rm{gradient\_{tolerance}}$ (adaptive, based on initial gradient)
 - **Parameter-step tolerance**: $\|\Delta p\| < 1.0 \times 10^{-10} (1 + \|p\|)$
 - **Cost tolerance**: $J < 1.0 \times 10^{-16}$
 - **Maximum iterations**: 200

@@ -23,7 +23,7 @@ We use a multi-site parameter calibration framework based on a multilevel forwar
 The calibration minimizes the multi-site objective function:
 
 $$
-J(w,d) = \frac{1}{2}\sum_{i=1}^{N_{\text{sites}}} \sum_{j=1}^{365} r_{i,j}^2
+J(w,d) = \frac{1}{2}\sum_{i=1}^{N_{\rm{sites}}} \sum_{j=1}^{365} r_{i,j}^2
 $$
 
 where:
@@ -44,8 +44,8 @@ J(w,d) =
 \dfrac{\partial f_{\mathrm{up},1,2}}{\partial w} &
 \dfrac{\partial f_{\mathrm{up},1,2}}{\partial d} \\
 \vdots & \vdots \\
-\dfrac{\partial f_{\mathrm{up},N_{\text{sites}},365}}{\partial w} &
-\dfrac{\partial f_{\mathrm{up},N_{\text{sites}},365}}{\partial d}
+\dfrac{\partial f_{\mathrm{up},N_{\rm{sites}},365}}{\partial w} &
+\dfrac{\partial f_{\mathrm{up},N_{\rm{sites}},365}}{\partial d}
 \end{bmatrix}
 $$
 
