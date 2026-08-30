@@ -74,8 +74,8 @@ The full Jacobian is then assembled by looping over all sites and days:
 
 1. For each (site, day), compute the raw sensitivity row
 2. Compute the residual $r = f_{\rm{up}} - f_{\rm{obs}}$
-3. Accumulate: $\nabla J = \nabla J + r \cdot \rm{row\_grad}$
-4. Accumulate: $H = H + \rm{row\_grad}^T \cdot \rm{row\_grad}$
+3. Accumulate: $\nabla J = \nabla J + r \cdot \rm{row\_{grad}}$
+4. Accumulate: $H = H + \rm{row\_{grad}}^T \cdot \rm{row\_{grad}}$
 
 ## Identifiability Diagnostics
 
