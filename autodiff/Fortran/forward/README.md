@@ -1,14 +1,14 @@
-# Calibration of two-stream radiation transfer solver
+# Calibration of two-Stream radiation transfer using forward model
 
 This example demonstrates the calibration of two parameters in a two-stream radiation transfer solver:
 
 - `w`: **single-scattering albedo**, describing the fraction of radiation that is scattered rather than absorbed.
 - `d`: **preferred directional scattering parameter**, describing the directional preference of the scattering process.
 
-We use a multi-site parameter calibration framework based on a multilevel forward model and the **Levenberg–Marquardt (LM)** optimization algorithm. The Fortran program generates synthetic references using randomly generated parameters and then attempts to recover the parameters `w` and `d` across multiple independent sites. The Python script reads the optimization history and generates diagnostic plots. The optimization process has the following features:
+We use a multi-site parameter calibration framework based on a multilevel forward model and the **Levenberg–Marquardt (LM)** optimization algorithm. The Fortran program generates synthetic references using randomly generated parameters and then attempts to recover the parameters `w` and `d` across the sites. The optimization process has the following features:
 
-- **Multi-site parameter calibration**: Simultaneously estimates `w` and `d` using references from multiple independent sites (configurable via `N_SITES`)
-- **Full-year time series**: Uses 365 daily noon observations per site to capture seasonal variability
+- **Multi-site parameter calibration**: Simultaneously estimates `w` and `d` using references from multiple sites
+- **Full-year time series**: Uses 365 daily noon references per site to capture seasonal variability
 - **Synthetic reference generation**: Generates references using randomly parameters
 - **Tapenade tangent differentiation**: Uses `multilevel_matrix_d` to calculate derivatives with respect to `w` and `d`
 - **Gauss–Newton Hessian**: Constructs the approximate Hessian from the Jacobian
@@ -100,14 +100,8 @@ $\left|\mathrm{jac\_corr}\right| > 0.999$
 The number of sites can be configured at compile time using the `N_SITES` variable:
 
 ```bash
-    # Build with 8 sites (default)
-    make
-
-    # Build with 16 sites
-    make N_SITES=16
-
-    # Build with 32 sites
-    make N_SITES=32
+# Build with M sites
+make N_SITES=M
 ```
 
 
@@ -115,11 +109,15 @@ The number of sites can be configured at compile time using the `N_SITES` variab
 
 The Tapenade path need to be adjusted in the Makefile using:
 
-    TAPENADE_HOME = /path/to/tapenade
+```makefile
+TAPENADE_HOME = /path/to/tapenade
+```
 
 The Tapenade runtime is expected at:
 
-    $(TAPENADE_HOME)/ADFirstAidKit
+```makefile
+$(TAPENADE_HOME)/ADFirstAidKit
+```
 
 ## Requirements
 
@@ -137,14 +135,11 @@ The Tapenade runtime is expected at:
 Compile the project with:
 
 ```bash
-    # Build with 8 sites (default)
-    make
+# Build with 8 sites (default)
+make
 
-    # Build with 16 sites
-    make N_SITES=16
-
-    # Build with 32 sites
-    make N_SITES=32
+# Build with M sites
+make N_SITES=M
 ```
 
 This produces the executable:
@@ -162,21 +157,25 @@ The build creates the following directories:
 
 Run the calibration with:
 
-    make run N_SITES=16
+```bash
+make run N_SITES=M
+```
 
 or directly:
 
-    ./calibrate
+```bash
+./calibrate
+```
 
 The program generates a new synthetic calibration problem for each execution.
-
-The random seed is initialized using `/dev/urandom`, so the reference parameters and site properties generally differ between runs.
 
 ## Run and Visualize
 
 To build, execute the calibration, and generate the plots:
 
-    make viz N_SITES=16
+```bash
+make viz N_SITES=M
+```
 
 This performs:
 
@@ -191,15 +190,19 @@ This performs:
 
 If the optimization output files already exist, generate the plots with:
 
-    make plot N_SITES=16
+```bash
+make plot N_SITES=M
+```
 
 or:
 
-     python plots.py --n_sites 16
+```bash
+python plots.py --n_sites M
+```
 
 ## Output Files
 
-### `true_parameters.txt`
+### true_parameters.txt
 
 Contains the randomly generated reference parameters:
 
@@ -213,8 +216,6 @@ Contains the optimization history. The columns are:
 
     iter cost w d gJ_w gJ_d lambda rho
 
-
-
 ### optimization_history.png
 
 The figure contains six diagnostic panels:
@@ -227,13 +228,13 @@ The figure contains six diagnostic panels:
 6. **LM Gain Ratio ($\rho$)**
 
 <p align="center">
-  <img src="../../images/optimization_history.png" alt="Optimization History" width="80%">
+  <img src="../../../images/optimization_history.png" alt="Optimization History" width="80%">
 </p>
 
 ### flux_comparison.png
 
-The figure compares observed vs recovered upward fluxes over the full year (365 days) for each sites. This plot validates that the recovered parameters reproduce the reference flux across the entire seasonal cycle.
+The figure compares reference vs recovered upward fluxes over the full year (365 days) for each sites. This plot validates that the recovered parameters reproduce the reference flux across the entire seasonal cycle.
 
 <p align="center">
-  <img src="../../images/flux_comparison.png" alt="Flux Comparison" width="80%">
+  <img src="../../../images/flux_comparison.png" alt="Flux Comparison" width="80%">
 </p>

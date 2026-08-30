@@ -6,7 +6,7 @@
 ! To view a copy of this license, visit
 ! http://creativecommons.org/licenses/by-nc-sa/4.0/
 
-PROGRAM calibrate_w_d_multisite
+PROGRAM calibrate_w_d
 
   USE module_global_multilevel_matrixmodule_global_multilevel_matrix_tgt
   IMPLICIT NONE
@@ -172,7 +172,7 @@ PROGRAM calibrate_w_d_multisite
   WRITE(*,'(A)') 'True parameters written to: ' // TRIM(true_params_file)
 
   !
-  ! Generate synthetic observations: fup(nlevels_tot) per day, per site
+  ! Generate synthetic references: fup(nlevels_tot) per day, per site
   !
   DO isite = 1, n_sites
      DO j = 1, n_days
@@ -182,7 +182,7 @@ PROGRAM calibrate_w_d_multisite
      END DO
   END DO
 
-  WRITE(*,'(A,I0,A)') 'Generated ', n_sites*n_days, ' synthetic observations.'
+  WRITE(*,'(A,I0,A)') 'Generated ', n_sites*n_days, ' synthetic references.'
 
   !
   ! Initial guess
@@ -432,4 +432,4 @@ PROGRAM calibrate_w_d_multisite
   DEALLOCATE(history_cost, history_w, history_d)
   DEALLOCATE(history_gw, history_gd, history_lambda, history_rho)
 
-END PROGRAM calibrate_w_d_multisite
+END PROGRAM calibrate_w_d
