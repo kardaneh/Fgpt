@@ -1,5 +1,5 @@
-Tapenade Automatic Differentiation Integration
-==============================================
+Automatic Differentiation
+=========================
 
 Tapenade is an Automatic Differentiation (AD) tool that transforms Fortran
 code to compute derivatives efficiently. It generates tangent-linear (forward
@@ -7,6 +7,45 @@ mode) and adjoint (reverse mode) code from a given Fortran subroutine or
 function.
 
 For more information, see the `Tapenade documentation <https://inria.hal.science/hal-00913983/document/>`_.
+
+Tapenade Installation
+---------------------
+
+Before installing Tapenade, you must check that an up-to-date Java Runtime
+Environment is installed. Tapenade will not run with older Java Runtime
+Environment.
+
+**Installation Steps:**
+
+1. Read the Tapenade license available on the Tapenade website
+2. Download ``tapenade_3.16.tar`` into your chosen installation directory
+   ``install_dir``
+3. Go to your chosen installation directory and extract Tapenade:
+
+   .. code-block:: bash
+
+      cd /path/to/install_dir
+      tar xvfz tapenade_3.16.tar
+
+4. On Linux, depending on your distribution, Tapenade may require you to set
+   the shell variable ``JAVA_HOME`` to your Java installation directory.
+   It is often ``JAVA_HOME=/usr/java/default``:
+
+   .. code-block:: bash
+
+      export JAVA_HOME=/usr/java/default
+      export TAPENADE_HOME=/path/to/install_dir
+      export PATH=$TAPENADE_HOME/bin:$PATH
+
+5. Verify the installation:
+
+   .. code-block:: bash
+
+      which tapenade
+      tapenade -help
+
+For more information on the ``tapenade`` command and its arguments, type:
+``tapenade -help``
 
 Requirements
 ------------
