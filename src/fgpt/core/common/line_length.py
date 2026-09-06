@@ -1,6 +1,11 @@
 # Copyright 2026 IPSL / CNRS / Sorbonne University
 # Authors: Shivamshan Sivanesan and Kazem Ardaneh
 #
+# This class has been adapted from the ``FortLineLength`` implementation in
+# PSyclone, developed by the Science and Technology Facilities Council (STFC)
+# and distributed under the BSD-3-Clause license. The original implementation
+# is Copyright (c) 2017-2026 Science and Technology Facilities Council.
+#
 # This work is licensed under the Creative Commons
 # Attribution-NonCommercial-ShareAlike 4.0 International License.
 # To view a copy of this license, visit
