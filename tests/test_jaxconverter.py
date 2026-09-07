@@ -1023,7 +1023,6 @@ def compute(self, x):
         else:
             arr[i] = arr[i] - c
         """)
-        print(ast.unparse(ast.fix_missing_locations(result)))
         stmts = result.body
         assert len(stmts) == 4  # Contains the 2 mask and the arr as masked update
         assert "logical_and" in _unparse(stmts[0])  # the elif mask

@@ -924,7 +924,7 @@ class TestF2NP:
 
         if_nodes = [node for node in ast.walk(func) if isinstance(node, ast.If)]
         assert len(if_nodes) >= 3  # ensures nesting was preserved
-        # print(ast.unparse(ast.fix_missing_locations(func)))
+
         code_out = ast.unparse(ast.fix_missing_locations(func))
         assert "result =" in code_out
         expected_output = """
@@ -1003,7 +1003,6 @@ def complex_logic(arr, n, threshold, result):
         assert "process_mod" in call_names
         assert "finalize" in call_names
 
-        # print(ast.unparse(ast.fix_missing_locations(func)))
         if_nodes = [node for node in ast.walk(func) if isinstance(node, ast.If)]
         assert len(if_nodes) == 4
 
@@ -1241,7 +1240,7 @@ def extreme_case(x, y, n):
         """
         stmt = self.parse_and_get(code, F23.Data_Ref)
         result = self.f2np.handle_data_ref(stmt)
-        print(ast.unparse(ast.fix_missing_locations(result)))
+
         assert isinstance(result, ast.Subscript)
         assert isinstance(result.slice, ast.Slice)
         assert isinstance(result.slice.lower, ast.Constant)
