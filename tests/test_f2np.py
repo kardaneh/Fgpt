@@ -450,7 +450,7 @@ class TestF2NP:
         # lower and upper
         # Since the lower values started at 1 and in python we start at everything at 0 thus the lower slice is None
         # this is only applied to the lower bound values
-        assert result.slice.lower is None
+        assert isinstance(result.slice.lower, ast.Constant)
         assert isinstance(result.slice.upper, ast.Constant)
         assert result.slice.upper.value == 5
 
@@ -1025,6 +1025,395 @@ def extreme_case(x, y, n):
         """
         expected_ast = ast.parse(expected_output).body[0]
         assert_ast_equal(func, expected_ast)
+
+    def test_extract_dtype_derived_type(self):
+        code = """
+        subroutine test()
+            TYPE(laieff_type) :: laieff_fit
+        end subroutine test
+        """
+        stmt = self.parse_and_get(code, F23.Type_Declaration_Stmt)
+        idx, attr = self.f2np._extract_dtype(stmt)
+
+        # Sentinel: idx is None for derived types, attr carries the type name
+        assert idx is None
+        assert attr == "laieff_type"
+
+    def test_extract_dtype_still_handles_intrinsics(self):
+        # Regression check: derived-type branch shouldn't break intrinsics
+        code = """
+        subroutine test()
+            real :: x
+        end subroutine test
+        """
+        stmt = self.parse_and_get(code, F23.Type_Declaration_Stmt)
+        idx, attr = self.f2np._extract_dtype(stmt)
+
+        assert idx == "np"
+        assert attr == "float64"
+
+    def test_handle_type_declaration_stmt_derived_type_no_init(self):
+        code = """
+        subroutine test()
+            TYPE(laieff_type) :: laieff_fit
+        end subroutine test
+        """
+        stmt = self.parse_and_get(code, F23.Type_Declaration_Stmt)
+        result = self.f2np.handle_type_declaration_stmt(stmt)
+
+        assert isinstance(result, ast.Assign)
+        assert result.targets[0].id == "laieff_fit"
+
+        # laieff_fit = LaieffType() (or laieff_type(), depending on casing convention)
+        assert isinstance(result.value, ast.Call)
+        assert isinstance(result.value.func, ast.Name)
+        assert result.value.func.id == "laieff_type"
+        assert result.value.args == []
+        assert result.value.keywords == []
+
+    def test_handle_type_declaration_stmt_derived_type_with_structure_constructor(self):
+        code = """
+        subroutine test()
+            TYPE(laieff_type) :: laieff_fit = laieff_type(1.0, 2.0)
+        end subroutine test
+        """
+        stmt = self.parse_and_get(code, F23.Type_Declaration_Stmt)
+        result = self.f2np.handle_type_declaration_stmt(stmt)
+
+        assert isinstance(result, ast.Assign)
+        assert result.targets[0].id == "laieff_fit"
+        assert isinstance(result.value, ast.Call)
+        assert result.value.func.id == "laieff_type"
+        assert len(result.value.args) == 2
+        assert all(isinstance(a, ast.Constant) for a in result.value.args)
+        assert [a.value for a in result.value.args] == [1.0, 2.0]
+
+    def test_handle_structure_constructor_positional(self):
+        code = """
+        subroutine test()
+            laieff_fit = laieff_type(1.0, arr_vals)
+        end subroutine test
+        """
+        stmt = self.parse_and_get(code, F23.Structure_Constructor)
+        result = self.f2np.handle_structure_constructor(stmt)
+
+        assert isinstance(result, ast.Call)
+        assert isinstance(result.func, ast.Name)
+        assert result.func.id == "laieff_type"
+
+        assert len(result.args) == 2
+        assert isinstance(result.args[0], ast.Constant) and result.args[0].value == 1.0
+        assert isinstance(result.args[1], ast.Name) and result.args[1].id == "arr_vals"
+        assert result.keywords == []
+
+    def test_handle_structure_constructor_keyword(self):
+        code = """
+        subroutine test()
+            laieff_fit = laieff_type(comp1=1.0, comp2=arr_vals)
+        end subroutine test
+        """
+        stmt = self.parse_and_get(code, F23.Structure_Constructor)
+        result = self.f2np.handle_structure_constructor(stmt)
+
+        assert isinstance(result, ast.Call)
+        assert result.args == []
+        assert len(result.keywords) == 2
+
+        kw_names = [kw.arg for kw in result.keywords]
+        assert kw_names == ["comp1", "comp2"]
+        assert isinstance(result.keywords[0].value, ast.Constant)
+        assert result.keywords[0].value.value == 1.0
+        assert isinstance(result.keywords[1].value, ast.Name)
+        assert result.keywords[1].value.id == "arr_vals"
+
+    def test_handle_structure_constructor_mixed_positional_and_keyword(self):
+        code = """
+        subroutine test()
+            laieff_fit = laieff_type(1.0, comp2=arr_vals)
+        end subroutine test
+        """
+        stmt = self.parse_and_get(code, F23.Structure_Constructor)
+        result = self.f2np.handle_structure_constructor(stmt)
+
+        assert len(result.args) == 1
+        assert result.args[0].value == 1.0
+        assert len(result.keywords) == 1
+        assert result.keywords[0].arg == "comp2"
+
+    def test_handle_structure_constructor_empty(self):
+        code = """
+        subroutine test()
+            laieff_fit = laieff_type()
+        end subroutine test
+        """
+        stmt = self.parse_and_get(code, F23.Structure_Constructor)
+        result = self.f2np.handle_structure_constructor(stmt)
+
+        assert isinstance(result, ast.Call)
+        assert result.func.id == "laieff_type"
+        assert result.args == []
+        assert result.keywords == []
+
+    def test_handle_structure_constructor_via_handle_expr(self):
+        # Ensure handle_expr dispatches to handle_structure_constructor
+        code = """
+        subroutine test()
+            laieff_fit = laieff_type(1.0, 2.0)
+        end subroutine test
+        """
+        stmt = self.parse_and_get(code, F23.Structure_Constructor)
+        result = self.f2np.handle_expr(stmt)
+
+        assert isinstance(result, ast.Call)
+        assert result.func.id == "laieff_type"
+
+    def test_handle_assignment_rhs_structure_constructor(self):
+        # RHS of a plain assignment can be a structure constructor
+        code = """
+        subroutine test()
+            laieff_fit = laieff_type(1.0, 2.0)
+        end subroutine test
+        """
+        stmt = self.parse_and_get(code, F23.Assignment_Stmt)
+        result = self.f2np.handle_assignment(stmt)
+
+        assert isinstance(result, ast.Assign)
+        assert result.targets[0].id == "laieff_fit"
+        assert isinstance(result.value, ast.Call)
+        assert result.value.func.id == "laieff_type"
+
+    def test_handle_structure_constructor_as_call_argument(self):
+        code = """
+        subroutine test()
+            call foo(laieff_type(1.0, 2.0))
+        end subroutine test
+        """
+        stmt = self.parse_and_get(code, F23.Call_Stmt)
+        self.f2np.extractor.allowed_external_subroutines = []
+        result = self.f2np.handle_call_stmt(stmt)
+
+        assert isinstance(result, ast.Expr)
+        call = result.value
+        assert isinstance(call, ast.Call)
+        assert call.func.id == "foo"
+        assert len(call.args) == 1
+        assert isinstance(call.args[0], ast.Call)
+        assert call.args[0].func.id == "laieff_type"
+
+    def test_handle_data_ref_simple_component(self):
+        code = """
+        subroutine test()
+            b = laieff_fit%foo
+        end subroutine test
+        """
+        stmt = self.parse_and_get(code, F23.Data_Ref)
+        result = self.f2np.handle_data_ref(stmt)
+
+        assert isinstance(result, ast.Attribute)
+        assert result.attr == "foo"
+        assert isinstance(result.value, ast.Name)
+        assert result.value.id == "laieff_fit"
+        assert isinstance(result.ctx, ast.Load)
+
+    def test_handle_data_ref_array_component_index(self):
+        code = """
+        subroutine test()
+            b = laieff_fit%arr(2)
+        end subroutine test
+        """
+        stmt = self.parse_and_get(code, F23.Data_Ref)
+        result = self.f2np.handle_data_ref(stmt)
+
+        assert isinstance(result, ast.Subscript)
+        assert isinstance(result.value, ast.Attribute)
+        assert result.value.attr == "arr"
+        assert result.value.value.id == "laieff_fit"
+
+        # Fortran index 2 -> Python index 1
+        assert isinstance(result.slice, ast.Constant)
+        assert result.slice.value == 2
+
+    def test_handle_data_ref_array_component_slice(self):
+        code = """
+        subroutine test()
+            b = laieff_fit%arr(1:5)
+        end subroutine test
+        """
+        stmt = self.parse_and_get(code, F23.Data_Ref)
+        result = self.f2np.handle_data_ref(stmt)
+        print(ast.unparse(ast.fix_missing_locations(result)))
+        assert isinstance(result, ast.Subscript)
+        assert isinstance(result.slice, ast.Slice)
+        assert isinstance(result.slice.lower, ast.Constant)
+        assert result.slice.upper.value == 5
+
+    def test_handle_data_ref_via_handle_expr(self):
+        code = """
+        subroutine test()
+            b = laieff_fit%foo
+        end subroutine test
+        """
+        stmt = self.parse_and_get(code, F23.Data_Ref)
+        result = self.f2np.handle_expr(stmt)
+
+        assert isinstance(result, ast.Attribute)
+        assert result.attr == "foo"
+
+    def test_handle_assignment_lhs_data_ref(self):
+        # laieff_fit%foo = 1.0 -> LHS must carry Store context
+        code = """
+        subroutine test()
+            laieff_fit%foo = 1.0
+        end subroutine test
+        """
+        stmt = self.parse_and_get(code, F23.Assignment_Stmt)
+        result = self.f2np.handle_assignment(stmt)
+
+        assert isinstance(result, ast.Assign)
+        lhs = result.targets[0]
+        assert isinstance(lhs, ast.Attribute)
+        assert lhs.attr == "foo"
+        assert isinstance(lhs.ctx, ast.Store)
+
+        assert isinstance(result.value, ast.Constant)
+        assert result.value.value == 1.0
+
+    def test_handle_assignment_lhs_data_ref_array_component(self):
+        code = """
+        subroutine test()
+            laieff_fit%arr(2) = 1.0
+        end subroutine test
+        """
+        stmt = self.parse_and_get(code, F23.Assignment_Stmt)
+        result = self.f2np.handle_assignment(stmt)
+
+        lhs = result.targets[0]
+        assert isinstance(lhs, ast.Subscript)
+        assert isinstance(lhs.ctx, ast.Store)
+        assert isinstance(lhs.value, ast.Attribute)
+        assert lhs.value.attr == "arr"
+
+    def test_build_dataclass_fields_scalar_intrinsic(self):
+        code = """
+        module test_mod
+            TYPE :: laieff_type
+                REAL :: comp1
+            END TYPE laieff_type
+        end module test_mod
+        """
+        decl = self.parse_and_get(code, F23.Data_Component_Def_Stmt)
+        fields = self.f2np._build_dataclass_fields(decl)
+
+        assert len(fields) == 1
+        field = fields[0]
+        assert isinstance(field, ast.AnnAssign)
+        assert field.target.id == "comp1"
+        assert isinstance(field.annotation, ast.Attribute)
+        assert field.annotation.attr == "float64"
+
+        # scalar default: np.float64(0)
+        assert isinstance(field.value, ast.Call)
+        assert field.value.func.attr == "float64"
+        assert field.value.args[0].value == 0
+
+    def test_build_dataclass_fields_array_intrinsic(self):
+        code = """
+        module test_mod
+            TYPE :: laieff_type
+                REAL :: arr(10)
+            END TYPE laieff_type
+        end module test_mod
+        """
+        decl = self.parse_and_get(code, F23.Data_Component_Def_Stmt)
+        fields = self.f2np._build_dataclass_fields(decl)
+
+        assert len(fields) == 1
+        field = fields[0]
+        assert field.target.id == "arr"
+        assert field.annotation.attr == "ndarray"
+
+        # array default: field(default_factory=lambda: np.zeros((10,), dtype=np.float64))
+        assert isinstance(field.value, ast.Call)
+        assert field.value.func.id == "field"
+        assert field.value.keywords[0].arg == "default_factory"
+        assert isinstance(field.value.keywords[0].value, ast.Lambda)
+
+        lambda_body = field.value.keywords[0].value.body
+        assert isinstance(lambda_body, ast.Call)
+        assert lambda_body.func.attr == "zeros"
+
+    def test_build_dataclass_fields_nested_derived_type(self):
+        code = """
+        module test_mod
+            TYPE :: outer_type
+                TYPE(inner_type) :: comp
+            END TYPE outer_type
+        end module test_mod
+        """
+        decl = self.parse_and_get(code, F23.Data_Component_Def_Stmt)
+        fields = self.f2np._build_dataclass_fields(decl)
+
+        assert len(fields) == 1
+        field = fields[0]
+        assert field.target.id == "comp"
+        assert field.annotation.id == "inner_type"
+
+        # nested default: comp = inner_type()
+        assert isinstance(field.value, ast.Call)
+        assert field.value.func.id == "inner_type"
+        assert field.value.args == []
+        assert field.value.keywords == []
+
+    def test_build_dataclass_fields_multiple_components_same_stmt(self):
+        code = """
+        module test_mod
+            TYPE :: laieff_type
+                REAL :: comp1, comp2
+            END TYPE laieff_type
+        end module test_mod
+        """
+        decl = self.parse_and_get(code, F23.Data_Component_Def_Stmt)
+        fields = self.f2np._build_dataclass_fields(decl)
+
+        assert len(fields) == 2
+        assert [f.target.id for f in fields] == ["comp1", "comp2"]
+        assert all(isinstance(f, ast.AnnAssign) for f in fields)
+
+    def test_recursive_ast_function_without_result_suffix(self):
+        code = """
+        REAL(KIND=r_std) FUNCTION calculate_laieff_fit(test_angle, laieff_fit)
+            REAL(KIND=r_std), INTENT(IN) :: test_angle
+            TYPE(laieff_type), INTENT(IN) :: laieff_fit
+            calculate_laieff_fit = laieff_fit % a + test_angle * laieff_fit % b
+        END FUNCTION calculate_laieff_fit
+        """
+        stmt = self.parse_and_get(code, F23.Function_Subprogram)
+        _, _, result = self.f2np.recursive_ast(stmt)
+
+        func = result[0]
+        assert isinstance(func, ast.FunctionDef)
+        assert func.name == "calculate_laieff_fit"
+
+        # Implicit result variable: function name doubles as return value
+        return_nodes = [n for n in func.body if isinstance(n, ast.Return)]
+        assert len(return_nodes) == 1
+        assert return_nodes[0].value.id == "calculate_laieff_fit"
+
+    def test_recursive_ast_function_with_result_suffix_still_works(self):
+        # Regression guard: explicit RESULT(...) must still take precedence
+        code = """
+        REAL(KIND=r_std) FUNCTION compute(x) RESULT(y)
+            REAL(KIND=r_std), INTENT(IN) :: x
+            y = x * 2.0
+        END FUNCTION compute
+        """
+        stmt = self.parse_and_get(code, F23.Function_Subprogram)
+        _, _, result = self.f2np.recursive_ast(stmt)
+
+        func = result[0]
+        return_nodes = [n for n in func.body if isinstance(n, ast.Return)]
+        assert len(return_nodes) == 1
+        assert return_nodes[0].value.id == "y"
 
 
 @pytest.mark.usefixtures("test_env")

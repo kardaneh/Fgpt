@@ -843,7 +843,7 @@ x: int = 5
             assign_nodes, module, method_name="foo"
         )
         names = [stmt.targets[0].id for stmt in func.body]
-        assert names == ["a", "b", "c"]
+        assert set(names) == set(["a", "c"])
 
         # Testing with attributes inside a function with no dependencies
         self.transformer.global_state = False

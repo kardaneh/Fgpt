@@ -990,9 +990,9 @@ def compute(self, x):
             arr[i] = 0
         """)
         stmts = result.body
-        assert len(stmts) == 2  # Contains the mask and the arr as masked update
+        assert len(stmts) == 3  # Contains the mask and the arr as masked update
         assert _unparse(stmts[-1]) == (
-            "arr = arr.at[:].set(jnp.where(_mask_0, arr + 1, 0))"
+            "arr = arr.at[:].set(jnp.where(_mask_0, old_val_arr + 1, 0))"
         )
 
         result = self._transform_fn("""
@@ -1006,11 +1006,11 @@ def compute(self, x):
             arr[i] = c
         """)
         stmts = result.body
-        assert len(stmts) == 3  # Contains the 2 mask and the arr as masked update
+        assert len(stmts) == 4  # Contains the 2 mask and the arr as masked update
         assert "logical_and" in _unparse(stmts[0])  # the elif mask
         assert "greater" in _unparse(stmts[1])  # the if mask
         assert _unparse(stmts[-1]) == (
-            "arr = arr.at[:].set(jnp.where(_mask_1, arr + a, jnp.where(_mask_0, b, c)))"
+            "arr = arr.at[:].set(jnp.where(_mask_1, old_val_arr + a, jnp.where(_mask_0, b, c)))"
         )
 
         result = self._transform_fn("""
@@ -1023,12 +1023,13 @@ def compute(self, x):
         else:
             arr[i] = arr[i] - c
         """)
+        print(ast.unparse(ast.fix_missing_locations(result)))
         stmts = result.body
-        assert len(stmts) == 3  # Contains the 2 mask and the arr as masked update
+        assert len(stmts) == 4  # Contains the 2 mask and the arr as masked update
         assert "logical_and" in _unparse(stmts[0])  # the elif mask
-        assert "greater" in _unparse(stmts[1])  # the if mask
+        assert "greater" in _unparse(stmts[2])  # the if mask
         assert _unparse(stmts[-1]) == (
-            "arr = arr.at[:].set(jnp.where(_mask_1, arr + a, jnp.where(_mask_0, b, arr - c)))"
+            "arr = arr.at[:].set(jnp.where(_mask_1, old_val_arr + a, jnp.where(_mask_0, b, old_val_arr - c)))"
         )
 
     def _transform_fn(self, code):
@@ -1280,59 +1281,95 @@ class TestVisitAssign:
 
     def test_visit_Assign(self):
         # self.soil_temp[0] = v  ->  soil_temp = soil_temp.at[0].set(v).
-        transformed = self._visit_fn("""
+        transformed = self._visit_fn(
+            """
 def compute(self):
     self.soil_temp[0] = 1.0
-        """)
+        """
+        )
         code = _unparse(transformed)
-        assert ".at[" in code
-        assert ".set(" in code
+        assert ".at[0].set(1.0)" in code
 
     def test_subscript_assign_self_attr_registers_mutation(self):
         # Assigning to self.soil_temp[i] must record soil_temp in _var_modif.
         self.converter.reset_all()
-        self._visit_fn("""
+        self._visit_fn(
+            """
 def compute(self):
     self.soil_temp[0] = 2.0
-        """)
+        """
+        )
         assert "soil_temp" in self.converter._var_modif["attr"]
 
     def test_local_array_subscript_at_set(self):
         # x[0] = 9.0 (x is a func arg) -> x = x.at[0].set(9.0).
-        transformed = self._visit_fn("""
+        transformed = self._visit_fn(
+            """
 def compute(self, x):
     x[0] = 9.0
-        """)
+        """
+        )
         code = _unparse(transformed)
-        assert ".at[" in code and ".set(" in code
+        assert ".at[0].set(9.0)" in code
 
     def test_in_place_add_subscript_becomes_at_add(self):
-        # a[i] = a[i] + v pattern -> .at[i].add(v).
-        transformed = self._visit_fn("""
+        # a[i] = a[i] + v pattern -> .at[i].add(v), not .set(a[i] + v).
+        transformed = self._visit_fn(
+            """
 def compute(self):
     self.soil_temp[0] = self.soil_temp[0] + 1.0
-        """)
+        """
+        )
         code = _unparse(transformed)
-        # Either .add or a transformed .set with the value — at minimum .at[ must appear
-        assert ".at[" in code
+        assert ".at[0].add(1.0)" in code
+        assert ".set(" not in code
 
     def test_plain_scalar_assign_no_at(self):
         # A plain y = expr with no subscript must not produce .at[.
-        transformed = self._visit_fn("""
+        transformed = self._visit_fn(
+            """
 def compute(self, x):
     y = x + 1
     return y
-        """)
+        """
+        )
         code = _unparse(transformed)
         assert ".at[" not in code
 
     def test_augmented_assign_subscript_becomes_at_add(self):
-        transformed = self._visit_fn("""
+        transformed = self._visit_fn(
+            """
 def compute(self, x):
     x[0] = x[0] + 1
-        """)
+        """
+        )
         code = _unparse(transformed)
-        assert ".at[" in code
+        assert ".at[0].add(1)" in code
+
+    def test_mixed_nested_binop_subscript_falls_back_to_set(self):
+        # Regression: x[0] = (x[0] / a) ** b must lower to a full .set(...)
+        # of the whole expression, never .divide(a ** b).
+        transformed = self._visit_fn(
+            """
+def compute(self, x, a, b):
+    x[0] = (x[0] / a) ** b
+        """
+        )
+        code = _unparse(transformed)
+        assert ".divide(" not in code
+        assert ".at[0].set((x[0] / a) ** b)" in code
+
+    def test_same_index_requires_matching_slice(self):
+        # a[i] = a[j] + x -- different indices, must NOT fold to "add".
+        op, value = self.converter.check_in_place_modif(_stmt("a[i] = a[j] + x"))
+        assert op == "set"
+        assert _unparse(value) == "a[j] + x"
+
+    def test_same_index_requires_matching_base_name(self):
+        # a[i] = b[i] + x -- different arrays, must NOT fold to "add".
+        op, value = self.converter.check_in_place_modif(_stmt("a[i] = b[i] + x"))
+        assert op == "set"
+        assert _unparse(value) == "b[i] + x"
 
 
 @pytest.mark.usefixtures("test_env")
@@ -1446,3 +1483,75 @@ def compute(self, x):
         """)
         self.converter.reset_all()
         assert self.converter._var_modif == {"attr": set(), "args": set()}
+
+
+@pytest.mark.usefixtures("test_env")
+class TestCheckInPlaceModif:
+    """Direct unit tests for check_in_place_modif — pure AST-in/AST-out,
+    no visitor state needed.
+    """
+
+    def _check(self, code):
+        assign = _stmt(code)
+        return self.converter.check_in_place_modif(assign)
+
+    def test_simple_add(self):
+        op, value = self._check("a[i] = a[i] + x")
+        assert op == "add"
+        assert _unparse(value) == "x"
+
+    def test_simple_subtract(self):
+        op, value = self._check("a[i] = a[i] - x")
+        assert op == "subtract"
+        assert _unparse(value) == "x"
+
+    def test_simple_multiply(self):
+        op, value = self._check("a[i] = a[i] * x")
+        assert op == "multiply"
+        assert _unparse(value) == "x"
+
+    def test_simple_divide(self):
+        op, value = self._check("a[i] = a[i] / x")
+        assert op == "divide"
+        assert _unparse(value) == "x"
+
+    def test_plain_set_when_no_binop(self):
+        op, value = self._check("a[i] = x")
+        assert op == "set"
+        assert _unparse(value) == "x"
+
+    def test_nested_add_add_folds(self):
+        # (a[i] + b) + c -> ("add", b + c) since Add is associative.
+        op, value = self._check("a[i] = (a[i] + b) + c")
+        assert op == "add"
+        assert _unparse(value) == "b + c"
+
+    def test_nested_mult_mult_folds(self):
+        # (a[i] * b) * c -> ("multiply", b * c) since Mult is associative.
+        op, value = self._check("a[i] = (a[i] * b) * c")
+        assert op == "multiply"
+        assert _unparse(value) == "b * c"
+
+    def test_nested_div_pow_does_not_fold(self):
+        # Regression test: (a[i] / b) ** c must NOT fold into
+        # ("divide", b ** c) -- that computes a / b**c, not (a/b)**c.
+        op, value = self._check("a[i] = (a[i] / b) ** c")
+        assert op == "set"
+        assert _unparse(value) == "(a[i] / b) ** c"
+
+    def test_nested_add_mult_mixed_does_not_fold(self):
+        # Regression: mixed operators (inner Add, outer Mult) must not
+        # fold -- (a[i] + b) * c != a[i] + (b * c).
+        op, value = self._check("a[i] = (a[i] + b) * c")
+        assert op == "set"
+        assert _unparse(value) == "(a[i] + b) * c"
+
+    def test_different_index_not_in_place(self):
+        op, value = self._check("a[i] = a[j] + x")
+        assert op == "set"
+        assert _unparse(value) == "a[j] + x"
+
+    def test_self_attr_subscript_add(self):
+        op, value = self._check("self.soil_temp[i] = self.soil_temp[i] + x")
+        assert op == "add"
+        assert _unparse(value) == "x"

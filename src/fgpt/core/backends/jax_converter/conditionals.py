@@ -1145,6 +1145,10 @@ class _ConditionalLowering:
                     return self._lower_masked_branch_pair(node, vectorization_context)
 
                 elif cond_type == "vector":
+                    if self._is_simple_branch_pair(node):
+                        return self._lower_masked_branch_pair(
+                            node, vectorization_context
+                        )
                     return self._lower_vector_condition(
                         node, assigned, used_after, vectorization_context
                     )
@@ -1157,6 +1161,14 @@ class _ConditionalLowering:
                     if has_break_in_body or has_break_in_orelse:
                         return self._emit_convergence_break(
                             node, vectorization_context, assigned, used_after
+                        )
+
+                    # NOTE: same symmetric-branch shortcut as the "vector" case above
+                    # an index_loop conditional with matching assigns per branch doesn't
+                    # need loop-indexed lowering, jnp.where is equivalent and cheaper.
+                    if self._is_simple_branch_pair(node):
+                        return self._lower_masked_branch_pair(
+                            node, vectorization_context
                         )
                     return self._lower_index_loop_condition(
                         node, assigned, used_after, vectorization_context
@@ -1190,14 +1202,63 @@ class _ConditionalLowering:
         vectorization_context: dict | None,
     ) -> ast.AST | list[ast.AST]:
         """
-        Public entry point. See :meth:`_lower_masked_branch_pair_impl` for
-        the full algorithm; this wrapper just flattens its
-        ``(preamble, final_assigns)`` result into the ``ast.AST |
-        list[ast.AST]`` shape the rest of the lowering pass expects.
+        Lower a conditional branch pair into vectorized JAX operations.
+
+        This is the public entry point for lowering ``if``/``else`` and
+        ``if``/``elif``/``else`` chains whose branches contain compatible
+        assignments. The underlying transformation is performed by
+        :meth:`_lower_masked_branch_pair_impl`, which converts conditional
+        assignments into ``jnp.where``-based expressions and array updates.
+
+        The implementation may produce supporting statements, such as mask
+        assignments, temporary reads, or broadcast-related assignments, in
+        addition to the final transformed assignments. This wrapper flattens
+        those results into the form expected by the surrounding AST lowering
+        pass.
+
+        Parameters
+        ----------
+        node : ast.If
+            The conditional AST node to lower. The node may represent either a
+            terminal ``if``/``else`` pair or the head of an ``if``/``elif``/``else``
+            chain.
+        vectorization_context : dict or None
+            The active vectorization context. When provided, it supplies
+            information such as vectorization axes and loop metadata used to
+            broadcast values and construct appropriately shaped masks. If
+            ``None``, the conditional is lowered without an active
+            vectorization scope.
+
+        Returns
+        -------
+        ast.AST or list of ast.AST
+            The lowered AST statements. A single resulting statement is
+            returned directly; multiple statements are returned as a list.
+            Supporting statements are placed before the final transformed
+            assignments.
+
+        Raises
+        ------
+        NotImplementedError
+            If the conditional contains a supported-looking case that the
+            masked-branch lowering implementation cannot represent, such as
+            incompatible indexed operations that require unsupported index
+            merging.
+        Exception
+            Re-raises unexpected exceptions after logging the failure.
+
+        Notes
+        -----
+        The detailed transformation logic, including handling of plain-name
+        assignments, indexed array updates, ``elif`` chains, broadcasting,
+        masks, and differing array update operations, is implemented by
+        :meth:`_lower_masked_branch_pair_impl`.
         """
         try:
             preamble, final_assigns = self._lower_masked_branch_pair_impl(
-                node, vectorization_context
+                node,
+                vectorization_context,
+                old_val_cache=None,
             )
             result = preamble + final_assigns
             return result if len(result) > 1 else result[0]
@@ -1211,6 +1272,7 @@ class _ConditionalLowering:
         self,
         node: ast.If,
         vectorization_context: dict | None,
+        old_val_cache: dict | None = None,
     ) -> tuple[list[ast.AST], list[ast.Assign]]:
         """
         Lower an ``if``/``else`` (or ``if``/``elif``/.../``else``) chain
@@ -1287,16 +1349,19 @@ class _ConditionalLowering:
         preamble: list[ast.AST] = []
         final_assigns: list[ast.Assign] = []
 
+        if old_val_cache is None:
+            old_val_cache = {}  # only the top-level call starts a fresh cache
+
         # If this node is the head of an elif chain, collapse the rest of
         # the chain (everything in node.orelse[0]) first, by recursing.
         # Crucially: only the recursive call's `final_assigns` become this
-        # level's `orelse` -- its `preamble` (mask assigns, old_val reads,
+        # level's `orelse`, its `preamble` (mask assigns, old_val reads,
         # ...) is carried through untouched and must NOT be mistaken for
         # part of the orelse, since it consists of ast.Assign nodes too.
         already_lowered_orelse = False
         if len(node.orelse) == 1 and isinstance(node.orelse[0], ast.If):
             nested_preamble, nested_final = self._lower_masked_branch_pair_impl(
-                node.orelse[0], vectorization_context
+                node.orelse[0], vectorization_context, old_val_cache=old_val_cache
             )
             preamble.extend(nested_preamble)
             node = ast.copy_location(
@@ -1307,6 +1372,10 @@ class _ConditionalLowering:
 
         assigns_true = [stmt for stmt in node.body if isinstance(stmt, ast.Assign)]
         assigns_false = [stmt for stmt in node.orelse if isinstance(stmt, ast.Assign)]
+
+        visited_test = None  # cache: self.visit(node.test), computed once
+        mask_name = None  # cache: the _mask_N name backing that test
+        mask_rank = None  # cache: its rank
 
         for stmt_true, stmt_false in zip(assigns_true, assigns_false):
             target_true = stmt_true.targets[0]
@@ -1409,6 +1478,14 @@ class _ConditionalLowering:
                 target_slice = target_true.slice
                 target_rank = self._target_rank(target_slice)
 
+                arr_name = None
+                if isinstance(target_true.value, ast.Name):
+                    arr_name = target_true.value.id
+                elif isinstance(target_true.value, ast.Attribute):
+                    arr_name = target_true.value.attr
+                else:
+                    arr_name = None
+
                 true_args, false_args = None, None
                 if isinstance(stmt_true.value, ast.Call):
                     true_args = stmt_true.value.args[0]
@@ -1426,15 +1503,18 @@ class _ConditionalLowering:
                     vectorization_context if vectorization_context else {},
                 )
 
-                mask_name = f"_mask_{self._mask_counter}"
-                self._mask_counter += 1
-                node.test = self.visit(node.test)
-                mask_assign = ast.Assign(
-                    targets=[ast.Name(id=mask_name, ctx=ast.Store())],
-                    value=node.test,
-                )
-                mask_assign = self._boolean_mask(mask_assign)
-                preamble.append(mask_assign)
+                if mask_name is None:
+                    if visited_test is None:
+                        visited_test = self.visit(node.test)
+                    node.test = visited_test
+                    mask_name = f"_mask_{self._mask_counter}"
+                    self._mask_counter += 1
+                    mask_assign = ast.Assign(
+                        targets=[ast.Name(id=mask_name, ctx=ast.Store())],
+                        value=visited_test,
+                    )
+                    mask_assign = self._boolean_mask(mask_assign)
+                    preamble.append(mask_assign)
 
                 if true_elts_list and false_elts_list:
                     raise NotImplementedError(
@@ -1511,18 +1591,36 @@ class _ConditionalLowering:
                     )
                     new_assign = ast.Assign(targets=[stmt_true.targets[0]], value=value)
                 else:
+                    # NOTE: branches use different array ops (e.g. multiply vs set), so
+                    # they can't share a single .at[...].<op>(...) call. Read the
+                    # pre-update value once via old_val, reconstruct each branch's
+                    # operation as an explicit BinOp, merge with jnp.where, and force
+                    # the final write to .set(), the only op that can represent both
+                    # outcomes uniformly.
                     if operation_true is None or operation_false is None:
                         raise NotImplementedError(
                             "Both branch assignments must use an attribute-call array "
                             "operation (e.g. .add/.set) when operations differ."
                         )
-                    target_stmt = self.visit_Subscript(target_true)
-                    target_stmt.ctx = ast.Load()
-                    old_val_name = ast.Name(id="old_val", ctx=ast.Load())
-                    old_val = ast.Assign(
-                        targets=[ast.Name(id="old_val", ctx=ast.Store())],
-                        value=target_stmt,
-                    )
+
+                    if arr_name is not None and arr_name in old_val_cache:
+                        old_val_name = old_val_cache[arr_name]
+                    else:
+                        target_stmt = self.visit_Subscript(target_true)
+                        target_stmt.ctx = ast.Load()
+                        old_val_id = (
+                            f"old_val_{arr_name}"
+                            if arr_name
+                            else f"old_val_{self._mask_counter}"
+                        )
+                        old_val_name = ast.Name(id=old_val_id, ctx=ast.Load())
+                        old_val = ast.Assign(
+                            targets=[ast.Name(id=old_val_id, ctx=ast.Store())],
+                            value=target_stmt,
+                        )
+                        preamble.append(old_val)
+                        if arr_name is not None:
+                            old_val_cache[arr_name] = old_val_name
 
                     ops = {
                         "add": ast.Add,
@@ -1570,12 +1668,58 @@ class _ConditionalLowering:
                         func=stmt_true.value.func, args=[jnp_call], keywords=[]
                     )
                     new_assign = ast.Assign(targets=[stmt_true.targets[0]], value=value)
-                    preamble.append(old_val)
 
             new_assign = ast.fix_missing_locations(new_assign)
             final_assigns.append(new_assign)
 
         return preamble, final_assigns
+
+    def _is_simple_branch_pair(self, node: ast.If) -> bool:
+        """
+        Check whether a conditional has a supported simple branch structure.
+
+        A simple branch pair consists of assignment-only statements in both
+        branches, with corresponding targets in the same order. An ``elif``
+        chain is also supported, provided that each nested conditional
+        independently satisfies the same structural requirements.
+
+        Parameters
+        ----------
+        node : ast.If
+            The conditional AST node to validate.
+
+        Returns
+        -------
+        bool
+            ``True`` if the conditional has a supported branch structure;
+            otherwise, ``False``.
+
+        Notes
+        -----
+        Each branch must contain only :class:`ast.Assign` statements. A branch
+        must not assign to the same target more than once, and the targets in
+        the terminal branches must match positionally. For an ``elif`` chain,
+        the nested conditional is validated recursively.
+        """
+        body_ok = all(isinstance(s, ast.Assign) for s in node.body)
+        orelse_ok = node.orelse and (
+            all(isinstance(s, ast.Assign) for s in node.orelse)
+            or (len(node.orelse) == 1 and isinstance(node.orelse[0], ast.If))
+        )
+        if not (body_ok and orelse_ok):
+            return False
+
+        targets_true = [ast.dump(s.targets[0]) for s in node.body]
+        if len(set(targets_true)) != len(targets_true):
+            return False  # same target assigned twice in one branch
+
+        if len(node.orelse) == 1 and isinstance(node.orelse[0], ast.If):
+            # elif-chain: this level's shape is fine, but the tail must
+            # independently satisfy the same property before we trust it.
+            return self._is_simple_branch_pair(node.orelse[0])
+
+        targets_false = [ast.dump(s.targets[0]) for s in node.orelse]
+        return targets_true == targets_false
 
     def _lower_vector_condition(
         self,

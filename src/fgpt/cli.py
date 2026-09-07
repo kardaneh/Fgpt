@@ -251,7 +251,7 @@ def main():
 
     args = parser.parse_args()
 
-    if args.openacc:
+    if args.command == "isolate" and args.openacc:
         raise RuntimeError(
             "FGPT Fortran GPU porting via OpenACC is not available in the public version.\n"
             "Contact Kazem Ardaneh (kardaneh@ipsl.fr) for more information about "

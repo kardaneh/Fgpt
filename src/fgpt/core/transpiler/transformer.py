@@ -36,6 +36,7 @@ from fgpt.core.common.utils import (
     ReplaceGlobals,
     ast_walk,
     attach_instance,
+    dtype_attr,
     find_folder,
     find_used_globals,
     get_instance_name,
@@ -1359,6 +1360,7 @@ class Transformer:
         self,
         function_def: ast.FunctionDef,
         cls_info: dict,
+        call_site_preadjustment: dict,
         subroutine_key: str | None = None,
         main_file_attributes: list | None = None,
     ) -> None:
@@ -1395,6 +1397,9 @@ class Transformer:
         main_file_attributes : list, optional
             Attribute names defined at the main-file level, excluded from
             scalar return consideration.
+        call_site_preadjustment : dict
+            Preadjustment information computed for procedure call sites and
+            used when correcting procedure arguments and array indices.
         """
 
         try:
@@ -1439,6 +1444,7 @@ class Transformer:
                 scalar_variables,
                 module_name,
                 instance_name,
+                call_site_preadjustment,
             )
 
             # 5. Insert return
@@ -1576,7 +1582,7 @@ class Transformer:
 
             method = cls_info[module_name][instance_name]["methods"].get(func_name)
 
-            new_args = self._resolve_call_arguments(func_name, call_indices, method)
+            new_args, _ = self._resolve_call_arguments(func_name, call_indices, method)
             if new_args:
                 node.args = new_args
 
@@ -1649,7 +1655,7 @@ class Transformer:
                     self.f2np.handle_expr(actual_args_list[i].children[idx])
                     for idx in indexes
                 ]
-                return args
+                return args, [actual_args_list[i].children[idx] for idx in indexes]
             else:
                 # Fall back to another parsing route which usually means
                 # we are in the case of Functions
@@ -1688,12 +1694,12 @@ class Transformer:
                             f"Skipping missing actual argument at index {idx} for {func_name}: "
                             f"{len(actual_args_list.children)} actual args found."
                         )
-                return args
+                return args, [actual_args_list.children[idx] for idx in indexes]
         except (IndexError, KeyError) as e:
             self.logger.error(
                 f"Error mapping arguments for expr to '{func_name}' at index {i}:", e
             )
-            return []
+            return [], []
         except AssertionError as e:
             self.logger.error(
                 "if the actual-argument count for a \
@@ -1756,7 +1762,7 @@ class Transformer:
         if not method:
             return return_list, scalar_variables
 
-        scalars = [s.string for s in self.extractor.scalar_variables[func_name]]
+        scalars = [s.tostr() for s in self.extractor.scalar_variables[func_name]]
 
         for arg in method.args.args:
             if arg.arg in scalars and arg.arg not in main_file_attributes:
@@ -1771,7 +1777,7 @@ class Transformer:
                     if var.tostr() in ["OUT", "INOUT"]
                 ]
             ):
-                name = walk(walk(variables, F23.Entity_Decl), F23.Name)[0].string
+                name = walk(walk(variables, F23.Entity_Decl), F23.Name)[0].tostr()
                 variables_output.append(name)
 
         # Retreive the output variables that might be modified
@@ -1803,6 +1809,7 @@ class Transformer:
         scalar_variables: list,
         module_name: str,
         instance_name: str,
+        call_site_preadjustment: dict,
     ) -> None:
         """
         Apply Fortran-to-Python array index correction to a function body
@@ -1828,8 +1835,24 @@ class Transformer:
             Owning module name.
         instance_name : str
             Owning instance name.
+        call_site_preadjustment : dict
+            Preadjustment information computed for procedure call sites and
+            used when correcting procedure arguments and array indices.
         """
         cons_var = self._collect_loop_variables(function_def, subroutine_key)
+        arg_names = [
+            a.arg
+            for a in function_def.args.args
+            if a.arg not in ("self", instance_name)
+        ]
+        per_param = call_site_preadjustment.get(function_def.name, {})
+        scalar_variables = set(scalar_variables)
+        for name in list(scalar_variables):
+            if name not in arg_names:
+                continue
+            position = arg_names.index(name)
+            if not per_param.get(position, False):
+                scalar_variables.discard(name)
 
         kwargs = {"exclude_index": scalar_variables} if scalar_variables else {}
 
@@ -2050,7 +2073,7 @@ class Transformer:
             for read_dec in combined:
                 read_stmt = walk(read_dec, F23.Input_Item_List)
                 for item in read_stmt:
-                    self.variable_order.append(item.children[0].string)
+                    self.variable_order.append(item.children[0].tostr())
         except Exception:
             self.logger.exception("Exception in retrieve_variable_order")
             raise
@@ -2103,13 +2126,19 @@ class Transformer:
                 declarations = self._preprocess_declarations(declarations)
 
                 for node in walk(
-                    declarations, (F23.Type_Declaration_Stmt, F23.Use_Stmt)
+                    declarations,
+                    (F23.Type_Declaration_Stmt, F23.Use_Stmt, F23.Derived_Type_Def),
                 ):
                     if isinstance(node, F23.Use_Stmt):
                         ast_nodes.extend(self._handle_use_stmt(node))
 
                     elif isinstance(node, F23.Type_Declaration_Stmt):
                         ast_nodes.extend(self._handle_type_decl(node, cls_mode))
+
+                    elif isinstance(node, F23.Derived_Type_Def):
+                        ast_nodes.append(
+                            self.f2np.build_dataclass_from_derived_type(node)
+                        )
 
             if fix_loc:
                 ast_nodes = [ast.fix_missing_locations(n) for n in ast_nodes]
@@ -2216,11 +2245,11 @@ class Transformer:
             names = self._extract_use_names(only_stmt)
             if not names:
                 return []
-            return [ast.ImportFrom(module=module_name.string, names=names, level=0)]
+            return [ast.ImportFrom(module=module_name.tostr(), names=names, level=0)]
 
         return [
             ast.ImportFrom(
-                module=module_name.string, names=[ast.alias(name="*")], level=0
+                module=module_name.tostr(), names=[ast.alias(name="*")], level=0
             )
         ]
 
@@ -2249,15 +2278,15 @@ class Transformer:
 
         for el in only_stmt.children:
             if isinstance(el, F23.Name):
-                if el.string in self.extractor.allowed_external_subroutines:
+                if el.tostr() in self.extractor.allowed_external_subroutines:
                     continue
-                names.append(ast.alias(name=el.string))
+                names.append(ast.alias(name=el.tostr()))
 
             elif isinstance(el, F23.Rename):
                 _, name, asname = el.children
-                if name.string in self.extractor.allowed_external_subroutines:
+                if name.tostr() in self.extractor.allowed_external_subroutines:
                     continue
-                names.append(ast.alias(name=name.string, asname=asname.string))
+                names.append(ast.alias(name=name.tostr(), asname=asname.tostr()))
 
         return names
 
@@ -2288,7 +2317,7 @@ class Transformer:
         intrinsic_type_spec, _, entity_decl_list = node.children
 
         dtype = self._get_dtype(intrinsic_type_spec)
-        attr_specs = [p.string for p in walk(node, F23.Attr_Spec)]
+        attr_specs = [p.tostr() for p in walk(node, F23.Attr_Spec)]
         has_dimension = self._is_array_declaration(node)
         has_kind = any(walk(node, F23.Kind_Selector))
 
@@ -2340,7 +2369,7 @@ class Transformer:
         ast.Attribute or ast.Name
             The store-context target node.
         """
-        var_name = entity.children[0].string
+        var_name = entity.children[0].tostr()
 
         if cls_mode:
             return ast.Attribute(
@@ -2395,7 +2424,7 @@ class Transformer:
         ast.Call
             The constructor call.
         """
-        return ast.Call(func=self._dtype_attr(dtype=dtype), args=[value], keywords=[])
+        return ast.Call(func=dtype_attr(dtype=dtype), args=[value], keywords=[])
 
     def _assign(self, target: ast.AST, value: ast.AST) -> ast.Assign:
         """
@@ -2555,7 +2584,7 @@ class Transformer:
                     ctx=ast.Load(),
                 ),
                 args=[ast.Tuple(elts=shape, ctx=ast.Load())],
-                keywords=[ast.keyword(arg="dtype", value=self._dtype_attr(dtype))],
+                keywords=[ast.keyword(arg="dtype", value=dtype_attr(dtype))],
             ),
         )
 
@@ -2602,7 +2631,7 @@ class Transformer:
         """
         if intrinsic.children[0] == "LOGICAL" and not has_kind:
             val = False
-            if value and value.string.upper() == ".TRUE.":
+            if value and value.tostr().upper() == ".TRUE.":
                 val = True
             return self._assign(target, self._dtype_call(dtype, ast.Constant(val)))
 
@@ -2650,29 +2679,7 @@ class Transformer:
                 value=ast.Name(id="np", ctx=ast.Load()), attr="array", ctx=ast.Load()
             ),
             args=[elements],
-            keywords=[ast.keyword(arg="dtype", value=self._dtype_attr(dtype))],
-        )
-
-    def _dtype_attr(self, dtype: tuple[str, str]) -> ast.Attribute:
-        """
-        Build the AST node for a NumPy dtype reference, e.g. ``np.float64``.
-
-        Used throughout this class and :class:`F2NP` wherever a ``dtype=``
-        keyword value is needed.
-
-        Parameters
-        ----------
-        dtype : tuple[str, str]
-            ``(module, attribute)`` pair.
-
-        Returns
-        -------
-        ast.Attribute
-            The dtype reference expression.
-        """
-        mod, attr = dtype
-        return ast.Attribute(
-            value=ast.Name(id=mod, ctx=ast.Load()), attr=attr, ctx=ast.Load()
+            keywords=[ast.keyword(arg="dtype", value=dtype_attr(dtype))],
         )
 
     def _extract_array_elements(self, value: Any) -> list:
@@ -2871,7 +2878,7 @@ class Transformer:
             decl = self._preprocess_declarations(decl)
 
             for entity in walk(decl, F23.Entity_Decl):
-                name = entity.children[0].string
+                name = entity.children[0].tostr()
                 _, _, _, init = entity.children
 
                 table[name] = {"initialized": init is not None}
@@ -2895,7 +2902,7 @@ class Transformer:
             The declared name (string).
         """
         entity = walk(decl, F23.Entity_Decl)[0]
-        return entity.children[0].string
+        return entity.children[0].tostr()
 
     def _extract_bounds(self, decl: Any) -> list:
         """
@@ -2953,7 +2960,7 @@ class Transformer:
             names = walk(b, F23.Name)
 
             for name_node in names:
-                name = name_node.string
+                name = name_node.tostr()
 
                 if name in self.pre_init:
                     continue
@@ -3782,7 +3789,7 @@ class Transformer:
         Declarations containing initialization expressions, dimension
         attributes, or explicit shape specifications are excluded.
         """
-        var = walk(dec_statement, F23.Entity_Decl)[0].string
+        var = walk(dec_statement, F23.Entity_Decl)[0].tostr()
         init_spec = any(walk(dec_statement, F23.Initialization))
         alloc_spec = any(walk(dec_statement, F23.Dimension_Attr_Spec))
         explicit_shape = any(walk(dec_statement, F23.Explicit_Shape_Spec))
@@ -3973,7 +3980,7 @@ class Transformer:
                 attr=read_type,
                 ctx=ast.Load(),
             ),
-            args=[self._dtype_attr(("np", attr_type))],
+            args=[dtype_attr(("np", attr_type))],
             keywords=[],
         )
 
@@ -3985,7 +3992,7 @@ class Transformer:
             return ast.Assign(
                 targets=[target],
                 value=ast.Call(
-                    func=self._dtype_attr(("np", "bool")),
+                    func=dtype_attr(("np", "bool")),
                     args=[ast.Subscript(read_call, ast.Constant(0), ctx=ast.Load())],
                     keywords=[],
                 ),
@@ -4027,7 +4034,7 @@ class Transformer:
                 attr=read_type,
                 ctx=ast.Load(),
             ),
-            args=[self._dtype_attr(("np", attr_type))],
+            args=[dtype_attr(("np", attr_type))],
             keywords=[],
         )
 
@@ -4348,7 +4355,14 @@ class Transformer:
                         self.insert_at(None, node, code_tree, method_name=method_name)
 
             else:
-                ordered_vars = order_assignments(assign_nodes, None)
+                # NOTE: SINCE the depedant variables, have variables that depend on a depdenant that
+                # is still need to be intialized thus only the dependant needs to be set and init
+                dependant = set(self.dependant_variables.keys())
+                new_vars = all_names - dependant
+
+                ordered_vars = order_assignments(
+                    assign_nodes, new_vars if new_vars else None
+                )
 
                 for var in ordered_vars:
                     node = name_to_node.get(var)
@@ -4746,17 +4760,25 @@ ffile = FortranFile(path, 'r')
 
             assign_nodes = []
             procedure_nodes = []
+            class_nodes = []
 
             for node in ast_nodes:
                 if isinstance(node, ast.Import | ast.ImportFrom):
                     procedure_nodes.append(node)
                 elif isinstance(node, ast.Assign):
                     assign_nodes.append(node)
+                elif isinstance(node, ast.ClassDef):
+                    class_nodes.append(node)
 
             # If the procedures are present then that we add them to the template
             if procedure_nodes:
                 for procedure_node in procedure_nodes:
                     self.insert_at(None, procedure_node, class_tree)
+
+            # Derived types are placed as
+            if class_nodes:
+                for class_node in class_nodes:
+                    self.insert_at(None, class_node, class_tree)
 
             self.separate_scalar(subroutine_key=subroutine_key)
 
@@ -5038,18 +5060,31 @@ ffile = FortranFile(path, 'r')
                 func.name: idx for idx, func in enumerate(all_child_subroutines)
             }
             main_file_attributes = [
-                names.string
+                names.tostr()
                 for names in walk(
                     walk(self.extractor.var_dummy[subroutine_key], F23.Entity_Decl),
                     F23.Name,
                 )
             ]
+            # Determine the primary class instance and compute call-site
+            # preadjustment information before transforming the procedures.
+            module_name, instance_name, _ = self._get_primary_instance(cls_info)
+            call_site_preadjustment = self._compute_call_site_preadjustment(
+                cls_info,
+                module_name,
+                instance_name,
+                copy.deepcopy(all_child_subroutines),
+                subroutine_to_stack_index,
+            )
+            # print(f'call_site_preadjustement: {call_site_preadjustment}')
+
             self._process_procedures(
                 subroutine_key=subroutine_key,
                 subroutine_to_stack_index=subroutine_to_stack_index,
                 module_stacks=all_child_subroutines,
                 cls_info=cls_info,
                 main_file_attributes=main_file_attributes,
+                call_site_preadjustment=call_site_preadjustment,
             )
 
             # Step 10: Ensure all methods have `self`
@@ -5067,6 +5102,299 @@ ffile = FortranFile(path, 'r')
         except Exception as e:
             self.logger.exception("Error in update_global_python method", e)
             return None
+
+    def retrieve_call_function_args(
+        self,
+        function_def: ast.FunctionDef,
+        all_child_subroutines: list,
+        subroutine_key: str,
+        subroutine_to_stack_index: dict,
+    ) -> dict[str, list]:
+        """
+        Retrieve the actual arguments passed at each call site in a procedure.
+
+        The function walks the procedure AST, identifies calls to known
+        subroutines, and resolves the arguments for each call occurrence.
+        Arguments are grouped by callee name and preserved in call-site order.
+
+        Parameters
+        ----------
+        function_def : ast.FunctionDef
+            AST node representing the procedure whose call sites are inspected.
+        all_child_subroutines : list
+            AST nodes for the procedures available in the current procedure
+            hierarchy.
+        subroutine_key : str
+            Identifier of the procedure being inspected.
+        subroutine_to_stack_index : dict
+            Mapping from subroutine names to their corresponding indices in
+            ``all_child_subroutines``.
+
+        Returns
+        -------
+        dict[str, list]
+            Mapping from each called subroutine name to a list of resolved
+            argument lists, with one entry for each call occurrence in the
+            order in which the calls appear in the AST.
+        """
+        call_indices = defaultdict(int)
+        actual_args_list = defaultdict(list)
+        for node in ast_walk(function_def, ast.Call):
+            if not isinstance(node.func, ast.Name):
+                continue
+            func_name = node.func.id
+            if func_name not in self.extractor.call_within_sub[subroutine_key]:
+                continue
+            index = subroutine_to_stack_index.get(func_name)
+            method = all_child_subroutines[index]
+            # self._fix_function_arguments(method, instance_name, global_attr, instance_data)
+            _, actual_args = self._resolve_call_arguments(
+                func_name, call_indices, method
+            )
+            actual_args_list[func_name].append(actual_args)
+        return dict(actual_args_list)
+
+    def _topological_order_parents_first(self, methods: dict) -> list:
+        """
+        Return procedure names in parent-before-child dependency order.
+
+        A procedure appears before any procedure it calls within the supplied
+        procedure set. Root or entry procedures are therefore visited first,
+        followed by their descendants. Procedures that are not reachable from
+        any root are appended afterward so that every procedure in ``methods``
+        is included.
+
+        Parameters
+        ----------
+        methods : dict
+            Mapping of procedure names to their corresponding procedure
+            metadata or definitions. Only the keys are used to construct the
+            ordering.
+
+        Returns
+        -------
+        list
+            Procedure names ordered so that callers precede their callees.
+
+        Notes
+        -----
+        The ordering is based on the call graph stored in
+        ``self.extractor.call_within_sub``. ``__init__`` and
+        ``declaration_initialization`` are excluded from the traversal.
+        Cycles are guarded against during traversal, although the expected
+        procedure call graph is acyclic.
+        """
+        visited = set()
+        order = []
+
+        def visit(name, stack):
+            if name in ["__init__", "declaration_initialization"]:
+                return
+            if name in visited or name not in methods:
+                return
+            if name in stack:
+                return  # cycle guard; Fortran call graphs are acyclic here
+            stack.append(name)
+            order.append(name)
+            visited.add(name)
+            for child in self.extractor.call_within_sub.get(name, []):
+                visit(child, stack)
+            stack.pop()
+
+        called = {
+            child
+            for caller in methods
+            for child in self.extractor.call_within_sub.get(caller, [])
+        }
+        roots = [k for k in methods if k not in called]
+        for root in roots:
+            visit(root, [])
+        # Anything left over (unreachable/unused methods) appended at the end,
+        # so nothing is silently skipped.
+        for k in methods:
+            visit(k, [])
+
+        return order
+
+    def _compute_call_site_preadjustment(
+        self,
+        cls_info: dict,
+        module_name: str,
+        instance_name: str,
+        all_child_subroutines: list,
+        subroutine_to_stack_index: dict,
+    ) -> dict[str, dict[int, bool]]:
+        """
+        Compute preadjustment state propagated through procedure call sites.
+
+        The procedure call graph is processed in two dependency directions.
+        First, called procedures are processed from leaves toward their
+        callers so that their arguments can be correctly remapped. The
+        resulting procedure definitions are then scanned from parents toward
+        children to determine whether actual call arguments are currently
+        preadjusted. This information is propagated from caller argument
+        positions to the corresponding callee formal parameters.
+
+        Parameters
+        ----------
+        cls_info : dict
+            Class and instance metadata used to resolve procedure attributes,
+            arguments, and array information.
+        module_name : str
+            Name of the module containing the primary instance.
+        instance_name : str
+            Name of the primary class instance used when correcting procedure
+            arguments.
+        all_child_subroutines : list
+            AST nodes for the current procedure and its descendant procedures.
+            The nodes are updated in place during the initial argument
+            correction pass.
+        subroutine_to_stack_index : dict
+            Mapping from subroutine names to their corresponding indices in
+            ``all_child_subroutines``.
+
+        Returns
+        -------
+        dict[str, dict[int, bool]]
+            Mapping from callee names to per-parameter preadjustment states.
+            The inner dictionary maps a callee parameter position to ``True``
+            or ``False``, indicating whether that parameter is guaranteed to
+            receive a preadjusted value across the observed call sites.
+
+        Notes
+        -----
+        Preadjustment information is propagated conservatively: a parameter
+        is considered preadjusted only when the corresponding argument is
+        preadjusted at every observed call site.
+
+        The initial traversal uses the reverse of the parent-first topological
+        order to resolve and update call arguments before the dataflow pass.
+        The subsequent traversal uses the parent-first order so that a
+        procedure's inferred parameter state is available when its own body
+        is analyzed.
+        """
+        instance_data = cls_info[module_name][instance_name]
+        methods = instance_data["methods"]
+        global_attr = instance_data["attributes"]
+
+        order = self._topological_order_parents_first(methods)
+        reverse_order = order[::-1]
+        call_indices = defaultdict(int)
+
+        for name in reverse_order:
+            method_index = subroutine_to_stack_index.get(name)
+
+            if method_index is None:
+                continue
+
+            method = all_child_subroutines[method_index]
+
+            if method is None:
+                continue
+
+            self._fix_function_arguments(
+                method,
+                instance_name,
+                global_attr,
+                instance_data,
+            )
+
+            for node in ast_walk(method, ast.Call):
+                if not isinstance(node.func, ast.Name):
+                    continue
+
+                func_name = node.func.id
+
+                if func_name not in self.extractor.call_within_sub[name]:
+                    continue
+
+                child_index = subroutine_to_stack_index.get(func_name)
+
+                if child_index is None:
+                    continue
+
+                child_method = all_child_subroutines[child_index]
+
+                new_args, _ = self._resolve_call_arguments(
+                    func_name,
+                    call_indices,
+                    child_method,
+                )
+
+                if new_args:
+                    node.args = new_args
+
+            all_child_subroutines[method_index] = method
+
+        final_registry: dict[str, dict[int, bool]] = {}
+        # preadjusted_params[func_name] = set of that function's OWN formal
+        # parameter names known, from its own (already-processed) callers, to
+        # always receive a preadjusted value.
+        preadjusted_params: dict[str, set] = defaultdict(set)
+        for caller_key in order:
+            if caller_key in ("__init__", "declaration_initialization"):
+                continue
+            caller_index = subroutine_to_stack_index.get(caller_key)
+            if caller_index is None:
+                continue
+
+            caller_copy = all_child_subroutines[caller_index]
+            if caller_copy is None:
+                continue
+            cons_var = self._collect_loop_variables(caller_copy, caller_key)
+            adjusted = set(search_convar_dependencies(cons_var, caller_copy) or set())
+            adjusted |= preadjusted_params.get(caller_key, set())
+
+            name_state_registry: dict[str, list[dict[str, bool]]] = {}
+            adjuster = AdjustIndices(
+                cons_var,
+                self.extractor.all_array_info.get(caller_key, {}),
+                instance_data,
+                adjusted_vars=adjusted,
+                call_arg_registry=name_state_registry,
+            )
+            for stmt in caller_copy.body:
+                adjuster.visit(stmt)
+
+            # Correctly remapped actual args for this caller's calls.
+            actual_args_by_callee = self.retrieve_call_function_args(
+                caller_copy,
+                all_child_subroutines,
+                caller_key,
+                subroutine_to_stack_index,
+            )
+            for func_name, calls in actual_args_by_callee.items():
+                per_param = final_registry.setdefault(func_name, {})
+                occurrences = name_state_registry.get(func_name, [])
+
+                for occ_idx, actual_args in enumerate(calls):
+                    name_state = (
+                        occurrences[occ_idx] if occ_idx < len(occurrences) else {}
+                    )
+                    for i, arg in enumerate(actual_args):
+                        is_preadj = name_state.get(arg.tostr(), False)
+                        per_param[i] = per_param.get(i, True) and is_preadj
+
+                # Immediately propagate: translate the callee's per-position
+                # verdicts into its own parameter NAMES, so that when the
+                # callee is itself visited later in `order` (guaranteed,
+                # since parents come before children), its local scan is
+                # seeded correctly.
+                index = subroutine_to_stack_index.get(func_name)
+                callee_def = all_child_subroutines[index]
+                if callee_def is not None:
+                    callee_arg_names = [
+                        a.arg
+                        for a in callee_def.args.args
+                        if a.arg not in ("self", instance_name)
+                    ]
+                    for position, is_preadj in per_param.items():
+                        if is_preadj and position < len(callee_arg_names):
+                            preadjusted_params[func_name].add(
+                                callee_arg_names[position]
+                            )
+
+        return final_registry
 
     def collect_descendants_dfs(self, subroutine_key: str) -> list:
         """
@@ -5164,6 +5492,8 @@ ffile = FortranFile(path, 'r')
                     "read ast for main template is None due to prior error"
                 )
 
+            dependent_names = set(self.dependant_variables)
+
             function_def = next(iter(ast_walk(read_ast, ast.FunctionDef)), None)
             if function_def is None:
                 raise ValueError("No FunctionDef found in read_ast")
@@ -5171,7 +5501,8 @@ ffile = FortranFile(path, 'r')
             # Add arguments (dummy variables)
             dummy_list = []
             for name in self.variable_order:
-                function_def.args.args.append(ast.arg(arg=name))
+                if name not in dependent_names:
+                    function_def.args.args.append(ast.arg(arg=name))
                 dummy_list.append(name)
 
             # Prepare scalar + array metadata
@@ -5202,6 +5533,10 @@ ffile = FortranFile(path, 'r')
             arrays_to_add = self._insert_reads_in_order(
                 read_ast, function_def, scalar_read_nodes, assign_map, seen, var_pos
             )
+
+            read_body = self.init_dependant_variables(read_ast, assign_nodes)
+            read_ast.body = read_body
+
             # Update loop iteration variables
             self._update_for_loop(read_ast, dummy_list, arrays_to_add)
             # Add return statement (if needed)
@@ -5429,7 +5764,10 @@ ffile = FortranFile(path, 'r')
 
         return_node = ast.Return()
 
-        values = [ast.Name(id=s, ctx=ast.Load()) for s in self.scalar]
+        values = [
+            ast.Name(id=s, ctx=ast.Load())
+            for s in self.scalar + list(self.dependant_variables.keys())
+        ]
 
         if len(values) == 1:
             return_node.value = values[0]
@@ -5534,6 +5872,8 @@ ffile = FortranFile(path, 'r')
             )
             if ast_nodes is None:
                 raise ValueError("Ast_nodes is None")
+
+            self.search_dependant_variables(declaration_stmts=declaration_stmts)
 
             assign_nodes = []
             procedure_nodes = []
@@ -5649,6 +5989,7 @@ ffile = FortranFile(path, 'r')
         module_stacks: list,
         cls_info: dict,
         main_file_attributes: list,
+        call_site_preadjustment: dict,
     ) -> None:
         """
         Recursively process and correct procedure subroutines in dependency order.
@@ -5667,6 +6008,9 @@ ffile = FortranFile(path, 'r')
             Class/instance metadata used for resolving references and corrections.
         main_file_attributes : list
             List of attributes available in the main file for dependency resolution.
+        call_site_preadjustment : dict
+            Preadjustment information computed for procedure call sites and
+            used when correcting procedure arguments and array indices.
 
         """
         # First, process all sub-subroutines if any
@@ -5677,6 +6021,7 @@ ffile = FortranFile(path, 'r')
                 module_stacks,
                 cls_info,
                 main_file_attributes,
+                call_site_preadjustment,
             )  # recurse for nested calls
 
         # Then process the current subroutine
@@ -5684,6 +6029,7 @@ ffile = FortranFile(path, 'r')
         self.correct_function(
             module_stacks[module_stack_index],
             cls_info,
+            call_site_preadjustment,
             subroutine_key,
             main_file_attributes=main_file_attributes,
         )

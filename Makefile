@@ -9,7 +9,7 @@
 # -----------------------------
 # Environment
 # -----------------------------
-WORK = /scratchu/kardaneh/tmp
+WORK = /data/ssivanes
 FC_NVIDIA = mpif90
 CC        = mpicc
 
@@ -76,7 +76,7 @@ TAPENADE_FILES = $(TAPENADE_ADJOINT_FILES) $(TAPENADE_TANGENT_FILES)
 
 ifneq ($(TAPENADE_FILES),)
   $(info Tapenade files detected (adjoint: $(notdir $(TAPENADE_ADJOINT_FILES)), tangent: $(notdir $(TAPENADE_TANGENT_FILES))) - enabling Tapenade runtime)
-  TAPENADE_HOME = /home/kardaneh/tapenade/tapenade_3.16
+  TAPENADE_HOME = /data/kardaneh/tapenade/tapenade_3.16
   TAPENADE_LIB  = $(TAPENADE_HOME)/ADFirstAidKit
   TAPENADE_OBJ = $(OBJ_DIR)/adStack.o
   TAPENADE_SRC = $(TAPENADE_LIB)/adStack.c

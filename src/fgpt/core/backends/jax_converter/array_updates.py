@@ -458,7 +458,8 @@ class _ArrayUpdate:
             a[i] = a[i] - x
             a[i] = a[i] * x
             a[i] = a[i] / x
-            a[i] = (a[i] + b) * c
+            a[i] = (a[i] + b) + c
+            a[i] = (a[i] * b) * c
 
         and converts them into an operation name and update expression suitable
         for translation into JAX's ``array.at[index].<op>()`` API. Assignments
@@ -490,8 +491,21 @@ class _ArrayUpdate:
         - ``a[idx] = a[idx] - x`` -> ``("subtract", x)``
         - ``a[idx] = a[idx] * x`` -> ``("multiply", x)``
         - ``a[idx] = a[idx] / x`` -> ``("divide", x)``
-        - ``a[idx] = (a[idx] + b) * c`` ->
-        ``("add", b * c)``
+        - ``a[idx] = (a[idx] + b) + c`` -> ``("add", b + c)``
+        - ``a[idx] = (a[idx] * b) * c`` -> ``("multiply", b * c)``
+
+        The nested-binop fold is only applied when the inner and outer
+        operators are identical *and* associative (``Add`` or ``Mult``).
+        Folding ``a OP1 b`` then ``OP2 c`` into a single in-place op assumes
+        ``(a OP1 b) OP2 c == a OP1 (b OP2 c)``, which only holds for
+        same-operator, associative cases. It does **not** hold for mixed
+        operators (e.g. ``a[i] = (a[i] / b) ** c``, which is *not*
+        ``a[i] / (b ** c)``) nor for same-operator non-associative cases
+        (e.g. ``a[i] = (a[i] - b) - c``, which is *not* ``a[i] - (b - c)``;
+        likewise for repeated ``/``). All such patterns are deliberately left
+        unfolded and returned as ``("set", node.value)``, preserving the full
+        original expression rather than risking an incorrect algebraic
+        rewrite.
 
         The method verifies that both sides reference the same indexed array
         location before classifying an assignment as an in-place update.
@@ -520,12 +534,12 @@ class _ArrayUpdate:
                 return "set", node.value
 
             rhs = node.value.left
-            # in-place case: a[:] = a + expr
+            # in-place case: a[:] = a + expr  (or self.attr[:] = self.attr + expr)
             same_index = (
-                isinstance(sub.value, ast.Subscript)
+                isinstance(sub, ast.Subscript)
                 and isinstance(rhs, ast.Subscript)
-                and get_name(sub.value) == get_name(rhs)
-                and ast.dump(sub.value.slice) == ast.dump(rhs.slice)
+                and get_name(sub) == get_name(rhs)
+                and ast.dump(sub.slice) == ast.dump(rhs.slice)
             )
             if same_index:
                 operator = ops.get(type(node.value.op))
@@ -549,12 +563,21 @@ class _ArrayUpdate:
                     )
 
                 if inner_name == lhs_name:
-                    operator = ops.get(type(rhs.op))
-                    if operator:
-                        new_binop = ast.BinOp(
-                            left=rhs.right, op=node.value.op, right=node.value.right
-                        )
-                        return operator, new_binop
+                    # Only safe when both operators are the SAME associative op --
+                    # (a+b)+c == a+(b+c) and (a*b)*c == a*(b*c) hold in general;
+                    # mixed operators (e.g. Div then Pow) do NOT distribute this
+                    # way and must not be folded into a single in-place op.
+                    associative_ops = {ast.Add, ast.Mult}
+                    if (
+                        isinstance(rhs.op, type(node.value.op))
+                        and type(rhs.op) in associative_ops
+                    ):
+                        operator = ops.get(type(rhs.op))
+                        if operator:
+                            new_binop = ast.BinOp(
+                                left=rhs.right, op=node.value.op, right=node.value.right
+                            )
+                            return operator, new_binop
 
             return "set", node.value
         except Exception as e:

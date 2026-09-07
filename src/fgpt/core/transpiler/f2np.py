@@ -14,7 +14,13 @@ from fparser.two import Fortran2003 as F23
 from fparser.two.utils import walk
 
 from fgpt.core.common.logger import Logger
-from fgpt.core.common.utils import ast_walk
+from fgpt.core.common.utils import (
+    ast_walk,
+    dtype_attr,
+    dtype_call,
+    is_array_declaration,
+    sanitize_identifier,
+)
 from fgpt.core.frontend.extractor import Extractor
 from fgpt.core.transpiler.intrinsic import (
     intrinsic_signatures,
@@ -673,7 +679,7 @@ class F2NP:
                         pass
 
                     elif isinstance(child, F23.Subroutine_Stmt):
-                        self.func_name = child.items[1].string
+                        self.func_name = child.items[1].tostr()
                         stmt = self.handle_subroutine_stmt(child)
                         if stmt is None:
                             raise ValueError(
@@ -686,7 +692,7 @@ class F2NP:
                             child, F23.Attr_Spec
                         ):
                             if (
-                                walk(walk(child, F23.Entity_Decl), F23.Name)[0].string
+                                walk(walk(child, F23.Entity_Decl), F23.Name)[0].tostr()
                                 not in self.arg_list
                             ):
                                 stmt = self.handle_type_declaration_stmt(child)
@@ -706,16 +712,24 @@ class F2NP:
 
                             module_stack[:] = [func_def]
                             if isinstance(child, F23.End_Function_Stmt):
-                                # Try to check if the element SUFFIX is present or not, which usually means that we have a function and not a subroutine
-                                return_stmt = walk(
+                                # RESULT(name) is optional. When present, the result variable
+                                # is whatever name follows RESULT(...); when absent, the
+                                # function's own name doubles as the implicit result variable
+                                # (assigned to directly in the body, e.g. `foo = ...`).
+                                suffix_names = walk(
                                     walk(child.parent, F23.Suffix), F23.Name
-                                )[0]
-                                return_node = ast.Return()
-                                if return_stmt:
-                                    return_node.value = ast.Name(
-                                        id=return_stmt.string, ctx=ast.Load()
-                                    )
+                                )
+                                result_name = (
+                                    suffix_names[0].tostr()
+                                    if suffix_names
+                                    else self.func_name
+                                )
 
+                                return_node = ast.Return()
+                                if result_name:
+                                    return_node.value = ast.Name(
+                                        id=result_name, ctx=ast.Load()
+                                    )
                                     func_def.body.append(return_node)
                             self.func_name = None
                         else:
@@ -724,7 +738,7 @@ class F2NP:
                             )
 
                     elif isinstance(child, F23.Function_Stmt):
-                        self.func_name = child.items[1].string
+                        self.func_name = child.items[1].tostr()
                         stmt = self.handle_subroutine_stmt(child)
                         if stmt is None:
                             raise ValueError(
@@ -931,7 +945,7 @@ class F2NP:
                 elif isinstance(child, F23.Dummy_Arg_List):
                     # arg_list = child.tostr()
                     for gchild in child.children:
-                        self.arg_list.append(gchild.tostr())
+                        self.arg_list.append(sanitize_identifier(gchild.tostr()))
 
             args = [ast.arg(arg) for arg in self.arg_list]
             function_def = ast.FunctionDef(
@@ -995,7 +1009,7 @@ class F2NP:
                 )
 
             function_node, args_spec_list = stmt.children
-            func_name = function_node.string
+            func_name = function_node.tostr()
 
             extractor = getattr(self, "extractor", None)
 
@@ -1165,6 +1179,27 @@ class F2NP:
                     targets=[ast.Name(id=name, ctx=ast.Store())], value=value
                 )
 
+            if dtype_name is None:  # derived type instance
+                entity = walk(stmt, F23.Entity_Decl)[0]
+                _, _, _, init = entity.children
+
+                if init is not None:
+                    value_node = init.children[1]
+                    value = self.handle_expr(
+                        value_node
+                    )  # -> handle_structure_constructor
+                else:
+                    value = ast.Call(
+                        func=ast.Name(id=dtype_attr, ctx=ast.Load()),
+                        args=[],
+                        keywords=[],
+                    )
+
+                return ast.Assign(
+                    targets=[ast.Name(id=name, ctx=ast.Store())],
+                    value=value,
+                )
+
             # Case 2: Scalar declaration
             return self._handle_scalar_declaration(stmt, dtype_name, dtype_attr)
 
@@ -1241,7 +1276,9 @@ class F2NP:
         str
             The declared variable's name.
         """
-        return walk(walk(stmt, F23.Entity_Decl), F23.Name)[0].string
+        return sanitize_identifier(
+            walk(walk(stmt, F23.Entity_Decl), F23.Name)[0].tostr()
+        )
 
     def _extract_dtype(self, stmt: F23.Base) -> tuple[str, str]:
         """
@@ -1271,14 +1308,31 @@ class F2NP:
         """
         TYPE = {"REAL": "np.float64", "INTEGER": "np.int32", "LOGICAL": "np.bool"}
 
-        fdtype = walk(stmt, F23.Intrinsic_Type_Spec)[0].children[0]
+        intrinsic = walk(stmt, F23.Intrinsic_Type_Spec)
+        if intrinsic:
+            fdtype = intrinsic[0].children[0]
+            np_dtype = TYPE.get(fdtype)
+            if np_dtype is None:
+                raise KeyError(f"Unsupported dtype: {fdtype}")
+            idx, attr = np_dtype.split(".")
+            return idx, attr
 
-        np_dtype = TYPE.get(fdtype)
-        if np_dtype is None:
-            raise KeyError(f"Unsupported dtype: {fdtype}")
+        # Derived type
+        decl_spec = walk(stmt, F23.Declaration_Type_Spec)
+        if decl_spec:
+            # Case 1: wrapped form, e.g. parameterized derived types
+            # Declaration_Type_Spec('TYPE', Derived_Type_Spec(Type_Name('matrix'), ...))
+            derived_spec = walk(decl_spec, F23.Derived_Type_Spec)
+            if derived_spec:
+                name_node = derived_spec[0].children[0]
+                return None, name_node.tostr()
 
-        idx, attr = np_dtype.split(".")
-        return idx, attr
+            # Case 2: flat form, e.g. Declaration_Type_Spec('TYPE', Type_Name('laieff_type'))
+            if decl_spec[0].children[0] == "TYPE":
+                type_name_node = decl_spec[0].children[1]
+                return None, type_name_node.tostr()
+
+        raise KeyError("Unsupported type spec in _extract_dtype")
 
     def _build_array_from_constructor(
         self,
@@ -1322,11 +1376,7 @@ class F2NP:
             keywords=[
                 ast.keyword(
                     arg="dtype",
-                    value=ast.Attribute(
-                        value=ast.Name(id=idx, ctx=ast.Load()),
-                        attr=attr,
-                        ctx=ast.Load(),
-                    ),
+                    value=dtype_attr(dtype=(idx, attr)),
                 )
             ],
         )
@@ -1366,11 +1416,7 @@ class F2NP:
             keywords=[
                 ast.keyword(
                     arg="dtype",
-                    value=ast.Attribute(
-                        value=ast.Name(id=idx, ctx=ast.Load()),
-                        attr=attr,
-                        ctx=ast.Load(),
-                    ),
+                    value=dtype_attr(dtype=(idx, attr)),
                 )
             ],
         )
@@ -1413,7 +1459,7 @@ class F2NP:
         for entity_decl in entity_decl_list.children:
             var_name, _, _, initialization = entity_decl.children
 
-            target = ast.Name(id=var_name.string, ctx=ast.Store())
+            target = ast.Name(id=var_name.tostr(), ctx=ast.Store())
 
             if initialization is None:
                 return None  # or default value if needed
@@ -1426,11 +1472,7 @@ class F2NP:
                 return ast.Assign(
                     targets=[target],
                     value=ast.Call(
-                        func=ast.Attribute(
-                            value=ast.Name(id=idx, ctx=ast.Load()),
-                            attr=attr,
-                            ctx=ast.Load(),
-                        ),
+                        func=dtype_attr(dtype=(idx, attr)),
                         args=[value_ast],
                         keywords=[],
                     ),
@@ -1438,7 +1480,7 @@ class F2NP:
 
             # Logical
             if intrinsic_type_spec.children[0] == "LOGICAL":
-                bool_val = value_node.string.strip(".").upper() == "TRUE"
+                bool_val = value_node.tostr().strip(".").upper() == "TRUE"
 
                 return ast.Assign(
                     targets=[target],
@@ -1709,7 +1751,7 @@ class F2NP:
                 return ast.While(test=loop_expr, body=[], orelse=[])
 
             # Handle DO loops
-            loop_var, start_end_stride_values = elements[0].string, elements[1]
+            loop_var, start_end_stride_values = elements[0].tostr(), elements[1]
             start, end = start_end_stride_values[0], start_end_stride_values[1]
 
             # Adjust start to Python 0-based indexing
@@ -2171,7 +2213,7 @@ class F2NP:
             Re-raises any unexpected error after logging.
         """
         try:
-            intrinsic_name = intrinsic_function_reference.items[0].string.upper()
+            intrinsic_name = intrinsic_function_reference.items[0].tostr().upper()
             pattern = rf"\b{intrinsic_name}\b"
             func_name = self.intrinsic_replacements.get(pattern, None)
             intrinsic_func = None
@@ -2399,7 +2441,7 @@ class F2NP:
         names = walk(part_ref, F23.Name)
         if not names:
             raise ValueError("No name found in part_ref")
-        return names[0].string
+        return names[0].tostr()
 
     def _is_function_call(self, name: str) -> bool:
         """
@@ -2510,19 +2552,11 @@ class F2NP:
             ``('index', value, None, node)`` for plain index dimensions.
         """
         text = dim.tostr()
-        limits = text.split(":")
+        # limits = text.split(":")
 
         # Slice case
         if isinstance(dim, F23.Subscript_Triplet):
-            lb = limits[0].strip() if limits[0] else None
-            ub = limits[1].strip() if len(limits) > 1 else None
-
-            if lb:
-                lb = self.simplify_limits(lb + "-1")
-            if ub:
-                ub = self.simplify_limits(ub)
-
-            return ("slice", lb, ub, dim)
+            return ("slice", dim, None, dim)
 
         # NOTE: Vector subscript case, e.g. A((/1, 3, 5/)) or A([1,3,5]).
         # This is Fortran's "fancy indexing": each element is itself a
@@ -2534,6 +2568,59 @@ class F2NP:
 
         # Index case
         return ("index", text.strip(), None, dim)
+
+    def _stride_literal(self, stride_node: F23.Base | None) -> int | None:
+        if stride_node is None:
+            return 1
+        if isinstance(stride_node, F23.Int_Literal_Constant):
+            return int(stride_node.tostr())
+        if isinstance(stride_node, F23.Level_2_Unary_Expr):
+            op, operand = stride_node.children
+            if op == "-" and isinstance(operand, F23.Int_Literal_Constant):
+                return -int(operand.tostr())
+        return None  # symbolic stride: direction unknown at translation time
+
+    def _build_triplet_slice(self, node: F23.Subscript_Triplet) -> ast.Slice:
+        """
+        Convert a Fortran (lb:ub:stride) triplet into a Python ast.Slice.
+
+        lb is always shifted -1 (1-based -> 0-based); omitted lb -> None.
+
+        ub's treatment depends on stride direction, since Fortran bounds are
+        inclusive on both ends but Python's stop is exclusive:
+        - ascending (stride > 0): ub passed through UNSHIFTED — Fortran's
+            1-based inclusive ub already equals the 0-based exclusive stop.
+        - descending (stride < 0): ub becomes (ub - 2); when literal ub is
+            1, that would be -1, which Python reads as "last element" rather
+            than "before index 0", so that case is special-cased to None
+            (walk all the way to the start).
+        Omitted ub -> None either way.
+
+        stride is carried over unchanged.
+        """
+        lb_node, ub_node, stride_node = node.children
+
+        lower = self.handle_expr(lb_node) if lb_node else None
+        step = self.handle_expr(stride_node) if stride_node is not None else None
+        stride_val = self._stride_literal(stride_node)
+
+        upper = None
+        if ub_node is not None:
+            if stride_val is not None and stride_val < 0:
+                if (
+                    isinstance(ub_node, F23.Int_Literal_Constant)
+                    and int(ub_node.tostr()) == 1
+                ):
+                    upper = None
+                else:
+                    ub_expr = self.handle_expr(ub_node)
+                    upper = ast.BinOp(
+                        left=ub_expr, op=ast.Sub(), right=ast.Constant(value=2)
+                    )
+            else:
+                upper = self.handle_expr(ub_node)
+
+        return ast.Slice(lower=lower, upper=upper, step=step)
 
     def _build_slice_or_index(self, parsed_dim: tuple) -> ast.AST:
         """
@@ -2555,13 +2642,10 @@ class F2NP:
             expression otherwise.
         """
 
-        kind, lb, ub, node = parsed_dim
+        kind, _, _, node = parsed_dim
 
         if kind == "slice":
-            return ast.Slice(
-                lower=self.handle_expr(node.children[0]) if lb else None,
-                upper=self.handle_expr(node.children[1]) if ub else None,
-            )
+            return self._build_triplet_slice(node)
 
         if kind == "vector":
             return self._build_vector_subscript(node)
@@ -2595,7 +2679,7 @@ class F2NP:
         elements = []
         for val in array_list.children:
             if isinstance(val, F23.Int_Literal_Constant):
-                elements.append(ast.Constant(value=int(val.string) - 1))
+                elements.append(ast.Constant(value=int(val.tostr()) - 1))
             elif isinstance(val, F23.Real_Literal_Constant):
                 raise ValueError("Vector subscripts needs to be integers")
             else:
@@ -3103,7 +3187,25 @@ class F2NP:
                 raise ValueError("lhs_ast is None")
             return lhs_ast
 
+        if isinstance(lhs_node, F23.Data_Ref):
+            lhs_ast = self.handle_data_ref(lhs_node)
+            if lhs_ast is None:
+                raise ValueError("lhs_ast is None")
+            self._set_store_ctx(lhs_ast)
+            return lhs_ast
+
         raise TypeError(f"Unsupported LHS node type: {type(lhs_node)}")
+
+    def _set_store_ctx(self, node: ast.AST) -> None:
+        """
+        Flip the outermost node's context from Load to Store. Used when a
+        handle_data_ref result (always built with Load context) is placed
+        on the LHS of an assignment.
+        """
+        if isinstance(node, ast.Attribute | ast.Subscript | ast.Name):
+            node.ctx = ast.Store()
+        else:
+            raise TypeError(f"Cannot assign Store context to node type: {type(node)}")
 
     def _handle_name_lhs(
         self,
@@ -3139,7 +3241,7 @@ class F2NP:
             An ``ast.Subscript`` (full-slice) target if broadcast
             semantics apply, otherwise a plain ``ast.Name`` target.
         """
-        name = lhs_node.string
+        name = sanitize_identifier(lhs_node.tostr())
 
         # Detect case like: a = 1 or a = TRUE where a is actually an array
         if name in func_arrays and isinstance(
@@ -3393,7 +3495,7 @@ class F2NP:
             # Composite expression, which contains tuples of different other expressions
             if isinstance(
                 expr_node.items[0], F23.Intrinsic_Function_Reference
-            ) and expr_node.items[0].items[0].string in ["MINLOC", "MAXLOC"]:
+            ) and expr_node.items[0].items[0].tostr() in ["MINLOC", "MAXLOC"]:
                 return self.handle_expr(expr_node.items[0])
             else:
                 return self._binop_from_items(expr_node.items)
@@ -3417,7 +3519,7 @@ class F2NP:
                 )
 
         elif isinstance(expr_node, F23.Int_Literal_Constant):
-            return ast.Constant(value=int(expr_node.string))
+            return ast.Constant(value=int(expr_node.tostr()))
 
         elif isinstance(expr_node, F23.Level_2_Unary_Expr):
             op_token, operand_node = expr_node.children
@@ -3442,7 +3544,7 @@ class F2NP:
             return self.handle_expr(expr_node.items[1])
 
         elif isinstance(expr_node, F23.Name):
-            return ast.Name(id=expr_node.string, ctx=ast.Load())
+            return ast.Name(id=sanitize_identifier(expr_node.tostr()), ctx=ast.Load())
 
         elif isinstance(expr_node, F23.Mult_Operand):
             return self._binop_from_items(expr_node.items)
@@ -3470,7 +3572,7 @@ class F2NP:
             )
 
         elif isinstance(expr_node, F23.Char_Literal_Constant):
-            expr_node = expr_node.string.strip(" ' ").strip('"')
+            expr_node = expr_node.tostr().strip(" ' ").strip('"')
             return ast.Constant(value=expr_node)
 
         elif isinstance(expr_node, F23.Actual_Arg_Spec):
@@ -3481,7 +3583,7 @@ class F2NP:
                     raise NotImplementedError(
                         f"Unsupported arg name node: {type(name_node)}"
                     )
-                arg_name = name_node.string.lower()
+                arg_name = name_node.tostr().lower()
                 value_ast = self.handle_expr(value_node)
 
                 return ast.keyword(arg=arg_name, value=value_ast)
@@ -3500,46 +3602,7 @@ class F2NP:
             return self.handle_call_stmt(expr_node)
 
         elif isinstance(expr_node, F23.Subscript_Triplet):
-            shape = []
-            limits = expr_node.tostr().split(":")
-            lb = limits[0]
-            if len(limits) > 1:
-                ub = limits[1]
-                if lb:
-                    lb = lb + "-1"
-                lb = self.simplify_limits(lb)
-                ub = self.simplify_limits(ub)
-
-                shape.append((f"{lb}:{ub}", expr_node))
-            elif len(limits) == 1:
-                shape.append((f"{lb}", expr_node))
-            args = []
-            for sh, node in shape:
-                if ":" in sh and isinstance(node, F23.Subscript_Triplet):
-                    # It's a slice
-                    if sh == ":":
-                        # Simple ':' slice
-                        slice_node = ast.Slice()
-                    else:
-                        # Possibly lb:ub
-                        lb_ub = sh.split(":")
-                        lb = lb_ub[0].strip() or None
-                        ub = lb_ub[1].strip() if len(lb_ub) > 1 else None
-
-                        slice_node = ast.Slice(
-                            lower=self.handle_expr(node.children[0]) if lb else None,
-                            upper=self.handle_expr(node.children[1]) if ub else None,
-                        )
-                    args.append(slice_node)
-                else:
-                    # it's a direct index
-                    if isinstance(node, ast.AST):
-                        expr_node = node
-                    else:
-                        expr_node = self.handle_expr(node)
-                    args.append(expr_node)
-
-            return args
+            return [self._build_triplet_slice(expr_node)]
 
         elif isinstance(expr_node, F23.Array_Constructor):
             # Inline literal like (/2, 3/) or [2, 3] used as an intrinsic argument
@@ -3554,11 +3617,39 @@ class F2NP:
         elif isinstance(expr_node, F23.Assignment_Stmt):
             return self.handle_assignment(expr_node)
 
+        elif isinstance(expr_node, F23.Data_Ref):
+            return self.handle_data_ref(expr_node)
+
+        elif isinstance(expr_node, F23.Structure_Constructor):
+            return self.handle_structure_constructor(expr_node)
+
         else:
             raise NotImplementedError(
                 f"Unsupported node type: {type(expr_node).__name__}\n"
                 f"Node content: {repr(expr_node)}"
             )
+
+    def handle_data_ref(self, node: F23.Data_Ref) -> ast.AST:
+        parts = node.children
+        base = (
+            ast.Name(id=parts[0].tostr(), ctx=ast.Load())
+            if isinstance(parts[0], F23.Name)
+            else self.handle_expr(parts[0])
+        )
+
+        for part in parts[1:]:
+            if isinstance(part, F23.Name):
+                base = ast.Attribute(value=base, attr=part.tostr(), ctx=ast.Load())
+            elif isinstance(part, F23.Part_Ref):
+                comp_name = part.children[0].tostr()
+                base = ast.Attribute(value=base, attr=comp_name, ctx=ast.Load())
+                dims = self._extract_dimensions(part)
+                args = [self._build_slice_or_index(d) for d in dims]
+                slice_node = (
+                    args[0] if len(args) == 1 else ast.Tuple(elts=args, ctx=ast.Load())
+                )
+                base = ast.Subscript(value=base, slice=slice_node, ctx=ast.Load())
+        return base
 
     def apply_mask_to_rhs(self, node: ast.AST) -> ast.AST:
         """
@@ -3669,3 +3760,281 @@ class F2NP:
         except Exception as e:
             self.logger.exception("Exception in apply_mask_to_rhs:", e)
             raise
+
+    def build_dataclass_from_derived_type(
+        self, type_def: F23.Derived_Type_Def
+    ) -> ast.ClassDef:
+        """
+        Convert a Fortran ``TYPE ... END TYPE`` definition into a Python
+        dataclass ``ClassDef``.
+
+        Called from :meth:`Transformer.convert_SPECIFICATION_PART` when a
+        ``F23.Derived_Type_Def`` is encountered in a module's specification
+        part not from :meth:`recursive_ast`, since derived-type
+        definitions are declarative and module-scoped rather than
+        executable statements belonging to a single subroutine/function
+        body. The type's name is read from the nested
+        ``F23.Derived_Type_Stmt``; each ``F23.Data_Component_Def_Stmt``
+        found within the type body is converted to one or more dataclass
+        fields via :meth:`_build_dataclass_fields`, in declaration order,
+        matching the order used by :meth:`handle_structure_constructor` to
+        map positional structure-constructor arguments onto fields.
+
+        Parameters
+        ----------
+        type_def : F23.Derived_Type_Def
+            The Fortran derived-type definition to convert.
+
+        Returns
+        -------
+        ast.ClassDef
+            A ``@dataclass``-decorated class definition with one annotated
+            field per Fortran component. If the type declares no
+            components, the class body is a single ``ast.Pass()`` node.
+
+        Notes
+        -----
+        The emitted class requires ``from dataclasses import dataclass,
+        field`` (and ``numpy as np`` for intrinsic-typed fields) to be
+        present in the surrounding module; this method does not insert
+        those imports itself.
+
+        Nested derived types referenced as component types (see
+        :meth:`_build_dataclass_fields`) must already be defined earlier in
+        the emitted module, since Python requires a name to exist before
+        it is used as a default-value constructor or type annotation.
+
+        See Also
+        --------
+        :meth:`_build_dataclass_fields`
+            Builds the individual field assignments for one declaration.
+        :meth:`handle_structure_constructor`
+            Converts a Fortran structure constructor into an instantiation
+            of the class built here.
+        """
+        type_name = walk(type_def, F23.Derived_Type_Stmt)[0].items[1].tostr()
+
+        body = []
+        for decl in walk(type_def, F23.Data_Component_Def_Stmt):
+            body.extend(self._build_dataclass_fields(decl))
+
+        if not body:
+            body = [ast.Pass()]
+
+        return ast.ClassDef(
+            name=type_name,
+            bases=[],
+            keywords=[],
+            body=body,
+            decorator_list=[ast.Name(id="dataclass", ctx=ast.Load())],
+        )
+
+    def _build_dataclass_fields(
+        self, decl: F23.Data_Component_Def_Stmt
+    ) -> list[ast.AnnAssign]:
+        """
+        Convert a single derived-type component declaration into one or
+        more dataclass field assignments.
+
+        A single ``F23.Data_Component_Def_Stmt`` may declare several
+        components at once (e.g. ``REAL :: a, b``), so this returns a list
+        rather than a single node. Each field is built as an
+        ``ast.AnnAssign`` with an explicit default value, since Python
+        dataclasses require every field to either have a default or be
+        positioned before all fields that do, this method always supplies
+        a default (zero-valued for intrinsics, a no-argument constructor
+        call for nested derived types, ``field(default_factory=...)`` for
+        arrays), so field ordering constraints never arise.
+
+        Dispatch is based on whether the declaration's type is intrinsic
+        (``F23.Intrinsic_Type_Spec`` present, handled via
+        :meth:`_extract_dtype`) or a nested derived type (resolved via
+        ``F23.Declaration_Type_Spec``, handling both the wrapped
+        ``F23.Derived_Type_Spec`` form used for parameterized types and the
+        flat ``('TYPE', Type_Name)`` form fparser emits for a plain
+        ``TYPE(name)`` component declaration), and separately on whether
+        the component is an array (per ``is_array_declaration``).
+
+        Parameters
+        ----------
+        decl : F23.Data_Component_Def_Stmt
+            A single component declaration from within a
+            ``F23.Derived_Type_Def``'s ``Component_Part``.
+
+        Returns
+        -------
+        list[ast.AnnAssign]
+            One annotated field assignment per component named in *decl*.
+
+        Notes
+        -----
+        Field defaults by case:
+
+        - Scalar intrinsic (e.g. ``REAL :: a``): annotated ``np.float64``
+        (or the resolved dtype attribute), default
+        ``np.float64(0)``/equivalent via :func:`dtype_call`.
+        - Array intrinsic (e.g. ``REAL :: arr(10)``): annotated
+        ``np.ndarray``, default ``field(default_factory=lambda:
+        np.zeros(shape, dtype=...))`` so the mutable array is not shared
+        across instances.
+        - Scalar nested derived type (e.g. ``TYPE(inner) :: comp``):
+        annotated with the nested type's name, default a bare
+        no-argument constructor call, e.g. ``comp: inner = inner()``.
+        - Array of nested derived types: not currently distinguished from
+        the intrinsic-array case's shape handling; the default factory
+        falls back to an empty ``ast.List`` rather than a populated
+        array of instances, verify against real Fortran usage before
+        relying on this case for arrays of derived-type components.
+
+        See Also
+        --------
+        :meth:`build_dataclass_from_derived_type`
+            The caller; assembles the fields returned here into a
+            ``ClassDef`` body.
+        :meth:`_extract_dtype`
+            Resolves an intrinsic type to its NumPy ``(module, attribute)``
+            dtype pair.
+        :meth:`_extract_shapes`
+            Resolves an array declaration's per-dimension size expressions.
+        """
+        fields = []
+        intrinsic = walk(decl, F23.Intrinsic_Type_Spec)
+        is_array = is_array_declaration(
+            decl
+        )  # reuse Transformer's helper, or a local copy
+
+        for entity in walk(decl, F23.Component_Decl):
+            name = entity.children[0].tostr()
+
+            if intrinsic:
+                idx, attr = self._extract_dtype(decl)  # unchanged intrinsic path
+                annotation = ast.Attribute(
+                    value=ast.Name(id="np", ctx=ast.Load()),
+                    attr="ndarray" if is_array else attr,
+                    ctx=ast.Load(),
+                )
+            else:
+                decl_spec = walk(decl, F23.Declaration_Type_Spec)[0]
+
+                derived_spec = walk(decl_spec, F23.Derived_Type_Spec)
+                if derived_spec:
+                    nested_name = derived_spec[0].children[0].tostr()
+                else:
+                    nested_name = decl_spec.children[1].tostr()
+
+                annotation = ast.Name(id=nested_name, ctx=ast.Load())
+
+            if is_array:
+                shape = self._extract_shapes(decl)  # already exists on F2NP
+                default_call = ast.Call(
+                    func=ast.Name(id="field", ctx=ast.Load()),
+                    args=[],
+                    keywords=[
+                        ast.keyword(
+                            arg="default_factory",
+                            value=ast.Lambda(
+                                args=ast.arguments(
+                                    posonlyargs=[],
+                                    args=[],
+                                    kwonlyargs=[],
+                                    kw_defaults=[],
+                                    defaults=[],
+                                ),
+                                body=self._build_zeros_array(shape, idx, attr)
+                                if intrinsic
+                                else ast.List(elts=[], ctx=ast.Load()),
+                            ),
+                        )
+                    ],
+                )
+                value = default_call
+            elif intrinsic:
+                value = dtype_call((idx, attr), ast.Constant(0))
+            else:
+                value = ast.Call(
+                    func=ast.Name(id=nested_name, ctx=ast.Load()), args=[], keywords=[]
+                )
+
+            fields.append(
+                ast.AnnAssign(
+                    target=ast.Name(id=name, ctx=ast.Store()),
+                    annotation=annotation,
+                    value=value,
+                    simple=1,
+                )
+            )
+        return fields
+
+    def handle_structure_constructor(self, node: F23.Structure_Constructor) -> ast.Call:
+        """
+        Convert a Fortran structure constructor into a Python call
+        expression.
+
+        ``TYPE_NAME(a, b, comp=c)`` becomes ``ast.Call(func=TYPE_NAME,
+        args=[a, b], keywords=[comp=c])``. Positional arguments are
+        resolved via :meth:`handle_expr` and preserve their source order,
+        which matches the field order :meth:`_build_dataclass_fields`
+        emits for the corresponding dataclass, so no argument remapping is
+        needed for the positional case. Named-component arguments
+        (``F23.Component_Spec``, i.e. ``comp = value``) are converted to
+        ``ast.keyword`` nodes, with the component name lower-cased to match
+        the field-naming convention used elsewhere in this module (see
+        :meth:`_build_dataclass_fields`, which does not itself alter case,
+        but downstream naming conventions in this codebase are
+        lower-case).
+
+        Parameters
+        ----------
+        node : F23.Structure_Constructor
+            The Fortran structure constructor to convert.
+
+        Returns
+        -------
+        ast.Call
+            A call to the dataclass constructor named after the Fortran
+            type, with positional and/or keyword arguments corresponding
+            to the constructor's specification list.
+
+        Notes
+        -----
+        A structure constructor with no arguments (``TYPE_NAME()``)
+        produces ``ast.Call(func=TYPE_NAME, args=[], keywords=[])``,
+        relying entirely on the dataclass's own field defaults built by
+        :meth:`_build_dataclass_fields`.
+
+        This method does not itself validate that *type_name* corresponds
+        to a class already emitted by :meth:`build_dataclass_from_derived_type`
+        earlier in the module, that ordering constraint must be satisfied
+        by the caller assembling the module.
+
+        See Also
+        --------
+        :meth:`build_dataclass_from_derived_type`
+            Builds the dataclass this constructor call instantiates.
+        :meth:`handle_expr`
+            Resolves each constructor argument expression.
+        """
+        type_name = node.children[0].tostr()
+        spec_list = node.children[1]
+
+        args = []
+        keywords = []
+
+        if spec_list:
+            for spec in spec_list.children:
+                if isinstance(spec, F23.Component_Spec):
+                    comp_name, value_node = spec.children
+                    keywords.append(
+                        ast.keyword(
+                            arg=comp_name.tostr().lower(),
+                            value=self.handle_expr(value_node),
+                        )
+                    )
+                else:
+                    args.append(self.handle_expr(spec))
+
+        return ast.Call(
+            func=ast.Name(id=type_name, ctx=ast.Load()),
+            args=args,
+            keywords=keywords,
+        )
