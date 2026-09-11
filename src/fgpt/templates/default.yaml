@@ -32,6 +32,7 @@ Python_templates:
             import numpy as np
             import logging
             from scipy.io import FortranFile
+            from dataclasses import dataclass
             import time
             import functools
 
@@ -62,6 +63,7 @@ Python_templates:
             import os
             import numpy as np
             import logging
+            from dataclasses import field, is_dataclass
             from scipy.io import FortranFile
 
             def main():

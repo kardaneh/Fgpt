@@ -13,8 +13,8 @@ fgpt isolate \
     --parent_subroutine "" \
     --target_subroutines hydrol_alma hydrol_vegupd hydrol_canop hydrol_flood hydrol_hydraulic_arch_tuzet_calc hydrol_soil explicitsnow_main \
     --openacc "False" \
-    --f2py "False" \
-    --tapenade "True" \
+    --f2py "True" \
+    --tapenade "False" \
     --py2jx "False" \
     --config_path "template.yaml" \
     --vectorize kjpindex \

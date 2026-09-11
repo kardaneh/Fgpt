@@ -707,7 +707,7 @@ class _Masking:
                     args=[mask_expr, delta_expr, identity],
                     keywords=[],
                 )
-                delta_name = f"delta{mask_name}"
+                delta_name = f"delta_{target_name}{mask_name}"
                 delta_value = ast.Assign(
                     targets=[ast.Name(id=delta_name, ctx=ast.Store())],
                     value=masked_delta,

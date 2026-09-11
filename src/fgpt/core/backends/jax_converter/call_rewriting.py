@@ -736,13 +736,12 @@ class _CallRewriting:
                 else:
                     mapped_args.append(arg)
 
-            if mapped_args:
-                ret_info["var_modif_args"] = mapped_args
+            # if mapped_args:
+            #     ret_info["var_modif_args"] = mapped_args
 
             # Build tuple assignment for modified variables
-            modified_vars = list(ret_info["var_modif_args"]) + list(
-                ret_info["var_modif_attr"]
-            )
+            modified_vars = mapped_args + list(ret_info["var_modif_attr"])
+
             # NOTE:
             # These variables must be propagated because `var_modif_args` only
             # captures arguments modified within the function, but those arguments
@@ -801,6 +800,32 @@ class _CallRewriting:
             new_assign = ast.Assign(
                 targets=[ast.Tuple(elts=tuple_targets, ctx=ast.Store())], value=new_call
             )
+
+            current_modified = (
+                set(self._modified_ret_stack[-1]) if self._modified_ret_stack else set()
+            )
+            current_modified = current_modified - set(
+                methods.get(self.func_name)["local_arr"].keys()
+            )
+            if self._scan_stack:
+                ctx = self._scan_stack[-1]
+                ctx["mutated"].update(current_modified)
+                candidates = current_modified | set(modified_vars)
+                escaping = candidates & ctx.get("parent_reads", set())
+                for var in escaping:
+                    if var not in ctx["carry"]:
+                        ctx["introduced"].add(var)
+
+            elif not self._modified_ret_stack or len(self._modified_ret_stack) == 1:
+                current_modified = set(current_modified)
+                current_modified.discard("self")
+
+                # attr_mods = {v for v in current_modified if v in attributes}
+                local_param_mods = (
+                    current_modified & set(func_args) if func_args else set()
+                )
+                # self._var_modif["attr"].update(attr_mods)
+                self._var_modif["args"].update(local_param_mods)
 
             if vectorization_context and self._is_vectorized_child_call(node):
                 vmap_stmts = self._emit_scan_wrapped_call(

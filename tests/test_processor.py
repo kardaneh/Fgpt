@@ -163,7 +163,6 @@ class TestProcessor:
         assert result == assignment_stmt, "Should return the same assignment statement"
 
         # Test 5: Null node input
-        print("Test 5: Null node input")
         result = self.processor.find_enclosing_parent(None, F23.Assignment_Stmt)
         assert result is None, "Should return None for None input"
 

@@ -23,6 +23,7 @@ particularly in the Fortran to Python transformation stages.
 """
 
 import ast
+import keyword
 import logging
 import operator
 import os
@@ -31,6 +32,8 @@ from collections.abc import Generator, Iterable
 from typing import Any
 
 import yaml
+from fparser.two import Fortran2003 as F23
+from fparser.two.utils import walk
 
 
 class ReplaceGlobals(ast.NodeTransformer):
@@ -678,6 +681,14 @@ class AdjustIndices(ast.NodeTransformer):
       at ``1``.
     * Tracks variables requiring subsequent index correction through
       :attr:`adjusted_vars`.
+    * Tracks variables that have been reassigned a *raw*, un-shifted
+      Fortran-space value (even though their name is a conventional loop
+      variable) through :attr:`_raw_override`, and clears that override
+      whenever the name is rebound by a fresh ``for`` loop target.
+    * Detects affine reuses of a loop variable (e.g. ``le = 2*l``,
+      ``le = nlevels_tot - l``) and rewrites the affine formula itself so
+      that the *result* is a correct 0-based Python index, instead of
+      naively subtracting 1 from the whole expression.
     * Rewrites loop bounds and conditional comparisons involving converted
       indices.
     * Adjusts results of operations such as ``argmin`` and ``argmax`` so
@@ -685,6 +696,8 @@ class AdjustIndices(ast.NodeTransformer):
       indexing convention.
     * Preserves explicitly excluded variables recorded in
       :attr:`exclude_index`.
+    * Leaves slice *strides* untouched, since a stride is not an index and
+      needs no Fortran/Python correction.
 
     Parameters
     ----------
@@ -726,6 +739,11 @@ class AdjustIndices(ast.NodeTransformer):
         converted indices.
     exclude_index : Collection[str] | None
         Variables excluded from automatic index adjustment.
+    _raw_override : set[str]
+        Variables whose *name* is a conventional loop variable but which
+        currently hold a raw, un-shifted Fortran-space value (e.g. ``l``
+        reused as ``l = 2 * nl``). Cleared whenever the name is rebound as
+        a fresh ``for`` loop target.
 
     Notes
     -----
@@ -752,6 +770,149 @@ class AdjustIndices(ast.NodeTransformer):
 
         self.adjusted_vars = kwargs.get("adjusted_vars", set())
         self.exclude_index = kwargs.get("exclude_index")
+
+        # Optional shared dict, passed by the transformer, that visit_Call
+        # populates as a side effect: {callee_func_name: {param_index: bool}}.
+        # Used only for the call-site preadjustment pre-pass (see
+        # visit_Call); None in the real (mutating) adjustment pass, where
+        # it's irrelevant.
+        self.call_arg_registry = kwargs.get("call_arg_registry")
+
+        # Vars whose names are in CONV_VARS/adjusted_vars but currently hold
+        # raw, unadjusted values. While a name is in this set, it must not be
+        # treated as pre-adjusted. The state is cleared when the name is rebound
+        # as a fresh loop target.
+        self._raw_override: set[str] = set()
+
+    def _is_preadjusted(self, name: str) -> bool:
+        """
+        True if *name* currently holds an already Python-shifted value and
+        should NOT get a further -1 when used directly as an index.
+
+        A name in :attr:`_raw_override` overrides membership in
+        :attr:`CONV_VARS`/:attr:`adjusted_vars`, since it currently holds a
+        raw Fortran-space value rather than a pre-shifted Python one.
+        """
+        if name in self._raw_override:
+            return False
+        return name in self.CONV_VARS or name in self.adjusted_vars
+
+    def _is_index_derived(self, node: ast.AST) -> bool:
+        """
+        True if *node* looks like it derives an index (a name/subscript
+        reference, or a simple +/- constant offset of one) rather than an
+        arbitrary computed value such as a size or count (e.g. ``2 * nl``).
+        """
+        if isinstance(node, ast.Name | ast.Subscript):
+            return True
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add | ast.Sub):
+            return True
+        return False
+
+    def _contains_name(self, node: ast.AST, name: str) -> bool:
+        return any(isinstance(n, ast.Name) and n.id == name for n in ast.walk(node))
+
+    def _node_as_const(self, node: ast.AST) -> int | ast.AST:
+        return node.value if isinstance(node, ast.Constant) else node
+
+    def _decompose_affine(
+        self, node: ast.AST, base_name: str
+    ) -> tuple[int | None, int | ast.AST, bool]:
+        """
+        Express `node` as k*base_name + c, where c may be a plain int
+        OR a symbolic AST expression (e.g. self.nlevels_tot) when the
+        Fortran formula mixes a loop var with a non-literal bound.
+        Returns (k, c, True) on success, else (None, None, False).
+        """
+        if not self._contains_name(node, base_name):
+            return 0, self._node_as_const(node), True
+        if isinstance(node, ast.Name):
+            return 1, 0, True  # contains_name True + bare Name -> it IS base_name
+        if isinstance(node, ast.BinOp):
+            if isinstance(node.op, ast.Mult):
+                left, right = node.left, node.right
+                if (
+                    isinstance(left, ast.Constant)
+                    and isinstance(right, ast.Name)
+                    and right.id == base_name
+                ):
+                    return left.value, 0, True
+                if (
+                    isinstance(right, ast.Constant)
+                    and isinstance(left, ast.Name)
+                    and left.id == base_name
+                ):
+                    return right.value, 0, True
+                return None, None, False
+            if isinstance(node.op, ast.Add | ast.Sub):
+                k_l, c_l, found_l = self._decompose_affine(node.left, base_name)
+                k_r, c_r, found_r = self._decompose_affine(node.right, base_name)
+                if found_l and found_r:
+                    if isinstance(node.op, ast.Add):
+                        return k_l + k_r, self._const_add(c_l, c_r), True
+                    return k_l - k_r, self._const_sub(c_l, c_r), True
+                return None, None, False
+        return None, None, False
+
+    def _const_to_ast(self, c: int | ast.AST) -> ast.AST:
+        return ast.Constant(value=c) if isinstance(c, int) else c
+
+    def _is_zero(self, c: int | ast.AST) -> bool:
+        return isinstance(c, int) and c == 0
+
+    def _const_add(self, a: int | ast.AST, b: int | ast.AST) -> int | ast.AST:
+        if self._is_zero(a):
+            return b
+        if self._is_zero(b):
+            return a
+        if isinstance(a, int) and isinstance(b, int):
+            return a + b
+        if isinstance(b, int) and b < 0:
+            return ast.BinOp(
+                left=self._const_to_ast(a), op=ast.Sub(), right=ast.Constant(value=-b)
+            )
+        return ast.BinOp(
+            left=self._const_to_ast(a), op=ast.Add(), right=self._const_to_ast(b)
+        )
+
+    def _const_sub(self, a: int | ast.AST, b: int | ast.AST) -> int | ast.AST:
+        if self._is_zero(b):
+            return a
+        if isinstance(a, int) and isinstance(b, int):
+            return a - b
+        if self._is_zero(a):
+            return ast.UnaryOp(op=ast.USub(), operand=self._const_to_ast(b))
+        return ast.BinOp(
+            left=self._const_to_ast(a), op=ast.Sub(), right=self._const_to_ast(b)
+        )
+
+    def _rebuild_affine(self, base_name: str, k: int, c: int | ast.AST) -> ast.AST:
+        base = ast.Name(id=base_name, ctx=ast.Load())
+        if k == 0:
+            return self._const_to_ast(c)
+        abs_term = (
+            base
+            if abs(k) == 1
+            else ast.BinOp(left=ast.Constant(value=abs(k)), op=ast.Mult(), right=base)
+        )
+        if k > 0:
+            return self._const_add(abs_term, c)
+        return self._const_sub(c, abs_term)  # k < 0 -> render as "c - |k|*base"
+
+    def _find_affine_base(self, node: ast.AST) -> str | None:
+        """
+        Locate a currently pre-adjusted (CONV_VAR or already-adjusted) Name
+        feeding this RHS expression, to use as the affine base variable.
+
+        Uses :meth:`_is_preadjusted` (rather than a raw CONV_VARS/
+        adjusted_vars membership check) so that a name currently holding a
+        raw, un-shifted value (tracked via :attr:`_raw_override`) is never
+        picked up as an affine base.
+        """
+        for n in ast.walk(node):
+            if isinstance(n, ast.Name) and self._is_preadjusted(n.id):
+                return n.id
+        return None
 
     def visit_Subscript(self, node: ast.Subscript) -> ast.Subscript:
         """
@@ -923,9 +1084,31 @@ class AdjustIndices(ast.NodeTransformer):
         variables derived from conventional loop indices are converted to
         their Python-equivalent indexing scheme.
 
-        Tracks variables requiring future adjustment through
-        :attr:`adjusted_vars` and applies transformations using
-        :meth:`_adjust_assignment_rhs` and :meth:`_adjust_index`.
+        Three special cases are handled, checked in order, for a plain
+        ``Name``/``Attribute`` target whose name is a conventional loop
+        variable or an already-adjusted variable:
+
+        1. **Raw reassignment** (e.g. ``l = 2 * nl``): the RHS is not
+           index-derived (see :meth:`_is_index_derived`) even though the
+           target name is a loop-variable name. The RHS is left untouched
+           and the name is pushed onto :attr:`_raw_override` so that
+           subsequent index usages of it are *not* treated as
+           pre-adjusted, until the name is reassigned from an
+           index-derived expression or rebound by a fresh ``for`` loop
+           (see :meth:`visit_For`).
+        2. **Affine reuse of a loop variable** (e.g. ``le = 2 * l``,
+           ``le = nlevels_tot - l``): decomposed via
+           :meth:`_decompose_affine` against whichever pre-adjusted name
+           feeds the expression (:meth:`_find_affine_base`), and the
+           formula itself is rewritten so that its *result* is already a
+           correct 0-based Python index (see :meth:`_rebuild_affine`).
+           The target name is then added to :attr:`adjusted_vars` so
+           later subscript usages are not decremented again. This is
+           re-attempted on *every* assignment to the name (not just the
+           first), since the same name may be reassigned later in the
+           same routine with a different affine formula.
+        3. **Ordinary already-adjusted RHS**: falls back to
+           :meth:`_adjust_index`/:meth:`_adjust_assignment_rhs` as before.
 
         Parameters
         ----------
@@ -964,16 +1147,39 @@ class AdjustIndices(ast.NodeTransformer):
                     if isinstance(node.targets[0], ast.Name)
                     else node.targets[0].attr
                 )
-                if (
-                    name in self.CONV_VARS
-                ):  # THIS IS to modify in the case of CONV_vars ARE in the left hand side
-                    node.value = self._adjust_assignment_rhs(node.value)
-                # Check if the right hand assigement is that of conv vars
-                elif name in self.adjusted_vars:
-                    node.value = self._adjust_index(node.value)
+                if name in self.CONV_VARS:
+                    # THIS IS to modify in the case of CONV_vars ARE in the left hand side
+                    if self._is_index_derived(node.value):
+                        node.value = self._adjust_assignment_rhs(node.value)
+                        self._raw_override.discard(name)
+                    else:
+                        # A variable may be reused for a raw value rather than an
+                        # index-derived expression. In that case, leave the RHS untouched
+                        # and clear the variable's preadjusted state until it is reassigned
+                        # from an index-derived expression or rebound by a new loop.
+                        self._raw_override.add(name)
 
-                elif isinstance(node.value, ast.Compare) or name == "mask":
-                    self.adjusted_vars.add(name)
+                # NOTE: `_find_affine_base` searches the entire RHS subtree, including
+                # Subscript slices, so it may identify a base name even when the RHS
+                # itself is not an affine expression. In that case, `_decompose_affine`
+                # fails and processing must fall through to the normal already-adjusted
+                # / Compare-or-"mask" handling rather than skipping those cases.
+                else:
+                    handled = False
+                    base_name = self._find_affine_base(node.value)
+                    if base_name is not None:
+                        k, c, found = self._decompose_affine(node.value, base_name)
+                        if found and k != 0:
+                            adjusted_c = self._const_add(c, k - 1)
+                            node.value = self._rebuild_affine(base_name, k, adjusted_c)
+                            self.adjusted_vars.add(name)
+                            handled = True
+
+                    if not handled:
+                        if name in self.adjusted_vars:
+                            node.value = self._adjust_index(node.value)
+                        elif isinstance(node.value, ast.Compare) or name == "mask":
+                            self.adjusted_vars.add(name)
 
             elif isinstance(node.targets[0], ast.Subscript):
                 if isinstance(node.targets[0].value, ast.Name | ast.Attribute):
@@ -996,6 +1202,16 @@ class AdjustIndices(ast.NodeTransformer):
         """
         Visit a ``for`` loop and normalize iterator bounds.
 
+        A ``for`` loop target rebinding is exactly the point where a stale
+        :attr:`_raw_override` entry must be cleared: the loop variable goes
+        back to being an ordinary pre-adjusted, loop-derived index,
+        regardless of whatever raw un-shifted value the same name held
+        before entering this loop (e.g. a prior ``l = 2 * nl`` reusing a
+        loop-var name for a raw count). This is done *before*
+        :meth:`generic_visit` descends into the loop body, since that is
+        what triggers :meth:`visit_Assign`/:meth:`visit_Subscript` on the
+        body's statements.
+
         Identifies unused loop variables and replaces them with ``_`` when
         appropriate. Iterator arguments are processed through
         :meth:`_process_arg` to account for previously adjusted index
@@ -1017,6 +1233,13 @@ class AdjustIndices(ast.NodeTransformer):
             If an unexpected error occurs while processing the For loops.
         """
         try:
+            loop_vars = self._extract_loop_vars(node.target)
+
+            # Clear any stale raw-override for names rebound by this loop
+            # target, BEFORE visiting the body.
+            for var in loop_vars:
+                self._raw_override.discard(var)
+
             self.generic_visit(node)
 
             loop_vars = self._extract_loop_vars(node.target)
@@ -1235,8 +1458,10 @@ class AdjustIndices(ast.NodeTransformer):
         """
         try:
             self.generic_visit(node)
-            if isinstance(node.test, ast.Compare):
-                self._handle_compare(node.test)
+
+            for child in ast.walk(node.test):
+                if isinstance(child, ast.Compare):
+                    self._handle_compare(child)
 
             if (
                 not node.body or all(isinstance(n, ast.Pass) for n in node.body)
@@ -1319,6 +1544,18 @@ class AdjustIndices(ast.NodeTransformer):
         convention. Lower-bound information is retrieved from
         :attr:`array_info`.
 
+        As a side effect, if :attr:`call_arg_registry` is set, records for
+        every call to another user-defined method (``self.<name>(...)``)
+        whether each positional argument is currently a pre-adjusted
+        reference (a Name for which :meth:`_is_preadjusted` is True) at
+        this point in the *caller*. This is how the transformer determines
+        whether a callee's scalar dummy argument (e.g. `ins` fed a live
+        loop variable `jst`) is already 0-based and must NOT be
+        decremented again inside the callee, as opposed to a raw
+        Fortran-space value (e.g. `n` fed `2 * nl`) that genuinely needs
+        the standard -1 correction there. See
+        :meth:`Transformer._compute_call_site_preadjustment`.
+
         Parameters
         ----------
         node : ast.Call
@@ -1336,6 +1573,47 @@ class AdjustIndices(ast.NodeTransformer):
         """
         try:
             self.generic_visit(node)
+
+            registry = getattr(self, "call_arg_registry", None)
+            if registry is not None:
+                called_name = (
+                    node.func.attr
+                    if isinstance(node.func, ast.Attribute)
+                    else getattr(node.func, "id", None)
+                )
+                if called_name is not None:
+                    # Snapshot, for each call occurrence, whether each bare-Name
+                    # argument is currently preadjusted at that point in the caller.
+                    # The state is keyed by argument name rather than parameter position,
+                    # since it represents the caller's local dataflow state. The snapshots
+                    # are later aligned with the callee's parameter order when propagating
+                    # preadjustment information. (see Transformer._compute_call_site_preadjustment).
+                    name_state = {
+                        arg.id: self._is_preadjusted(arg.id)
+                        for arg in node.args
+                        if isinstance(arg, ast.Name)
+                    }
+                    registry.setdefault(called_name, []).append(name_state)
+
+            # TODO: Need to improve
+            # NOTE: value-context correction for conventional loop variables.
+            # Fortran `DO jrp = 1, nrp` becomes Python `range(0, nrp)`, so the
+            # loop variable itself is shifted by -1 relative to Fortran. When
+            # jrp is used as an *array index* this cancels out naturally
+            # But when jrp is cast to a real/float and used as
+            # a *value* in a formula (e.g. REAL(jrp) -> float(jrp)), the
+            # original Fortran value must be recovered explicitly with +1.
+            if (
+                isinstance(node.func, ast.Name)
+                and node.func.id in ("float", "int")
+                and len(node.args) == 1
+                and isinstance(node.args[0], ast.Name)
+                and node.args[0].id in self.CONV_VARS
+            ):
+                node.args[0] = ast.BinOp(
+                    left=node.args[0], op=ast.Add(), right=ast.Constant(value=1)
+                )
+
             if isinstance(node.func, ast.Attribute) and node.func.attr in [
                 "argmin",
                 "argmax",
@@ -1433,9 +1711,15 @@ class AdjustIndices(ast.NodeTransformer):
             # lower-bound offset. This preserves the original element mapping and
             # ensures that Python accesses the same logical array elements and
             # produces the same results as the Fortran code.
-            if isinstance(node, ast.Name) and (
-                node.id in self.CONV_VARS or node.id in self.adjusted_vars
-            ):
+
+            # NOTE: Apply the offset only to references that are currently
+            # preadjusted. These values have already been shifted according to
+            # the assumed default lower bound, so the offset compensates for the
+            # array's actual lower bound. Raw, unadjusted references must remain
+            # unchanged because they have not undergone the initial shift.
+            # `_is_preadjusted()` also accounts for `_raw_override`, ensuring that
+            # names currently holding raw values are treated as unadjusted.
+            if isinstance(node, ast.Name) and self._is_preadjusted(node.id):
                 node = ast.BinOp(
                     left=node, op=ast.Add(), right=ast.Constant(value=offset)
                 )
@@ -1449,7 +1733,7 @@ class AdjustIndices(ast.NodeTransformer):
 
                 # Case 1: left is a Name
                 if isinstance(left, ast.Name):
-                    if left.id in self.CONV_VARS or left.id in self.adjusted_vars:
+                    if self._is_preadjusted(left.id):
                         is_valid_left = True
 
                 # Case 2: left is a Subscript of a Name (A[i]) and A is in adjusted_vars
@@ -1505,7 +1789,15 @@ class AdjustIndices(ast.NodeTransformer):
 
         Variables listed in :attr:`CONV_VARS`,
         :attr:`adjusted_vars`, or :attr:`exclude_index` are excluded from
-        direct modification when appropriate.
+        direct modification when appropriate. A name currently tracked in
+        :attr:`_raw_override` is never treated as pre-adjusted, even if its
+        name also appears in :attr:`CONV_VARS`/:attr:`adjusted_vars` (see
+        :meth:`_is_preadjusted`).
+
+        Slice *strides* are passed through unchanged: a stride is not an
+        index, and Fortran's ``lb:ub:stride`` and Python's
+        ``slice(lb, ub, stride)`` use the stride value identically, with no
+        1-based/0-based correction ever required.
 
         Parameters
         ----------
@@ -1525,10 +1817,7 @@ class AdjustIndices(ast.NodeTransformer):
 
         try:
             if isinstance(index_node, ast.Name):
-                if (
-                    index_node.id not in self.CONV_VARS
-                    and index_node.id not in self.adjusted_vars
-                ):
+                if not self._is_preadjusted(index_node.id):
                     # TODO: Need a checker method that checks if one of the varaibles
                     # has either been affected is that of int type
                     # thus requires us to modify it directly
@@ -1573,14 +1862,16 @@ class AdjustIndices(ast.NodeTransformer):
                 if index_node.lower is None and index_node.upper is None:
                     return index_node
 
-                # Recursively adjust lower and upper if they exist
+                # Recursively adjust the lower bound when present. The upper bound is
+                # left unchanged, since Fortran's inclusive upper bound maps directly
+                # to Python's exclusive stop. Strides represent counts or direction,
+                # not index values, so they must remain unchanged rather than being
+                # passed through `_adjust_index()`.
                 new_lower = (
                     self._adjust_index(index_node.lower) if index_node.lower else None
                 )
                 new_upper = index_node.upper
-                new_step = (
-                    self._adjust_index(index_node.step) if index_node.step else None
-                )
+                new_step = index_node.step
 
                 return ast.Slice(lower=new_lower, upper=new_upper, step=new_step)
 
@@ -2482,3 +2773,41 @@ def load_code_templates(config_path: str) -> dict | None:
         templates = None
 
     return templates
+
+
+def is_array_declaration(decl) -> bool:
+    """
+    Return True if *decl* declares an array (has a dimension attribute
+    or an explicit shape specification). Shared between Transformer and
+    F2NP since both need to classify a Fortran declaration node.
+    """
+    return any(walk(decl, F23.Dimension_Attr_Spec)) or any(
+        walk(decl, F23.Explicit_Shape_Spec)
+    )
+
+
+def dtype_attr(dtype: tuple[str, str]) -> ast.Attribute:
+    """
+    Build the AST node for a NumPy dtype reference, e.g. np.float64.
+    Shared between Transformer and F2NP.
+    """
+    mod, attr = dtype
+    return ast.Attribute(
+        value=ast.Name(id=mod, ctx=ast.Load()), attr=attr, ctx=ast.Load()
+    )
+
+
+def dtype_call(dtype: tuple[str, str], value: ast.AST) -> ast.Call:
+    """
+    Wrap *value* in a NumPy dtype constructor call, e.g. np.float64(value).
+    """
+    return ast.Call(func=dtype_attr(dtype), args=[value], keywords=[])
+
+
+def sanitize_identifier(name: str) -> str:
+    """Rename a Fortran identifier that would collide with a Python
+    keyword or a builtin this transpiler relies on. Trailing underscore
+    matches common Python convention (e.g. `lambda` -> `lambda_`)."""
+    if keyword.iskeyword(name):
+        return name + "_"
+    return name
