@@ -10,12 +10,14 @@ import argparse
 import os
 import shutil
 from collections import defaultdict, deque
+from pathlib import Path
 
 from fparser.two import Fortran2003 as F23
 from fparser.two.utils import walk
 
 from fgpt.autodiff import AutoDiff
 from fgpt.core.common.logger import Logger
+from fgpt.core.common.utils import load_code_templates
 from fgpt.core.frontend.extractor import Extractor
 from fgpt.core.frontend.processor import Processor
 from fgpt.core.passes.tapenade import TapenadePass
@@ -84,8 +86,10 @@ class Isolator:
     def __init__(
         self,
         rest_of_path: str = "modipsl_truck_opt/modeles/ORCHIDEE/src_sechiba/",
+        target_model: str = "ORCHIDEE",
         target_module: str = "hydrol",
         work: str = os.getenv("works"),
+        config_path: str = Path(__file__).parent / "templates" / "default.yaml",
         openacc: bool = False,
         tapenade: bool = False,
         f2py: bool = False,
@@ -97,6 +101,7 @@ class Isolator:
         self.rest_of_path = rest_of_path
         self.target_module = target_module
         self.scratch_dir = work
+        self.target_model = target_model
         self.module_dir_sp = os.path.join(self.scratch_dir, self.rest_of_path)
         self.path_to_target = os.path.join(
             self.module_dir_sp, f"{self.target_module}.f90"
@@ -113,6 +118,8 @@ class Isolator:
         self.target_module_dir = os.path.join(
             os.getcwd(), self.target_module.split(".")[0]
         )
+        self.config_path = config_path
+        self.code_templates = load_code_templates(self.config_path)["Fortran_templates"]
         self.openacc = openacc
         self.f2py = f2py
         self.tapenade = tapenade
@@ -383,13 +390,18 @@ class Isolator:
         for sub_name in self.collect_all_subroutines(cls, child_procedure):
             sub_trees.append(self.working_subroutines[sub_name])
 
+        module_code_string = self.code_templates["Fortran_global_module_template"][
+            self.target_model
+        ]
+        main_code_string = self.code_templates["Fortran_main_template"]["general"]
         self.processor.update_global_module(
-            self.input_dict,
-            subroutine_dir,
-            child_procedure,
-            procedure_tree,
-            sub_trees,
-            # auto_diff=self.tapenade,
+            module_template=module_code_string,
+            main_template=main_code_string,
+            input_dict=self.input_dict,
+            subroutine_dir=subroutine_dir,
+            subroutine_name=child_procedure,
+            procedure_tree=procedure_tree,
+            custom_subroutine_trees=sub_trees,
         )
 
         if self.tapenade:
@@ -496,9 +508,18 @@ class Isolator:
             autodiff.run_python_scripts(base_dir=os.getcwd(), target_dir=subroutine_dir)
 
         write_module_tree = procedure_tree.get_root()
-        write_module_name = (
-            walk(write_module_tree, F23.Module_Stmt)[0].children[1].tostr()
-        )
+
+        module_stmt = walk(write_module_tree, F23.Module_Stmt)
+        if module_stmt:
+            assert len(module_stmt) == 1, (
+                f"Expected exactly one module per file, found {len(module_stmt)}. This case is not handled in the current implementation."
+            )
+            # There is a module statement, extract its name
+            write_module_name = module_stmt[0].children[1].tostr()
+        else:
+            # No module found, use a default name
+            write_module_name = self.target_module
+
         assert write_module_name in cls.module_path, (
             f"Module '{write_module_name}' not found in module_path. Available modules: {list(cls.module_path.keys())}"
         )
@@ -506,17 +527,18 @@ class Isolator:
             write_module_tree, cls.module_path[write_module_name]
         )
 
-        write_module_tree = call_statements[0].get_root()
-        write_module_name = (
-            walk(write_module_tree, F23.Module_Stmt)[0].children[1].tostr()
-        )
-        assert write_module_name in cls.module_path, (
-            f"Module '{write_module_name}' not found in module_path."
-        )
+        # write_module_tree = call_statements[0].get_root()
+        # write_module_name = (
+        #    walk(write_module_tree, F23.Module_Stmt)[0].children[1].tostr()
+        # )
+        # assert write_module_name in cls.module_path, (
+        #    f"Module '{write_module_name}' not found in module_path."
+        # )
+        #
+        # self.processor.write_fortran_code_to_file(
+        #    write_module_tree, cls.module_path[write_module_name]
+        # )
 
-        self.processor.write_fortran_code_to_file(
-            write_module_tree, cls.module_path[write_module_name]
-        )
         self.isolated_subroutines.add(child_procedure)
 
     def collect_global_vars_decl(self, in_dict: dict, out_dict: dict) -> None:
@@ -547,7 +569,6 @@ class Isolator:
     def process_subroutines(
         self,
         benchmark_dir: str,
-        config_path: str,
         vectorize: list[str],
         mode: str = "jax",
         parent_subroutine: str = "hydrol_main",
@@ -585,7 +606,7 @@ class Isolator:
         cls = Extractor(self.module_dir_sp, self.module_tree_cp, self.logger)
         cls.module_path[self.target_module] = self.path_to_target
         cls.parsed_modules[self.target_module] = self.module_tree_cp
-        cls.find_subroutines()
+        cls.find_subroutines(self.target_module)
 
         if self.f2py:
             self.logger.info(
@@ -596,7 +617,7 @@ class Isolator:
                 isolator=self,
                 extractor=cls,
                 ignore_case=None,
-                config_path=config_path,
+                config_path=self.config_path,
                 logger=self.logger,
             )
         else:
@@ -608,7 +629,7 @@ class Isolator:
                 f"Initializing Python for JAX conversion using mode: {mode}"
             )
             autodiff = AutoDiff(
-                config_path=config_path,
+                config_path=self.config_path,
                 vectorize=vectorize,
                 benchmark_dir=benchmark_dir,
                 mode=mode,
@@ -635,7 +656,6 @@ class Isolator:
     def run(
         self,
         benchmark_dir: str,
-        config_path: str,
         vectorize: list[str],
         mode: str = "jax",
         parent_subroutine: str = "hydrol_main",
@@ -667,7 +687,6 @@ class Isolator:
         self.create_target_directory()
         self.process_subroutines(
             benchmark_dir=benchmark_dir,
-            config_path=config_path,
             vectorize=vectorize,
             mode=mode,
             parent_subroutine=parent_subroutine,
@@ -714,6 +733,13 @@ def parse_args():
         type=str,
         required=True,
         help="Working directory root (typically environment variable like $works)",
+    )
+
+    parser.add_argument(
+        "--target_model",
+        type=str,
+        default="ORCHIDEE",
+        help="Name of the target model (default: ORCHIDEE)",
     )
 
     parser.add_argument(
@@ -808,8 +834,10 @@ if __name__ == "__main__":
 
     isolator = Isolator(
         rest_of_path=args.rest_of_path,
+        target_model=args.target_model,
         target_module=args.target_module,
         work=args.work,
+        config_path=args.config_path,
         openacc=args.openacc,
         tapenade=args.tapenade,
         f2py=args.f2py,
@@ -818,7 +846,6 @@ if __name__ == "__main__":
 
     isolator.run(
         benchmark_dir=args.benchmark_dir,
-        config_path=args.config_path,
         vectorize=args.vectorize,
         mode=args.mode,
         parent_subroutine=args.parent_subroutine,

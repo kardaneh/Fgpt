@@ -173,7 +173,7 @@ class Navigator:
                                     assert len(entity_decls) == 1, (
                                         "Assertion failed in 'find_variable_in_module': Expected 1 entity declaration, found a different number."
                                     )
-                                    entity_decl = entity_decls[0].tostr()
+                                    entity_decl = entity_decls[0].children[0].tostr()
                                     if self.variable_name_sc == entity_decl:
                                         stmt = decleration
                                         break
@@ -725,6 +725,7 @@ class FortranSearcher:
                     "ioipsl",
                     "ieee_arithmetic",
                     "netcdf",
+                    "iso_fortran_env",
                 ]:
                     continue
                 if module_name in visited_modules:

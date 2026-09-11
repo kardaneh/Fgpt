@@ -77,6 +77,7 @@ class TapenadePass:
 
         self.processor = Processor(logger=self.logger)
         self.allowed_external_subroutines = allowed_external_subroutines or []
+        self.imported_external_names = set()
         self.all_array_info = all_array_info or {}
 
         self.array_shape_not_defined = defaultdict(list)
@@ -1391,11 +1392,53 @@ class TapenadePass:
             self.extract_module_level_arrays(parse_tree)
 
             # Get all subroutine subprograms
-            subroutines = walk(parse_tree, F23.Subroutine_Subprogram)
+            subroutines = walk(parse_tree, F23.Subroutine_Subprogram) + walk(
+                parse_tree, F23.Function_Subprogram
+            )
+
+            allowed_names = {name.lower() for name in self.allowed_external_subroutines}
+            self.imported_external_names = set()
+
+            # Collect imported external names within this subroutine
+            for use_stmt in walk(parse_tree, F23.Use_Stmt):
+                children = getattr(use_stmt, "children", ())
+                only_list = next(
+                    (child for child in children if isinstance(child, F23.Only_List)),
+                    None,
+                )
+                if only_list is not None:
+                    for item in getattr(only_list, "children", ()):
+                        if not isinstance(item, F23.Name):
+                            raise AssertionError(f"Expected F23.Name, got {type(item)}")
+                        name = item.tostr()
+                        if name in allowed_names:
+                            self.imported_external_names.add(name)
+                else:
+                    module_name = next(
+                        (child for child in children if isinstance(child, F23.Name)),
+                        None,
+                    )
+                    if module_name is not None:
+                        name = module_name.tostr()
+                        if name in allowed_names:
+                            self.imported_external_names.add(name)
+
+            self.logger.info(
+                f"Allowed imported external procedures found: "
+                f"{sorted(self.imported_external_names)}"
+            )
 
             if subroutines:
                 for sub in subroutines:
-                    subroutine_stmt = walk(sub, F23.Subroutine_Stmt)[0]
+                    if isinstance(sub, F23.Subroutine_Subprogram):
+                        subroutine_stmt = walk(sub, F23.Subroutine_Stmt)[0]
+                    elif isinstance(sub, F23.Function_Subprogram):
+                        subroutine_stmt = walk(sub, F23.Function_Stmt)[0]
+                    else:
+                        self.logger.error(
+                            f"Unexpected type {type(sub)} encountered. Not implemented for processing. Skipping this subroutine."
+                        )
+
                     subroutine_name = None
                     for child in subroutine_stmt.children:
                         if isinstance(child, F23.Name):
@@ -1447,37 +1490,6 @@ class TapenadePass:
             The subroutine AST to clean.
         """
         try:
-            allowed_names = {name.lower() for name in self.allowed_external_subroutines}
-            imported_external_names = set()
-
-            # Collect imported external names within this subroutine
-            for use_stmt in walk(sub, F23.Use_Stmt):
-                children = getattr(use_stmt, "children", ())
-                only_list = next(
-                    (child for child in children if isinstance(child, F23.Only_List)),
-                    None,
-                )
-                if only_list is not None:
-                    for item in getattr(only_list, "children", ()):
-                        if not isinstance(item, F23.Name):
-                            raise AssertionError(f"Expected F23.Name, got {type(item)}")
-                        name = item.tostr()
-                        if name in allowed_names:
-                            imported_external_names.add(name)
-                else:
-                    module_name = next(
-                        (child for child in children if isinstance(child, F23.Name)),
-                        None,
-                    )
-                    if module_name is not None:
-                        name = module_name.tostr()
-                        if name in allowed_names:
-                            imported_external_names.add(name)
-
-            self.logger.info(
-                f"Subroutine '{self.current_subroutine}': Allowed imported external procedures found: "
-                f"{sorted(imported_external_names)}"
-            )
 
             def clean_use_and_external_statements(block: Any) -> None:
                 """
@@ -1515,7 +1527,8 @@ class TapenadePass:
                             )
                             if (
                                 module_name is not None
-                                and module_name.tostr() not in imported_external_names
+                                and module_name.tostr()
+                                not in self.imported_external_names
                             ):
                                 should_remove = True
 
@@ -1532,7 +1545,7 @@ class TapenadePass:
                                     external_names.add(name.tostr())
 
                         # Remove if the external statement references imported procedures
-                        if external_names & imported_external_names:
+                        if external_names & self.imported_external_names:
                             should_remove = True
 
                     # Remove the statement if flagged
@@ -1574,6 +1587,18 @@ class TapenadePass:
                             )
                         elif isinstance(lhs_expr, F23.Name):
                             array_name = lhs_expr.tostr()
+                        elif isinstance(lhs_expr, F23.Data_Ref):
+                            array_name = next(
+                                (
+                                    child.tostr()
+                                    for child in lhs_expr.children
+                                    if isinstance(child, F23.Name)
+                                ),
+                                None,
+                            )
+                            self.logger.warning(
+                                f"Unsupported LHS type in assignment: {type(lhs_expr).__name__} in '{child.tostr()}'. Not mplimented "
+                            )
                         else:
                             raise NotImplementedError(
                                 f"Unsupported LHS type in assignment: {type(lhs_expr).__name__} in '{child.tostr()}'"

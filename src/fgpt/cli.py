@@ -18,6 +18,14 @@ def _add_isolate_args(parser):
         required=True,
         help="Relative path to the directory containing the target Fortran module.",
     )
+
+    parser.add_argument(
+        "--target_model",
+        type=str,
+        default="ORCHIDEE",
+        help="Name of the target model (default: ORCHIDEE)",
+    )
+
     parser.add_argument(
         "--target_module",
         type=str,
@@ -163,8 +171,10 @@ def _run_isolate(args):
 
     isolator = Isolator(
         rest_of_path=args.rest_of_path,
+        target_model=args.target_model,
         target_module=args.target_module,
         work=args.work,
+        config_path=args.config_path,
         openacc=args.openacc,
         tapenade=args.tapenade,
         f2py=args.f2py,
@@ -184,7 +194,6 @@ def _run_isolate(args):
 
     isolator.run(
         benchmark_dir=args.benchmark_dir,
-        config_path=args.config_path,
         vectorize=args.vectorize,
         mode=args.mode,
         parent_subroutine=args.parent_subroutine,

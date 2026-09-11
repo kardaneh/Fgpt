@@ -164,6 +164,7 @@ class Extractor:
                 "read",
                 "write",
                 "albedo_surface_soilalb",
+                "GET_COMMAND_ARGUMENT",
             ]
             self.dec_global = defaultdict(lambda: defaultdict(list))
             self.all_array_info = defaultdict(lambda: defaultdict(list))
@@ -257,7 +258,7 @@ class Extractor:
             self.processor.logger.exception("Error in extract_loop_indices: ", e)
             raise
 
-    def find_subroutines(self) -> None:
+    def find_subroutines(self, module_name: str) -> None:
         """
         Discover and register all subroutines reachable from the module.
 
@@ -299,37 +300,80 @@ class Extractor:
         """
         """ """
         # Iterate through all subroutine subprograms in the module AST
-        current_module_name = (
-            walk(self.module_tree, F23.Module_Stmt)[0].children[1].tostr()
-        )
+        # current_module_name = (
+        #    walk(self.module_tree, F23.Module_Stmt)[0].children[1].tostr()
+        # )
+        module_stmt = walk(self.module_tree, F23.Module_Stmt)
+        if module_stmt:
+            assert len(module_stmt) == 1, (
+                f"Expected exactly one module per file, found {len(module_stmt)}. This case is not handled in the current implementation."
+            )
+            # There is a module statement, extract its name
+            current_module_name = module_stmt[0].children[1].tostr()
+        else:
+            # No module found, use a default name
+            current_module_name = module_name
+
         module_subroutines_queue = deque(
             walk(self.module_tree, F23.Subroutine_Subprogram)
+            + walk(self.module_tree, F23.Function_Subprogram)
+            + walk(self.module_tree, F23.Main_Program)
         )
-        module_subroutines_avail = set(
-            stmt.children[1].tostr()
-            for stmt in walk(self.module_tree, F23.Subroutine_Stmt)
-        )
+
+        module_subroutines_avail = set()
+        for stmt in walk(self.module_tree, F23.Subroutine_Stmt):
+            module_subroutines_avail.add(stmt.children[1].tostr())
+        for stmt in walk(self.module_tree, F23.Function_Stmt):
+            module_subroutines_avail.add(stmt.children[1].tostr())
+        for main_prog in walk(self.module_tree, F23.Main_Program):
+            program_stmt = walk(main_prog, F23.Program_Stmt)[0]
+            module_subroutines_avail.add(program_stmt.children[1].tostr())
+        # module_subroutines_avail = set(
+        #    stmt.children[1].tostr()
+        #    for stmt in walk(self.module_tree, F23.Subroutine_Stmt)
+        # )
 
         # for sub in walk(self.module_tree, F23.Subroutine_Subprogram):
         while module_subroutines_queue:
             sub = module_subroutines_queue.popleft()
-            subroutine_key, dummy_arg_list = None, None
+            subroutine_key, dummy_arg_list, suffix = None, None, None
 
             # Extract the main subroutine statement
-            subroutine_stmt = walk(sub, F23.Subroutine_Stmt)[0]
+            # subroutine_stmt = walk(sub, F23.Subroutine_Stmt)[0]
+            if isinstance(sub, F23.Subroutine_Subprogram):
+                subroutine_stmt = walk(sub, F23.Subroutine_Stmt)[0]
+            elif isinstance(sub, F23.Function_Subprogram):
+                subroutine_stmt = walk(sub, F23.Function_Stmt)[0]
+            elif isinstance(sub, F23.Main_Program):
+                subroutine_stmt = walk(sub, F23.Program_Stmt)[0]
+            else:
+                self.processor.logger.warning(
+                    f"Unexpected type {type(sub)} encountered. Not implemented for processing. Skipping this subroutine."
+                )
+                continue
+
             call_stmt = walk(sub, F23.Call_Stmt)
 
             # Parse subroutine statement children to extract name and dummy arguments
             for child in subroutine_stmt.children:
-                if child is None:
+                if child is None or isinstance(child, str):
                     continue
                 if isinstance(child, F23.Name):
                     subroutine_key = child.tostr()
                 elif isinstance(child, F23.Dummy_Arg_List):
                     dummy_arg_list = child
+                elif isinstance(child, F23.Suffix):
+                    assert isinstance(sub, F23.Function_Subprogram), (
+                        f"Suffix found in non-function type '{subroutine_key}': {type(sub).__name__}. This is unexpected and may indicate a parsing error."
+                    )
+                    self.logger.warning(
+                        f"Suffix found in function '{subroutine_key}': {child.tostr()}"
+                    )
+                    suffix = child.children[0].tostr()
+                    self.func_result[subroutine_key] = suffix
                 else:
                     raise ValueError(
-                        f"Unexpected type '{type(child)}' encountered in children."
+                        f"Unexpected type '{type(child)}' encountered in children {child}!"
                     )
 
             # Validate subroutine key extraction
@@ -415,16 +459,39 @@ class Extractor:
                                     f"Found external subroutine '{call_name}' in file: {call_name}, adding to processing queue"
                                 )
                                 # Add the found subroutine to the right end of the queue for processing
-                                all_subroutines_in_module = walk(
-                                    module_tree, F23.Subroutine_Subprogram
+                                all_subroutines_in_module = (
+                                    walk(module_tree, F23.Subroutine_Subprogram)
+                                    + walk(module_tree, F23.Function_Subprogram)
+                                    + walk(module_tree, F23.Main_Program)
                                 )
                                 for subroutine_subprogram in all_subroutines_in_module:
                                     module_subroutines_queue.append(
                                         subroutine_subprogram
                                     )
-                                    subroutine_stmt = walk(
-                                        subroutine_subprogram, F23.Subroutine_Stmt
-                                    )[0]
+                                    if isinstance(
+                                        subroutine_subprogram, F23.Subroutine_Subprogram
+                                    ):
+                                        subroutine_stmt = walk(
+                                            subroutine_subprogram, F23.Subroutine_Stmt
+                                        )[0]
+                                    elif isinstance(
+                                        subroutine_subprogram, F23.Function_Subprogram
+                                    ):
+                                        subroutine_stmt = walk(
+                                            subroutine_subprogram, F23.Function_Stmt
+                                        )[0]
+                                    elif isinstance(
+                                        subroutine_subprogram, F23.Main_Program
+                                    ):
+                                        subroutine_stmt = walk(
+                                            subroutine_subprogram, F23.Program_Stmt
+                                        )[0]
+                                    else:
+                                        self.processor.logger.warning(
+                                            f"Unexpected type {type(subroutine_subprogram).__name__} encountered in children. Not implemented for processing. Skipping this subroutine."
+                                        )
+                                        continue
+
                                     for child in subroutine_stmt.children:
                                         if isinstance(child, F23.Name):
                                             sub_name = child.tostr()
@@ -1046,7 +1113,7 @@ class Extractor:
                                 assert len(entity_decls) == 1, (
                                     f"walk(declaration_stmt, F23.Entity_Decl) should return exactly one, but got {len(entity_decls)}"
                                 )
-                                name = entity_decls[0].tostr()
+                                name = entity_decls[0].children[0].tostr()
                                 if intent:
                                     intent_spec_exp = self.general_usage_dict[
                                         subroutine_key
@@ -1292,7 +1359,8 @@ class Extractor:
         #    idx += 1
 
         self.var_declared[subroutine_key] = {
-            name.tostr() for name in walk(specification_part, F23.Entity_Decl)
+            name.children[0].tostr()
+            for name in walk(specification_part, F23.Entity_Decl)
         }
         names_declared, names_used = (
             walk(specification_part, F23.Name),
@@ -1306,6 +1374,11 @@ class Extractor:
             for child in type_stmts.children:
                 if isinstance(child, F23.Type_Name):
                     locally_defined_types.add(child.tostr().lower())
+
+        var_allocated_locally = {
+            allocation.children[0].tostr()
+            for allocation in walk(subroutine_tree, F23.Allocation)
+        }
 
         names_queue = deque(names_used)
         # Convert all names to lowercase for case-insensitive comparison. In some
@@ -1403,14 +1476,17 @@ class Extractor:
         self.var_global[subroutine_key] = list(seen.values())
         for idx, node in enumerate(specification_part.children):
             if isinstance(node, F23.Type_Declaration_Stmt):
-                assert len(walk(node, F23.Entity_Decl)) == 1, (
+                entity_decls = walk(node, F23.Entity_Decl)
+                assert len(entity_decls) == 1, (
                     "walk(declaration_stmt, F23.Entity_Decl), but got a different number."
                 )
+                name = entity_decls[0].children[0].tostr()
+
                 implicit_shape = walk(node, F23.Assumed_Shape_Spec)
                 intrinsic_name = walk(node, F23.Intrinsic_Name)
-                if implicit_shape:
+                if implicit_shape and name not in var_allocated_locally:
                     self.processor.logger.warning(
-                        f"Implicit shape detected in the declaration {node}"
+                        f"Implicit shape detected in the declaration {node}, it is not allocated locally!"
                     )
                     if isinstance(subroutine_tree, F23.Subroutine_Subprogram):
                         shape_finder = Shaper(
@@ -1431,7 +1507,7 @@ class Extractor:
                         node = self.processor.map_declaration(
                             node, explicit_dec=explicit_node, dimensions=None
                         )
-                        entity_decl = walk(node, F23.Entity_Decl)[0].tostr()
+                        entity_decl = walk(node, F23.Entity_Decl)[0].children[0].tostr()
                         if entity_decl not in self.imp_shape[subroutine_key]:
                             self.imp_shape[subroutine_key][entity_decl] = node
                         specification_part.children[idx] = node
@@ -1456,7 +1532,7 @@ class Extractor:
                         self.processor.logger.info(
                             f"An explicit similar declaration is found: {node}"
                         )
-                        entity_decl = walk(node, F23.Entity_Decl)[0].tostr()
+                        entity_decl = walk(node, F23.Entity_Decl)[0].children[0].tostr()
                         if entity_decl not in self.imp_shape[subroutine_key]:
                             self.imp_shape[subroutine_key][entity_decl] = node
                 if intrinsic_name:
@@ -1486,7 +1562,7 @@ class Extractor:
                 assert len(entity_decls) == 1, (
                     "walk(declaration_stmt, F23.Entity_Decl), but got a different number."
                 )
-                name = entity_decls[0].tostr()
+                name = entity_decls[0].children[0].tostr()
                 for shape_spec in walk(node, F23.Explicit_Shape_Spec):
                     for dim in walk(shape_spec, F23.Name):
                         dim_str = dim.tostr()
@@ -1775,7 +1851,7 @@ class Extractor:
                     assert len(entity_decls) == 1, (
                         f"In extract_modified_variables: walk(item, F23.Entity_Decl)=1, but got {len(entity_decls)}."
                     )
-                    entity_decl = entity_decls[0].tostr()
+                    entity_decl = entity_decls[0].children[0].tostr()
 
                     is_var_modified = entity_decl in self.var_modif[subroutine_key]
 
