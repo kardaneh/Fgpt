@@ -23,13 +23,17 @@ FGPT_CMD="fgpt"
 # Path configuration
 WORK_DIR="$works"  # Using environment variable
 REST_OF_PATH="tmp/modipsl_truck_opt/modeles/ORCHIDEE/src_sechiba/"
+
+# Model
+
+TARGET_MODEL="ORCHIDEE"
 #TARGET_MODULE="condveg" #"albedo_surface" #"condveg"
 TARGET_MODULE="hydrol"
 
 # Parent and target subroutines
 #PARENT_SUBROUTINE="condveg_main"         #"albedo_surface_main" #"condveg_main"
 #TARGET_SUBROUTINES="albedo_surface_main" #"multilevel_matrix" #"albedo_surface_main"
-PARENT_SUBROUTINE="hydrol_main"
+#PARENT_SUBROUTINE="hydrol_main"
 #TARGET_SUBROUTINES="hydrol_hydraulic_arch_tuzet_calc"
 TARGET_SUBROUTINES="hydrol_alma hydrol_vegupd hydrol_canop hydrol_flood hydrol_hydraulic_arch_tuzet_calc hydrol_soil explicitsnow_main"
 #PARENT_SUBROUTINE="hydrol_soil"
@@ -65,6 +69,7 @@ echo "=========================================="
 $FGPT_CMD isolate \\
     --work "$WORK_DIR" \\
     --rest_of_path "$REST_OF_PATH" \\
+    --target_model "$TARGET_MODEL" \\
     --target_module "$TARGET_MODULE" \\
     --parent_subroutine "$PARENT_SUBROUTINE" \\
     --target_subroutines $TARGET_SUBROUTINES \\
@@ -116,6 +121,7 @@ chmod +x "$run_script"
 
 echo "=== fgpt Setup Complete ($COMMAND) ==="
 if [[ "$COMMAND" == "isolator" ]]; then
+    echo "Target Model: $TARGET_MODEL"
     echo "Target Module: $TARGET_MODULE"
     echo "Source Path: $REST_OF_PATH"
     echo "Work Directory: $WORK_DIR"

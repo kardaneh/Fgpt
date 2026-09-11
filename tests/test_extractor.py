@@ -119,7 +119,7 @@ class TestExtractor:
     def test_extract_loop_vect(self):
         extractor = Extractor(self.test_dir, self.simple_tree, logger=Logger())
 
-        extractor.find_subroutines()
+        extractor.find_subroutines("simple_mod")
         sub_key = "test_sub"
         sub_tree = extractor.subroutines[sub_key]
 
@@ -147,13 +147,13 @@ class TestExtractor:
 
     def test_find_subroutines(self):
         extractor = Extractor(self.test_dir, self.simple_tree, logger=Logger())
-        extractor.find_subroutines()
+        extractor.find_subroutines("simple_mod")
 
         assert extractor.subroutine_keys_all == {"test_sub"}
         assert extractor.subroutine_keys_ncl == {"test_sub"}
 
         complex_extractor = Extractor(self.test_dir, self.complex_tree, logger=Logger())
-        complex_extractor.find_subroutines()
+        complex_extractor.find_subroutines("complex_tree")
 
         assert complex_extractor.subroutine_keys_all == {
             "test_sub",
@@ -169,8 +169,8 @@ class TestExtractor:
         complex_extractor = Extractor(self.test_dir, self.complex_tree, logger=Logger())
         simple_extractor = Extractor(self.test_dir, self.simple_tree, logger=Logger())
 
-        complex_extractor.find_subroutines()
-        simple_extractor.find_subroutines()
+        complex_extractor.find_subroutines("complex_tree")
+        simple_extractor.find_subroutines("simple_tree")
 
         called_key = "test_sub"
         called_tree = simple_extractor.subroutines[called_key]
@@ -201,7 +201,7 @@ class TestExtractor:
     def test_find_global_variables(self):
         extractor = Extractor(self.test_dir, self.complex_tree, logger=Logger())
 
-        extractor.find_subroutines()
+        extractor.find_subroutines("complex_tree")
 
         sub_key = "complex_sub"
         sub_tree = extractor.subroutines[sub_key]
@@ -220,7 +220,7 @@ class TestExtractor:
     def test_extract_array_info(self):
         extractor = Extractor(self.test_dir, self.complex_tree, logger=Logger())
 
-        extractor.find_subroutines()
+        extractor.find_subroutines("complex_tree")
 
         sub_key = "complex_sub"
         sub_tree = extractor.subroutines[sub_key]
@@ -246,7 +246,7 @@ class TestExtractor:
     def test_process_declaration_variables(self):
         extractor = Extractor(self.test_dir, self.simple_tree, logger=Logger())
 
-        extractor.find_subroutines()
+        extractor.find_subroutines("simple_tree")
 
         sub_key = "test_sub"
         sub_tree = extractor.subroutines[sub_key]
