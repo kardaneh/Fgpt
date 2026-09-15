@@ -1036,7 +1036,14 @@ class Processor:
                 right_part = ""
                 for child in stmt.children:
                     if isinstance(child, F23.Intrinsic_Type_Spec):
-                        left_part.append(child.tostr())
+                        child_str = child.tostr()
+                        if child.children[0] == "CHARACTER":
+                            length_selector = child.children[1]
+                            if length_selector.children[1].tostr() == "*":
+                                child_str = F23.Intrinsic_Type_Spec(
+                                    "CHARACTER(LEN=256)"
+                                ).tostr()
+                        left_part.append(child_str)
                     elif isinstance(child, F23.Declaration_Type_Spec):
                         left_part.append(child.tostr())
                     elif isinstance(child, F28.Attr_Spec_List) or isinstance(
@@ -1282,7 +1289,9 @@ class Processor:
         input_dict: dict,
         subroutine_dir: str,
         subroutine_name: str,
-        procedure_tree: F23.Function_Subprogram | F23.Subroutine_Subprogram,
+        procedure_tree: F23.Function_Subprogram
+        | F23.Subroutine_Subprogram
+        | F23.Main_Program,
         custom_subroutine_trees: list,
     ) -> None:
         """Generate and write the "global module" Fortran source for a subroutine.
@@ -1356,9 +1365,10 @@ class Processor:
 
             assert procedure_tree is not None, "procedure_tree must be provided"
             assert isinstance(
-                procedure_tree, F23.Function_Subprogram | F23.Subroutine_Subprogram
+                procedure_tree,
+                F23.Function_Subprogram | F23.Subroutine_Subprogram | F23.Main_Program,
             ), (
-                f"procedure_tree must be Function_Subprogram or Subroutine_Subprogram, got {type(procedure_tree)}"
+                f"procedure_tree must be Function_Subprogram or Subroutine_Subprogram or Main_Program, got {type(procedure_tree)}"
             )
             assert hasattr(procedure_tree, "content"), (
                 f"procedure_tree {type(procedure_tree)} has no 'content' attribute"
@@ -1481,7 +1491,9 @@ class Processor:
         var_modif: dict,
         subroutine_dir: str,
         subroutine_name: str,
-        procedure_tree: F23.Subroutine_Subprogram | F23.Function_Subprogram,
+        procedure_tree: F23.Subroutine_Subprogram
+        | F23.Function_Subprogram
+        | F23.Main_Program,
         openacc: bool = False,
         dummy_add_decl=None,
         error_flag: dict = None,
@@ -1583,9 +1595,10 @@ class Processor:
 
             assert procedure_tree is not None, "procedure_tree must be provided"
             assert isinstance(
-                procedure_tree, F23.Function_Subprogram | F23.Subroutine_Subprogram
+                procedure_tree,
+                F23.Function_Subprogram | F23.Subroutine_Subprogram | F23.Main_Program,
             ), (
-                f"procedure_tree must be Function_Subprogram or Subroutine_Subprogram, got {type(procedure_tree)}"
+                f"procedure_tree must be Function_Subprogram or Subroutine_Subprogram or Main_Program, got {type(procedure_tree)}"
             )
             assert hasattr(procedure_tree, "content"), (
                 f"procedure_tree {type(procedure_tree)} has no 'content' attribute"
@@ -1665,17 +1678,19 @@ class Processor:
                                 kdx += 1
                         elif isinstance(subnode, F23.Execution_Part):
                             kdx = len(subnode.content) - 1
-                            subroutine_call = "Call declaration_initialization"
-                            subnode.content.insert(
-                                kdx + 1, F23.Call_Stmt(subroutine_call)
-                            )
-                            kdx += 1
 
-                            subroutine_call = "Call read_dummy"
-                            subnode.content.insert(
-                                kdx + 1, F23.Call_Stmt(subroutine_call)
-                            )
-                            kdx += 1
+                            if not isinstance(procedure_tree, F23.Main_Program):
+                                subroutine_call = "Call declaration_initialization"
+                                subnode.content.insert(
+                                    kdx + 1, F23.Call_Stmt(subroutine_call)
+                                )
+                                kdx += 1
+
+                                subroutine_call = "Call read_dummy"
+                                subnode.content.insert(
+                                    kdx + 1, F23.Call_Stmt(subroutine_call)
+                                )
+                                kdx += 1
 
                             code_start = """
                             call SYSTEM_CLOCK(ic0, icr, ic)
@@ -1687,8 +1702,9 @@ class Processor:
                             )
                             kdx += 1
 
-                            subnode.content.insert(kdx + 1, call_stmts[0])
-                            kdx += 1
+                            if call_stmts:
+                                subnode.content.insert(kdx + 1, call_stmts[0])
+                                kdx += 1
 
                             code_end = f"""
                             call SYSTEM_CLOCK(ic0, icr, ic)
