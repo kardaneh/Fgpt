@@ -14,7 +14,7 @@ subroutine set_data(arr, size, start, step)
         arr(i) = start + real(i - 1) * step
     end do
 
-    print '(A,ES12.4,A,ES12.4)', "Data set successfully! start=", start, &
+    print *, "Data set successfully! start=", start, &
                                  " step=", step
 end subroutine set_data
 
@@ -33,7 +33,7 @@ subroutine process_data(arr, size, a, b, c)
         arr(i) = a * arr(i) * arr(i) + b * arr(i) + c
     end do
 
-    print '(A,3(A,ES12.4))', "Data processed successfully!", &
+    print *, "Data processed successfully!", &
                              " a=", a, " b=", b, " c=", c
 end subroutine process_data
 
@@ -45,25 +45,25 @@ subroutine display_data(arr, size, label)
     implicit none
     integer, intent(in)  :: size
     real,    intent(in)  :: arr(size)
-    character(len=12), intent(in) :: label
+    character(len=*), intent(in) :: label
     real    :: vmin, vmax, vsum
     integer :: i
 
-    print '(A)', trim(label)
+    print *, trim(label)
 
     vmin = arr(1)
     vmax = arr(1)
     vsum = 0.0
     do i = 1, size
-        print '(A,I4,A,ES20.12)', " Element ", i, " : ", arr(i)
+        print *, " Element ", i, " : ", arr(i)
         if (arr(i) < vmin) vmin = arr(i)
         if (arr(i) > vmax) vmax = arr(i)
         vsum = vsum + arr(i)
     end do
 
-    print '(A,ES16.8)', "   min = ", vmin
-    print '(A,ES16.8)', "   max = ", vmax
-    print '(A,ES16.8)', "   sum = ", vsum
+    print *, "   min = ", vmin
+    print *, "   max = ", vmax
+    print *, "   sum = ", vsum
 end subroutine display_data
 
 
@@ -96,7 +96,7 @@ function compute_average(arr, size, variance, stddev) result(avg)
     variance = var
     stddev   = sqrt(var)
 
-    print '(A)', "Average computed!"
+    print *, "Average computed!"
 end function compute_average
 
 
@@ -109,27 +109,23 @@ subroutine dump_to_file(arr, size, filename)
     implicit none
     integer, intent(in) :: size
     real,    intent(in) :: arr(size)
-    character(LEN = 15), intent(in) :: filename
+    character(LEN = *), intent(in) :: filename
     integer :: i, unit, ios
-    character(len=15) :: binname
-
-    binname = filename
-    binname(13:15) = "bin"
 
     ! ---- Formatted text output ----
-    open(newunit=unit, file=filename, status='replace', &
+    open(newunit=unit, file=trim(filename), status='replace', &
          action='write', iostat=ios)
     if (ios /= 0) then
-        print '(A,A)', "ERROR: could not open ", trim(filename)
+        print *, "ERROR: could not open ", trim(filename)
         return
     end if
     do i = 1, size
-        write(unit, '(ES24.16)') arr(i)
+        write(unit, *) arr(i)
     end do
     close(unit)
 
-    print '(A,A,A,A)', "Data written to file: ", trim(filename), &
-                       "  (binary: ", trim(binname)//")"
+    print *, "Data written to file: ", trim(filename)
+
 end subroutine dump_to_file
 
 
@@ -154,7 +150,7 @@ subroutine reset_data(arr, size, value, first, last)
         arr(i) = value
     end do
 
-    print '(A,ES12.4,A,I0,A,I0,A)', "Data reset to ", value, &
+    print *, "Data reset to ", value, &
           " over [", lo, ",", hi, "]"
 end subroutine reset_data
 
@@ -174,7 +170,7 @@ subroutine scale_data(arr, size, factor, offset)
         arr(i) = arr(i) * factor + offset
     end do
 
-    print '(A,ES12.4,A,ES12.4)', "Data scaled by factor: ", factor, &
+    print *, "Data scaled by factor: ", factor, &
                                  " offset: ", offset
 end subroutine scale_data
 
@@ -195,15 +191,15 @@ program test_procedures
     ! Pass 1: simple sequence, default doubling
 
     call set_data(data_array, n, 0.0, 1.5)
-    call display_data(data_array, n, "Initial data")
+    call display_data(data_array, n, "Initial data display")
 
     call process_data(data_array, n, 0.0, 2.0, 0.0)   ! arr = 2*arr
     call display_data(data_array, n, "After process_data (2*x)")
 
     average = compute_average(data_array, n, variance, stddev)
-    print '(A,ES16.8)', "Average value: ", average
-    print '(A,ES16.8)', "Variance     : ", variance
-    print '(A,ES16.8)', "Std deviation: ", stddev
+    print *, "Average value: ", average
+    print *, "Variance     : ", variance
+    print *, "Std deviation: ", stddev
 
     call scale_data(data_array, n, 0.5, 0.0)
     call display_data(data_array, n, "After scale_data (0.5*x)")
@@ -235,5 +231,5 @@ program test_procedures
 
     deallocate(data_array)
 
-    print '(A)', "Program completed successfully!"
+    print *, "Program completed successfully!"
 end program test_procedures
