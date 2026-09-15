@@ -254,7 +254,9 @@ class Isolator:
         ``cls.call_within_sub[child_procedure]`` that is not already present
         in :attr:`isolated_subroutines`.
         """
-        call_statements = cls.call_within_sub[parent_procedure][child_procedure]
+        call_statements = cls.call_within_sub.get(parent_procedure, {}).get(
+            child_procedure, []
+        )
 
         for i, call_stmt in enumerate(call_statements):
             self.logger.info(f"  Call site {i + 1}: {call_stmt.tostr()}")
@@ -265,8 +267,12 @@ class Isolator:
             procedure_type = "subroutine"
         elif isinstance(procedure_tree, F23.Function_Subprogram):
             procedure_type = "function"
+        elif isinstance(procedure_tree, F23.Main_Program):
+            procedure_type = "main_program"
         else:
             raise ValueError(f"Unknown procedure type: {type(procedure_tree)}")
+
+        self.logger.info(f"The procedure type is {procedure_type}.")
 
         cls.find_variables(procedure_tree, child_procedure, parent_procedure)
 
@@ -388,12 +394,22 @@ class Isolator:
 
         sub_trees = []
         for sub_name in self.collect_all_subroutines(cls, child_procedure):
+            if procedure_type == "main_program" and sub_name == child_procedure:
+                self.logger.warning(
+                    f"The procedure {child_procedure} is a main_program, so not need to add it into global module."
+                )
+                continue
             sub_trees.append(self.working_subroutines[sub_name])
 
         module_code_string = self.code_templates["Fortran_global_module_template"][
             self.target_model
         ]
-        main_code_string = self.code_templates["Fortran_main_template"]["general"]
+
+        if procedure_type == "main_program":
+            main_code_string = subroutine_tree_cp.tostr()
+        else:
+            main_code_string = self.code_templates["Fortran_main_template"]["general"]
+
         self.processor.update_global_module(
             module_template=module_code_string,
             main_template=main_code_string,
@@ -451,10 +467,18 @@ class Isolator:
             call_stmt_org = F23.Assignment_Stmt(
                 f"{cls.func_result[child_procedure]} = {child_procedure}({arg_list})"
             )
+        elif procedure_type == "main_program":
+            self.logger.info(
+                f"The procedure type is {procedure_type}. No need fro call statment!"
+            )
+            call_stmt_org = None
         else:
             raise ValueError(f"Unsupported procedure type: {procedure_type}")
 
-        call_stmts = [call_stmt_org]
+        if call_stmt_org is not None:
+            call_stmts = [call_stmt_org]
+        else:
+            call_stmts = []
 
         dec_dummy = defaultdict(lambda: defaultdict(list))
         for decleration in cls.var_dummy[child_procedure]:
@@ -466,6 +490,7 @@ class Isolator:
         self.input_dict = cls.organize_code_components(
             child_procedure, dec_dummy[child_procedure], openacc=self.openacc
         )
+
         self.processor.update_main_program(
             input_dict=self.input_dict,
             call_stmts=call_stmts,
