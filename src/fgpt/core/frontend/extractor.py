@@ -352,8 +352,6 @@ class Extractor:
                 )
                 continue
 
-            call_stmt = walk(sub, F23.Call_Stmt)
-
             # Parse subroutine statement children to extract name and dummy arguments
             for child in subroutine_stmt.children:
                 if child is None or isinstance(child, str):
@@ -424,6 +422,43 @@ class Extractor:
                 for child in dummy_arg_list.children:
                     self.dummy_arg_list[subroutine_key].append(child.tostr())
 
+            # FUNCTION CALLS VIA ASSIGNMENT STATEMENTS
+            # Walk assignment statements in `sub`, inspect the RHS, and if a
+            # Name on the RHS matches a known function name, register it as a
+            # call (mirrors the Call_Stmt handling above).
+            for assignment in walk(sub, F23.Assignment_Stmt):
+                rhs_expr = assignment.items[-1]
+                for pr in walk(rhs_expr, F23.Part_Ref):
+                    fun_name = pr.children[0].tostr()
+
+                    # Skip names we've excluded by pattern
+                    check = all(case not in fun_name for case in self.cases_to_exclude)
+                    if not check:
+                        continue
+
+                    # Only treat it as a function call if:
+                    #  * the name is not an allowed external routine
+                    #  * the name is a known procedure in this module
+                    if fun_name in self.allowed_external_subroutines:
+                        continue
+                    if fun_name not in module_subroutines_avail:
+                        continue
+                    # Skip self-reference
+                    if fun_name == subroutine_key:
+                        continue
+                    self.logger.info(
+                        f"Function {fun_name} is called inside the assignment {assignment} of procedure {subroutine_key}."
+                    )
+
+                    # Register the function call
+                    self.call_subroutines[fun_name].append(assignment)
+                    self.call_within_sub[subroutine_key][fun_name].append(assignment)
+
+                    arg_list = pr.children[1]
+                    if arg_list is not None:
+                        arg_string = [child.tostr() for child in arg_list.children]
+                        self.actual_arg_spec_list[fun_name].append(arg_string)
+            call_stmt = walk(sub, F23.Call_Stmt)
             # Process call statements within the subroutine
             if call_stmt:
                 for item in call_stmt:
@@ -904,7 +939,9 @@ class Extractor:
     def extract_intent(
         self,
         subroutine_key: str,
-        subroutine_tree: F23.Subroutine_Subprogram | F23.Function_Subprogram,
+        subroutine_tree: F23.Subroutine_Subprogram
+        | F23.Function_Subprogram
+        | F23.Main_Program,
         within_calls: dict = None,
     ) -> None:
         """
@@ -921,7 +958,7 @@ class Extractor:
         The final per-variable intent (``"IN"``, ``"OUT"``, ``"INOUT"``, or
         ``None`` if unused) is stored in
         :attr:`general_usage_dict` ``[subroutine_key]``, which downstream
-        methods such as :meth:`clean_subroutine` and
+        methods such as :meth:`len=15` and
         :meth:`_process_intent_call_statement` (for callers of this
         subroutine) consult.
 
@@ -961,6 +998,8 @@ class Extractor:
                     elif isinstance(
                         child,
                         F23.Nonlabel_Do_Stmt
+                        | F23.Write_Stmt
+                        | F23.Print_Stmt
                         | F23.If_Then_Stmt
                         | F23.Else_If_Stmt
                         | F23.Where_Construct_Stmt
@@ -985,10 +1024,10 @@ class Extractor:
         self.general_usage_dict[subroutine_key] = {
             var: props["intent"] for var, props in usage.items()
         }
-        # self.processor.logger.info(f"Induced INTENT for subroutine '{subroutine_key}':")
-        # for var, props in usage.items():
-        #    intent = props['intent'] if props['intent'] is not None else 'UNKNOWN'
-        #    self.processor.logger.info(f"  '{var}': '{intent}'")
+        self.processor.logger.info(f"Induced INTENT for subroutine '{subroutine_key}':")
+        for var, props in usage.items():
+            intent = props["intent"] if props["intent"] is not None else "UNKNOWN"
+            self.processor.logger.info(f"  '{var}': '{intent}'")
 
     @staticmethod
     def add_intent(
@@ -1055,7 +1094,11 @@ class Extractor:
         )
 
     def clean_subroutine(
-        self, subroutine_key: str, subroutine_tree: F23.Subroutine_Subprogram
+        self,
+        subroutine_key: str,
+        subroutine_tree: F23.Subroutine_Subprogram
+        | F23.Function_Subprogram
+        | F23.Main_Program,
     ) -> None:
         """
         Validates and corrects INTENT specifications for dummy arguments in a given subroutine.
@@ -1175,6 +1218,15 @@ class Extractor:
                                             self.processor.logger.warning(
                                                 f"Name {name} is not used. Declaration: {stmt.tostr()}"
                                             )
+                                    else:
+                                        self.processor.logger.warning(
+                                            f"Name '{name}' is not a dummy argument, and no need to add any intent."
+                                        )
+                                        if self._is_function_declaration(
+                                            stmt, subroutine_key
+                                        ):
+                                            continue
+
                                 block.content.insert(idc + 1, stmt)
                             del block.content[idc]
                         else:
@@ -1240,15 +1292,65 @@ class Extractor:
                                         self.processor.logger.warning(
                                             f"Name '{name}' is not used in declaration: {child.tostr()}"
                                         )
+                                else:
+                                    if self._is_function_declaration(
+                                        child, subroutine_key
+                                    ):
+                                        del block.content[idc]
+                                        continue
+
                     else:
                         traverse_subroutine(child)
                     idc += 1
 
         traverse_subroutine(subroutine_tree)
 
+    def _is_function_declaration(
+        self, stmt: F23.Type_Declaration_Stmt, subroutine_key: str
+    ) -> bool:
+        """
+        Return True if *stmt* declares a name that is actually a function
+        called from *subroutine_key* (i.e. present in
+        ``self.call_within_sub[subroutine_key]``), meaning the declaration
+        should be removed because the function now lives in the generated
+        module and is visible via USE.
+
+        Sanity-checks that the recorded call site(s) exist and are assignment
+        statements (function calls).
+        """
+
+        entity_decls = walk(stmt, F23.Entity_Decl)
+        assert len(entity_decls) == 1, (
+            f"walk(declaration_stmt, F23.Entity_Decl) should return exactly one, but got {len(entity_decls)}."
+        )
+        name = entity_decls[0].children[0].tostr()
+
+        called = self.call_within_sub.get(subroutine_key, {})
+        if name not in called:
+            return False
+
+        call_sites = called[name]
+        assert isinstance(call_sites, list) and call_sites, (
+            f"Expected non-empty list of call sites for '{name}' in "
+            f"call_within_sub['{subroutine_key}'], got {call_sites!r}"
+        )
+        for site in call_sites:
+            assert isinstance(site, F23.Assignment_Stmt), (
+                f"Expected Assignment_Stmt call site for function '{name}' "
+                f"in '{subroutine_key}', got {type(site).__name__}"
+            )
+
+        self.processor.logger.warning(
+            f"Removing declaration of function '{name}' from "
+            f"'{subroutine_key}' (now provided by the generated module)."
+        )
+        return True
+
     def find_variables(
         self,
-        subroutine_tree: F23.Subroutine_Subprogram | F23.Function_Subprogram,
+        subroutine_tree: F23.Subroutine_Subprogram
+        | F23.Function_Subprogram
+        | F23.Main_Program,
         subroutine_key: str,
         parent_subroutine_key: str = None,
     ) -> None:
@@ -1687,7 +1789,9 @@ class Extractor:
     def extract_modified_variables(
         self,
         subroutine_key: str,
-        subroutine_tree: F23.Subroutine_Subprogram | F23.Function_Subprogram,
+        subroutine_tree: F23.Subroutine_Subprogram
+        | F23.Function_Subprogram
+        | F23.Main_Program,
     ) -> None:
         """
         Determine which variables are written to within a subroutine.
