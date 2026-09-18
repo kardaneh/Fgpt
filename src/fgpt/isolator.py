@@ -368,9 +368,9 @@ class Isolator:
             )
 
         cls.extract_intent(child_procedure, procedure_tree, calls)
-        cls.clean_subroutine(child_procedure, procedure_tree)
-        cls.extract_local_in_variables(child_procedure, procedure_tree)
-        cls.extract_modified_variables(child_procedure, procedure_tree)
+        cleaned_procedure_tree = cls.clean_subroutine(child_procedure, procedure_tree)
+        cls.extract_local_in_variables(child_procedure, cleaned_procedure_tree)
+        cls.extract_modified_variables(child_procedure, cleaned_procedure_tree)
 
         assert os.path.exists(self.processor.benchmark_dir), (
             "benchmark directory does not exist!"
@@ -387,7 +387,7 @@ class Isolator:
         )
 
         subroutine_tree_cp = self.processor.parse_fortran_string(
-            procedure_tree.tofortran()
+            cleaned_procedure_tree.tofortran()
         )
         self.processor.remove_io_statements(subroutine_tree_cp)
         self.working_subroutines[child_procedure] = subroutine_tree_cp
@@ -396,7 +396,8 @@ class Isolator:
         for sub_name in self.collect_all_subroutines(cls, child_procedure):
             if procedure_type == "main_program" and sub_name == child_procedure:
                 self.logger.warning(
-                    f"The procedure {child_procedure} is a main_program, so not need to add it into global module."
+                    f"Procedure '{child_procedure}' is a main program; "
+                    f"it does not need to be added to the global module."
                 )
                 continue
             sub_trees.append(self.working_subroutines[sub_name])
