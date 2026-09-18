@@ -180,6 +180,7 @@ python-venv/*
 !python-venv/.gitkeep
 
 example_*/*
+*_demo/*
 
 src/fgpt/gpu_isolator.py
 src/fgpt/core/passes/modifier.py

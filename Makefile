@@ -9,7 +9,7 @@
 # -----------------------------
 # Environment
 # -----------------------------
-WORK = /data/ssivanes
+WORK = /scratchu/kardaneh/tmp
 FC_NVIDIA = mpif90
 CC        = mpicc
 
