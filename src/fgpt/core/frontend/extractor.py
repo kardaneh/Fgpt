@@ -6,6 +6,7 @@
 # To view a copy of this license, visit
 # http://creativecommons.org/licenses/by-nc-sa/4.0/
 
+import copy
 import os
 import shutil
 from collections import defaultdict, deque
@@ -164,7 +165,6 @@ class Extractor:
                 "read",
                 "write",
                 "albedo_surface_soilalb",
-                "GET_COMMAND_ARGUMENT",
             ]
             self.dec_global = defaultdict(lambda: defaultdict(list))
             self.all_array_info = defaultdict(lambda: defaultdict(list))
@@ -186,9 +186,14 @@ class Extractor:
             self.org_files_loaded = set()
             self.processor = Processor(logger=self.logger)
             self.exclude.update(self.processor.fortran_intrinsics)
-            self.allowed_external_subroutines = (
+            self.exclude.update(self.processor.allowed_netcdf_variables)
+            self.allowed_external_subroutines = set(
                 self.processor.allowed_external_subroutines
             )
+            self.allowed_external_subroutines.update(
+                self.processor.allowed_fortran_procedure
+            )
+
             self.procedure_search = FortranSearcher(
                 self.module_path,
                 self.parsed_modules,
@@ -335,7 +340,27 @@ class Extractor:
 
         # for sub in walk(self.module_tree, F23.Subroutine_Subprogram):
         while module_subroutines_queue:
+            prefix = None
             sub = module_subroutines_queue.popleft()
+
+            # attention: internal subprogram part need to be removed!
+            internal_subprogram_part_index = None
+            for idx, node in enumerate(sub.content):
+                if isinstance(node, F23.Internal_Subprogram_Part):
+                    internal_subprogram_part_index = idx
+                    filtered = copy.copy(sub)
+                    break
+            if internal_subprogram_part_index is not None:
+                filtered.content = [
+                    node
+                    for node in sub.content
+                    if not isinstance(node, F23.Internal_Subprogram_Part)
+                ]
+                self.logger.warning(
+                    "The internal subprogram part shoud not be present in main procedure. Remove!"
+                )
+                sub = filtered
+
             subroutine_key, dummy_arg_list, suffix = None, None, None
 
             # Extract the main subroutine statement
@@ -369,6 +394,11 @@ class Extractor:
                     )
                     suffix = child.children[0].tostr()
                     self.func_result[subroutine_key] = suffix
+                elif isinstance(child, F23.Prefix):
+                    self.logger.warning(
+                        f"Prefix found in function '{subroutine_stmt.tostr()}': {child.tostr()}"
+                    )
+                    prefix = child.tostr()
                 else:
                     raise ValueError(
                         f"Unexpected type '{type(child)}' encountered in children {child}!"
@@ -378,6 +408,21 @@ class Extractor:
             assert subroutine_key is not None, (
                 f"Unexpected type {subroutine_key} encountered in children."
             )
+
+            if prefix is not None:
+                self.logger.warning(f"There is a prefix for for '{subroutine_key}'")
+                assert isinstance(sub, F23.Function_Subprogram), (
+                    f"Prefix found in non-function type '{subroutine_key}': "
+                    f"{type(sub).__name__}. This is unexpected and may indicate a parsing error."
+                )
+                self.logger.warning(
+                    f"Using '{subroutine_key}_result' as result variable. "
+                    f"The variable '{subroutine_key}_result' will be referenced by the generated write statement, but it is not "
+                    f"declared in the original code. Remove the corresponding write statement from the original code and the "
+                    f"corresponding read statement from the isolated function '{subroutine_key}'. Otherwise, the generated "
+                    f"in/out benchmark will fail to compile under Fortran `implicit none`."
+                )
+                self.func_result[subroutine_key] = f"{subroutine_key}_result"
 
             for loop in walk(sub, F23.Nonlabel_Do_Stmt):
                 if len(loop.children) < 2 or loop.children[1] is None:
@@ -426,38 +471,39 @@ class Extractor:
             # Walk assignment statements in `sub`, inspect the RHS, and if a
             # Name on the RHS matches a known function name, register it as a
             # call (mirrors the Call_Stmt handling above).
-            for assignment in walk(sub, F23.Assignment_Stmt):
-                rhs_expr = assignment.items[-1]
-                for pr in walk(rhs_expr, F23.Part_Ref):
-                    fun_name = pr.children[0].tostr()
+            # for assignment in walk(sub, F23.Assignment_Stmt):
+            #    rhs_expr = assignment.items[-1]
+            # This line might need extension:
+            for pr in walk(sub, F23.Part_Ref) + walk(sub, F23.Structure_Constructor):
+                fun_name = pr.children[0].tostr()
 
-                    # Skip names we've excluded by pattern
-                    check = all(case not in fun_name for case in self.cases_to_exclude)
-                    if not check:
-                        continue
+                # Skip names we've excluded by pattern
+                check = all(case not in fun_name for case in self.cases_to_exclude)
+                if not check:
+                    continue
 
-                    # Only treat it as a function call if:
-                    #  * the name is not an allowed external routine
-                    #  * the name is a known procedure in this module
-                    if fun_name in self.allowed_external_subroutines:
-                        continue
-                    if fun_name not in module_subroutines_avail:
-                        continue
-                    # Skip self-reference
-                    if fun_name == subroutine_key:
-                        continue
-                    self.logger.info(
-                        f"Function {fun_name} is called inside the assignment {assignment} of procedure {subroutine_key}."
-                    )
+                # Only treat it as a function call if:
+                #  * the name is not an allowed external routine
+                #  * the name is a known procedure in this module
+                if fun_name in self.allowed_external_subroutines:
+                    continue
+                if fun_name not in module_subroutines_avail:
+                    continue
+                # Skip self-reference
+                if fun_name == subroutine_key:
+                    continue
+                self.logger.info(
+                    f"Function {fun_name} is called as {pr} inside of procedure {subroutine_key}."
+                )
 
-                    # Register the function call
-                    self.call_subroutines[fun_name].append(assignment)
-                    self.call_within_sub[subroutine_key][fun_name].append(assignment)
+                # Register the function call
+                self.call_subroutines[fun_name].append(pr)
+                self.call_within_sub[subroutine_key][fun_name].append(pr)
 
-                    arg_list = pr.children[1]
-                    if arg_list is not None:
-                        arg_string = [child.tostr() for child in arg_list.children]
-                        self.actual_arg_spec_list[fun_name].append(arg_string)
+                arg_list = pr.children[1]
+                if arg_list is not None:
+                    arg_string = [child.tostr() for child in arg_list.children]
+                    self.actual_arg_spec_list[fun_name].append(arg_string)
             call_stmt = walk(sub, F23.Call_Stmt)
             # Process call statements within the subroutine
             if call_stmt:
@@ -834,6 +880,105 @@ class Extractor:
                 if usage[var_name]["intent"] is None:
                     usage[var_name]["intent"] = "IN"
 
+    def _process_intent_write_only_statement(
+        self,
+        child: F23.Read_Stmt,
+        child_parent: object,
+        dummy_arg_list: list[str],
+        usage: dict,
+    ) -> None:
+        """
+        Mark dummy arguments referenced in a write-only construct (e.g. a
+        ``READ`` statement) according to how they are actually used.
+
+        A ``READ`` statement has (roughly) two distinct regions that must be
+        treated differently:
+
+        - The I/O control spec (unit number, format, ``IOSTAT=``, etc.) —
+          names here are only *read* (they control the read, they are not
+          filled in by it).
+        - The input item list — the variables actually being written to.
+          Within this list, any name that appears inside an array subscript
+          (:class:`~fparser.two.Fortran2003.Section_Subscript_List` or
+          :class:`~fparser.two.Fortran2003.Subscript_Triplet`), such as the
+          bounds/index of ``mat(1:ncol)``, is itself only *read* — it is
+          used to select which elements are written, not written itself.
+          Any other name in the input item list is a genuine write target.
+
+        "First use" bookkeeping (including the conditional branch-tracking
+        shared with the other ``_process_intent_*`` helpers) is updated for
+        every dummy-argument occurrence, regardless of whether that
+        particular occurrence turns out to be a read or a write.
+
+        Parameters
+        ----------
+        child : fparser.two.Fortran2003.Read_Stmt
+            The read statement to analyze.
+        child_parent : object
+            The parent AST node of *child*, used to detect conditional
+            (``If_Construct``) context.
+        dummy_arg_list : list of str
+            Names of the dummy arguments being tracked for the enclosing
+            subroutine.
+        usage : dict
+            Mutable mapping of variable name to intent-tracking state,
+            updated in place. See :meth:`extract_intent`.
+        """
+
+        def _update_first_use(var_name: str) -> None:
+            if (
+                isinstance(child_parent, F23.If_Construct)
+                and usage[var_name]["first_use_assign"] is not None
+                and usage[var_name]["first_use_assign"].parent == child_parent
+            ):
+                usage[var_name]["first_use_update"] = True
+
+            if (
+                usage[var_name]["first_use_assign"] is None
+                or usage[var_name]["first_use_update"]
+            ):
+                usage[var_name]["first_use_assign"] = child
+
+        def _apply_read_only(var_name: str) -> None:
+            # Same accumulation rule as array subscripts / DO bounds / etc.
+            if usage[var_name]["intent"] is None:
+                usage[var_name]["intent"] = "IN"
+
+        def _apply_write(var_name: str) -> None:
+            if usage[var_name]["intent"] is None:
+                usage[var_name]["intent"] = "OUT"
+            elif usage[var_name]["intent"] == "IN":
+                usage[var_name]["intent"] = "INOUT"
+            # already 'OUT' or 'INOUT' -> unchanged
+
+        # --- Io_Control_Spec_List: unit / format / IOSTAT / etc. -> read-only
+        io_control_list = child.children[0] if child.children else None
+        if io_control_list is not None:
+            for name in walk(io_control_list, F23.Name):
+                var_name = name.tostr()
+                if var_name in dummy_arg_list:
+                    _update_first_use(var_name)
+                    _apply_read_only(var_name)
+
+        # --- Input_Item_List: the actual variables being read into
+        input_item_list = child.children[2] if len(child.children) > 2 else None
+        if input_item_list is not None:
+            for name in walk(input_item_list, F23.Name):
+                var_name = name.tostr()
+                if var_name not in dummy_arg_list:
+                    continue
+
+                _update_first_use(var_name)
+
+                # Names inside a subscript (index/bound expression) are
+                # read-only, e.g. `ncol`/`i` in mat(1:ncol) or mat(i,:)
+                if isinstance(
+                    name.parent, F23.Section_Subscript_List | F23.Subscript_Triplet
+                ):
+                    _apply_read_only(var_name)
+                else:
+                    _apply_write(var_name)
+
     def _process_intent_call_statement(
         self,
         child: F23.Call_Stmt,
@@ -1000,6 +1145,9 @@ class Extractor:
                         F23.Nonlabel_Do_Stmt
                         | F23.Write_Stmt
                         | F23.Print_Stmt
+                        | F23.Inquire_Stmt
+                        | F23.If_Stmt
+                        | F23.Open_Stmt
                         | F23.If_Then_Stmt
                         | F23.Else_If_Stmt
                         | F23.Where_Construct_Stmt
@@ -1008,6 +1156,11 @@ class Extractor:
                         | F23.Case_Stmt,
                     ):
                         self._process_intent_read_only_statement(
+                            child, child_parent, dummy_arg_list, usage
+                        )
+
+                    elif isinstance(child, F23.Read_Stmt):
+                        self._process_intent_write_only_statement(
                             child, child_parent, dummy_arg_list, usage
                         )
 
@@ -1303,7 +1456,10 @@ class Extractor:
                         traverse_subroutine(child)
                     idc += 1
 
-        traverse_subroutine(subroutine_tree)
+        # traverse_subroutine(subroutine_tree)
+        cleaned_tree = self.processor.parse_fortran_string(subroutine_tree.tostr())
+        traverse_subroutine(cleaned_tree)
+        return cleaned_tree
 
     def _is_function_declaration(
         self, stmt: F23.Type_Declaration_Stmt, subroutine_key: str
@@ -1335,14 +1491,14 @@ class Extractor:
             f"call_within_sub['{subroutine_key}'], got {call_sites!r}"
         )
         for site in call_sites:
-            assert isinstance(site, F23.Assignment_Stmt), (
+            assert isinstance(site, F23.Part_Ref | F23.Structure_Constructor), (
                 f"Expected Assignment_Stmt call site for function '{name}' "
                 f"in '{subroutine_key}', got {type(site).__name__}"
             )
 
         self.processor.logger.warning(
-            f"Removing declaration of function '{name}' from "
-            f"'{subroutine_key}' (now provided by the generated module)."
+            f"Removing declaration of function '{name}' from '{subroutine_key}': "
+            f"no longer needed — the function is provided by the generated module."
         )
         return True
 
@@ -1675,7 +1831,38 @@ class Extractor:
                             shapes[dim_str] = dim
                 if name in self.dummy_arg_list[subroutine_key]:
                     if name not in self.exclude:
-                        self.var_dummy[subroutine_key].append(node)
+                        # self.var_dummy[subroutine_key].append(node)
+                        # Detect CHARACTER(LEN=*) and rewrite it as
+                        # CHARACTER(LEN=:), ALLOCATABLE plus a companion
+                        # INTEGER, INTENT(IN) :: <name>_length
+                        converted = False
+                        for child in node.children:
+                            if isinstance(child, F23.Intrinsic_Type_Spec):
+                                if child.children[0] == "CHARACTER":
+                                    length_selector = child.children[1]
+                                    if (
+                                        length_selector is not None
+                                        and length_selector.children[1] is not None
+                                        and length_selector.children[1].tostr() == "*"
+                                    ):
+                                        alloc_decl = F23.Type_Declaration_Stmt(
+                                            f"CHARACTER(LEN = :), ALLOCATABLE :: {name}"
+                                        )
+                                        len_decl = F23.Type_Declaration_Stmt(
+                                            f"INTEGER, INTENT(IN) :: {name}_length_character"
+                                        )
+                                        self.var_dummy[subroutine_key].append(len_decl)
+                                        self.var_dummy[subroutine_key].append(
+                                            alloc_decl
+                                        )
+                                        # self.dummy_arg_list[subroutine_key].append(
+                                        #    f"{name}_length"
+                                        # )
+                                        converted = True
+                                break
+                        if not converted:
+                            self.var_dummy[subroutine_key].append(node)
+
                 else:
                     if name == subroutine_key or (
                         subroutine_key in self.func_result
@@ -2059,9 +2246,7 @@ class Extractor:
                 for i, item in enumerate(cached_data, 1):
                     self.processor.logger.info(f"   {i}. {item}")
                 if walk(cached_data, F23.Function_Subprogram):
-                    parent = self.processor.find_enclosing_parent(
-                        var, F23.Assignment_Stmt
-                    )
+                    parent = self.processor.find_enclosing_parent(var, F23.Part_Ref)
                     self.processor.logger.info(
                         f"The global {declaration} used in {parent} is a Function_Subprogram."
                     )
@@ -2139,9 +2324,7 @@ class Extractor:
                             self.processor.logger.info(
                                 f"Created backup of original file: {path_to_original}"
                             )
-                        parent = self.processor.find_enclosing_parent(
-                            var, F23.Assignment_Stmt
-                        )
+                        parent = self.processor.find_enclosing_parent(var, F23.Part_Ref)
                         self.processor.logger.info(
                             f"The global {declaration} used in {parent} is a Function_Subprogram."
                         )
@@ -2186,7 +2369,10 @@ class Extractor:
                         self.finder.var_initial,
                         subroutine_key,
                     )
-            elif declaration in self.external_subroutines:
+            elif (
+                declaration in self.external_subroutines
+                and declaration not in self.processor.allowed_fortran_procedure
+            ):
                 self.processor.logger.info(
                     f"⏳... Searching for procedure '{declaration}'"
                 )
@@ -2563,6 +2749,15 @@ class Extractor:
                             # Categorize based on whether variable is allocatable
                             if F23.Attr_Spec("ALLOCATABLE") not in attr_spec:
                                 result["reads_non_allocatables"].append(item)
+                            elif any(
+                                F23.Type_Param_Value(":") in length_selector.children
+                                for length_selector in walk(item, F23.Length_Selector)
+                            ):
+                                # CHARACTER(LEN=:), ALLOCATABLE
+                                self.processor.logger.info(
+                                    f"Allocatable is detected, it might be a string, a special case {item.tostr()} "
+                                )
+                                result["reads_non_allocatables"].append(item)
                             else:
                                 # Combine allocate and declaration for allocatable arrays
                                 combined = self.processor.combine_allocate_declaration(
@@ -2694,6 +2889,15 @@ class Extractor:
                 else:
                     items_sep.append(item)
 
+            items_sep.sort(
+                key=lambda stmt: 0
+                if any(
+                    decl.children[0].tostr().endswith("_length_character")
+                    for decl in walk(stmt, F23.Entity_Decl)
+                )
+                else 1
+            )
+
             # Generate I/O statements for each declaration
             for item in items_sep:
                 init = True
@@ -2718,18 +2922,35 @@ class Extractor:
                 # Generate read/write statements for variables that need initialization
                 if init:
                     # Create read statement with error handling
+                    if var_name.endswith("_length_character"):
+                        base_name = var_name[: -len("_length_character")]
+                        allocate_line = (
+                            f"ALLOCATE(CHARACTER(LEN={var_name}) :: {base_name})"
+                        )
+                    else:
+                        allocate_line = ""
+
                     code_template = f"""
                     read(1363, iostat = ier){var_name}
                     if (ier /= 0) then
                     write(*,*) 'Error reading from file for {var_name}. ',' IOSTAT : ', ier
                     endif
+                    {allocate_line}
                     """
                     read_list.append(
                         self.processor.parse_fortran_statement(code_template)
                     )
 
                     # Create corresponding write statement
-                    write_stmt.append(F23.Write_Stmt(f"write(1363){var_name}"))
+                    if var_name.endswith("_length_character"):
+                        base_name = var_name[: -len("_length_character")]
+                        write_stmt.append(
+                            F23.Write_Stmt(f"write(1363) len({base_name})")
+                        )
+                    else:
+                        write_stmt.append(F23.Write_Stmt(f"write(1363){var_name}"))
+
+                    # write_stmt.append(F23.Write_Stmt(f"write(1363){var_name}"))
 
             self.processor.logger.info("Processing initialization completed!")
             return read_list, write_stmt
