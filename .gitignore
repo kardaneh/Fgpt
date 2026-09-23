@@ -181,6 +181,7 @@ python-venv/*
 
 example_*/*
 *_demo/*
+*_program/*
 
 src/fgpt/gpu_isolator.py
 src/fgpt/core/passes/modifier.py
