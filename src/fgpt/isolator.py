@@ -552,6 +552,13 @@ class Isolator:
         self.processor.write_fortran_code_to_file(
             write_module_tree, cls.module_path[write_module_name]
         )
+        if write_module_name == "mod_math":
+            self.processor.logger.info(
+                f"----------------- child_procedure: {child_procedure}"
+            )
+            self.processor.logger.info(
+                f"----------------- update module: {write_module_tree.tostr()}"
+            )
 
         # write_module_tree = call_statements[0].get_root()
         # write_module_name = (
@@ -629,7 +636,24 @@ class Isolator:
             target_module=self.target_module,
         )
 
-        cls = Extractor(self.module_dir_sp, self.module_tree_cp, self.logger)
+        templates = self.code_templates["Fortran_global_module_template"]
+        variables_to_exclude = templates.get(
+            f"{self.target_model}_variables_to_exclude", []
+        )
+        procedures_to_exclude = templates.get(
+            f"{self.target_model}_procedures_to_exclude", []
+        )
+
+        self.logger.info(f"Variables to exclude (from YAML):\n{variables_to_exclude}")
+        self.logger.info(f"Procedures to exclude (from YAML):\n{procedures_to_exclude}")
+
+        cls = Extractor(
+            self.module_dir_sp,
+            self.module_tree_cp,
+            logger=self.logger,
+            exclude=variables_to_exclude,
+            cases_to_exclude=procedures_to_exclude,
+        )
         cls.module_path[self.target_module] = self.path_to_target
         cls.parsed_modules[self.target_module] = self.module_tree_cp
         cls.find_subroutines(self.target_module)
