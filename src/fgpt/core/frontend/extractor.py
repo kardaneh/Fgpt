@@ -128,7 +128,14 @@ class Extractor:
     analysis session.
     """
 
-    def __init__(self, module_dir: str, module_tree: object, logger: object = None):
+    def __init__(
+        self,
+        module_dir: str,
+        module_tree: object,
+        logger: object = None,
+        exclude: list[str] | None = None,
+        cases_to_exclude: list[str] | None = None,
+    ):
         try:
             self.module_dir = module_dir
             self.module_tree = module_tree
@@ -144,28 +151,8 @@ class Extractor:
             self.call_within_sub = defaultdict(lambda: defaultdict(list))
             self.loop_dict = defaultdict(lambda: defaultdict(set))  # defaultdict(set)
             self.loop_vect = defaultdict(lambda: None)
-            self.exclude = {
-                "kjpindex",
-                "nslm",
-                "nstm",
-                "nvm",
-                "nsnow",
-                "nice",
-                "ncirc",
-                "DIM",
-                "dim",
-                "MASK",
-                "next_calc_loop",
-            }
-            self.cases_to_exclude = [
-                "clear",
-                "finalize",
-                "init",
-                "initialize",
-                "read",
-                "write",
-                "albedo_surface_soilalb",
-            ]
+            self.exclude = set(exclude) if exclude else set()
+            self.cases_to_exclude = list(cases_to_exclude) if cases_to_exclude else []
             self.dec_global = defaultdict(lambda: defaultdict(list))
             self.all_array_info = defaultdict(lambda: defaultdict(list))
             self.imp_shape = defaultdict(dict)
@@ -396,9 +383,10 @@ class Extractor:
                     self.func_result[subroutine_key] = suffix
                 elif isinstance(child, F23.Prefix):
                     self.logger.warning(
-                        f"Prefix found in function '{subroutine_stmt.tostr()}': {child.tostr()}"
+                        f"Prefix found in function '{subroutine_stmt.tostr()}', the prefix is {child.tostr()}"
                     )
-                    prefix = child.tostr()
+                    if child.tostr() not in ("PURE",):
+                        prefix = child.tostr()
                 else:
                     raise ValueError(
                         f"Unexpected type '{type(child)}' encountered in children {child}!"
@@ -410,7 +398,9 @@ class Extractor:
             )
 
             if prefix is not None:
-                self.logger.warning(f"There is a prefix for for '{subroutine_key}'")
+                self.logger.warning(
+                    f"There is a prefix {prefix} for for '{subroutine_key}'"
+                )
                 assert isinstance(sub, F23.Function_Subprogram), (
                     f"Prefix found in non-function type '{subroutine_key}': "
                     f"{type(sub).__name__}. This is unexpected and may indicate a parsing error."
@@ -423,6 +413,8 @@ class Extractor:
                     f"in/out benchmark will fail to compile under Fortran `implicit none`."
                 )
                 self.func_result[subroutine_key] = f"{subroutine_key}_result"
+                # the added name shoud avoided in navigation
+                self.exclude.add(f"{subroutine_key}_result")
 
             for loop in walk(sub, F23.Nonlabel_Do_Stmt):
                 if len(loop.children) < 2 or loop.children[1] is None:
@@ -464,8 +456,11 @@ class Extractor:
                 assert isinstance(dummy_arg_list, F23.Dummy_Arg_List), (
                     f"Expected dummy_arg_list, got {type(dummy_arg_list).__name__.lower()}"
                 )
-                for child in dummy_arg_list.children:
-                    self.dummy_arg_list[subroutine_key].append(child.tostr())
+                self.dummy_arg_list[subroutine_key] = [
+                    child.tostr() for child in dummy_arg_list.children
+                ]
+                # for child in dummy_arg_list.children:
+                #    self.dummy_arg_list[subroutine_key].append(child.tostr())
 
             # FUNCTION CALLS VIA ASSIGNMENT STATEMENTS
             # Walk assignment statements in `sub`, inspect the RHS, and if a
@@ -537,7 +532,7 @@ class Extractor:
                             )
                             if found:
                                 self.processor.logger.info(
-                                    f"Found external subroutine '{call_name}' in file: {call_name}, adding to processing queue"
+                                    f"Found external subroutine '{call_name}' in file: {module_file_path}, adding to processing queue"
                                 )
                                 # Add the found subroutine to the right end of the queue for processing
                                 all_subroutines_in_module = (
@@ -671,10 +666,15 @@ class Extractor:
                 f"in/out benchmark will fail to compile under Fortran `implicit none`."
             )
             self.func_result[function_key] = f"{function_key}_result"
+            # the added name shoud avoided in navigation
+            self.exclude.add(f"{function_key}_result")
 
         if arg_list is not None:
-            for child in arg_list.children:
-                self.dummy_arg_list[function_key].append(child.tostr())
+            self.dummy_arg_list[function_key] = [
+                child.tostr() for child in arg_list.children
+            ]
+            # for child in arg_list.children:
+            #    self.dummy_arg_list[function_key].append(child.tostr())
 
     def _process_intent_assignment_statement(
         self,
@@ -1291,6 +1291,9 @@ class Extractor:
                 idc = 0
                 while idc < len(block.content):
                     child = block.content[idc]
+                    if isinstance(child, F23.Use_Stmt):
+                        del block.content[idc]
+                        continue
                     if isinstance(child, F23.Type_Declaration_Stmt):
                         intent = walk(child, F23.Intent_Spec)
                         entity_decls = walk(child, F23.Entity_Decl)
@@ -1686,7 +1689,8 @@ class Extractor:
                         self.logger.info(
                             f"Prefix found in function '{subroutine_key}': {child.tostr()}"
                         )
-                        prefix = child
+                        if child.tostr() not in ("PURE",):
+                            prefix = child
                 assert prefix is not None, (
                     f"Function '{subroutine_key}' lacks a prefix for type specification."
                 )
@@ -1821,6 +1825,37 @@ class Extractor:
                     "walk(declaration_stmt, F23.Entity_Decl), but got a different number."
                 )
                 name = entity_decls[0].children[0].tostr()
+
+                #
+                # Detect an initialization on the right-hand side of the declaration,
+                # e.g.  real(dp), parameter :: dt = dt_max
+                #
+
+                init_node = None
+                if len(entity_decls[0].children) > 3:
+                    init_node = entity_decls[0].children[3]
+                if isinstance(init_node, F23.Initialization):
+                    self.processor.logger.warning(
+                        f"Initialization detected in declaration of '{name}': "
+                        f"{entity_decls[0].tostr()}. "
+                        f"The right-hand side must be checked for dependencies "
+                        f"that should be treated as global."
+                    )
+                    rhs_node = init_node.children[1]
+                    for rhs_name in walk(rhs_node, F23.Name):
+                        rhs_str = rhs_name.tostr()
+                        if (
+                            rhs_str not in self.var_declared[subroutine_key]
+                            and rhs_str not in self.exclude
+                            and rhs_str not in seen
+                        ):
+                            self.processor.logger.info(
+                                f"Global dependency in initialization of "
+                                f"'{name}': '{rhs_str}'"
+                            )
+                            self.var_global[subroutine_key].append(rhs_name)
+                            seen[rhs_str] = rhs_name
+
                 for shape_spec in walk(node, F23.Explicit_Shape_Spec):
                     for dim in walk(shape_spec, F23.Name):
                         dim_str = dim.tostr()
@@ -1845,12 +1880,30 @@ class Extractor:
                                         and length_selector.children[1] is not None
                                         and length_selector.children[1].tostr() == "*"
                                     ):
+                                        self.processor.logger.warning(
+                                            f"Assumed-length CHARACTER detected in dummy argument "
+                                            f"'{name}' of '{subroutine_key}': "
+                                            f"{node.tostr()}. "
+                                            f"Rewriting as CHARACTER(LEN=:), ALLOCATABLE plus a "
+                                            f"companion INTEGER, INTENT(IN) :: "
+                                            f"{name}_length_character."
+                                        )
+
                                         alloc_decl = F23.Type_Declaration_Stmt(
                                             f"CHARACTER(LEN = :), ALLOCATABLE :: {name}"
                                         )
                                         len_decl = F23.Type_Declaration_Stmt(
                                             f"INTEGER, INTENT(IN) :: {name}_length_character"
                                         )
+
+                                        self.processor.logger.info(
+                                            f"Synthesised declaration: {alloc_decl.tostr()}"
+                                        )
+
+                                        self.processor.logger.info(
+                                            f"Synthesised declaration: {len_decl.tostr()}"
+                                        )
+
                                         self.var_dummy[subroutine_key].append(len_decl)
                                         self.var_dummy[subroutine_key].append(
                                             alloc_decl
@@ -1859,6 +1912,12 @@ class Extractor:
                                         #    f"{name}_length"
                                         # )
                                         converted = True
+                                    else:
+                                        self.processor.logger.info(
+                                            f"CHARACTER dummy argument '{name}' in "
+                                            f"'{subroutine_key}' has an explicit length; no "
+                                            f"conversion needed."
+                                        )
                                 break
                         if not converted:
                             self.var_dummy[subroutine_key].append(node)
@@ -2289,41 +2348,42 @@ class Extractor:
                             f"Module '{module_name}' not found in module_path. Available modules: {list(self.module_path.keys())}"
                         )
                         current_module_path = self.module_path[module_name]
-                        path_to_original = current_module_path.replace(
-                            ".f90", "_org.fgpt"
-                        ).replace(".F90", "_org.Fgpt")
-                        if (
-                            os.path.exists(path_to_original)
-                            and module_name not in self.org_files_loaded
-                        ):
-                            self.processor.logger.info(
-                                f"Loading original file for function '{declaration}': {path_to_original}"
-                            )
-                            original_module_tree = self.processor.parse_fortran_file(
-                                path_to_original
-                            )
-                            self.parsed_modules[module_name] = original_module_tree
-                            self.module_path[module_name] = current_module_path
-                            self.org_files_loaded.add(module_name)
-                            # Search for the function in the original file
-                            for sub in walk(
-                                original_module_tree, F23.Function_Subprogram
+                        if module_name not in self.parsed_modules:
+                            path_to_original = current_module_path.replace(
+                                ".f90", "_org.fgpt"
+                            ).replace(".F90", "_org.Fgpt")
+                            if (
+                                os.path.exists(path_to_original)
+                                and module_name not in self.org_files_loaded
                             ):
-                                function_stmt = walk(sub, F23.Function_Stmt)[0]
-                                for func_child in function_stmt.children:
-                                    if (
-                                        isinstance(func_child, F23.Name)
-                                        and func_child.tostr() == declaration
-                                    ):
-                                        # Use the function from the original file
-                                        function_name = func_child
-                                        function_subprogram = sub
-                                        break
-                        elif not os.path.exists(path_to_original):
-                            shutil.copy(current_module_path, path_to_original)
-                            self.processor.logger.info(
-                                f"Created backup of original file: {path_to_original}"
-                            )
+                                self.processor.logger.info(
+                                    f"Loading original file for function '{declaration}': {path_to_original}"
+                                )
+                                original_module_tree = (
+                                    self.processor.parse_fortran_file(path_to_original)
+                                )
+                                self.parsed_modules[module_name] = original_module_tree
+                                # self.module_path[module_name] = current_module_path
+                                self.org_files_loaded.add(module_name)
+                                # Search for the function in the original file
+                                for sub in walk(
+                                    original_module_tree, F23.Function_Subprogram
+                                ):
+                                    function_stmt = walk(sub, F23.Function_Stmt)[0]
+                                    for func_child in function_stmt.children:
+                                        if (
+                                            isinstance(func_child, F23.Name)
+                                            and func_child.tostr() == declaration
+                                        ):
+                                            # Use the function from the original file
+                                            function_name = func_child
+                                            function_subprogram = sub
+                                            break
+                            elif not os.path.exists(path_to_original):
+                                shutil.copy(current_module_path, path_to_original)
+                                self.processor.logger.info(
+                                    f"Created backup of original file: {path_to_original}"
+                                )
                         parent = self.processor.find_enclosing_parent(var, F23.Part_Ref)
                         self.processor.logger.info(
                             f"The global {declaration} used in {parent} is a Function_Subprogram."
@@ -2909,10 +2969,15 @@ class Extractor:
 
                 # Extract variable name from declaration
                 var_name = None
-                for child in item.children:
-                    if isinstance(child, F23.Entity_Decl_List):
-                        var_name = child.tostr()
-                        break  # Found the variable name, no need to continue
+                entity_decls = walk(item, F23.Entity_Decl)
+                assert len(entity_decls) == 1, (
+                    f"In extract_modified_variables: walk(item, F23.Entity_Decl)=1, but got {len(entity_decls)}."
+                )
+                var_name = entity_decls[0].children[0].tostr()
+                # for child in item.children:
+                #    if isinstance(child, F23.Entity_Decl_List):
+                #        var_name = child.tostr()
+                #        break  # Found the variable name, no need to continue
 
                 # Assert that var_name was successfully extracted
                 assert var_name is not None, (
