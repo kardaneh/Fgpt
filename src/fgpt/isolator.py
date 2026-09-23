@@ -552,13 +552,6 @@ class Isolator:
         self.processor.write_fortran_code_to_file(
             write_module_tree, cls.module_path[write_module_name]
         )
-        if write_module_name == "mod_math":
-            self.processor.logger.info(
-                f"----------------- child_procedure: {child_procedure}"
-            )
-            self.processor.logger.info(
-                f"----------------- update module: {write_module_tree.tostr()}"
-            )
 
         # write_module_tree = call_statements[0].get_root()
         # write_module_name = (
