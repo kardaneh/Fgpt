@@ -63,9 +63,9 @@ program netcdf_demo
 
   ! 2 - Write the input file
 
-  print '(A)', "--- Writing sample_in.nc ---"
+  print '(A)', "--- Writing netcdf_demo_sample_in.nc ---"
 
-  status = NF_CREATE('sample_in.nc', NF_CLOBBER, ncid_out)
+  status = NF_CREATE('/home/kardaneh/Fgpt/benchmark/demo-ios/netcdf_demo_sample_in.nc', NF_CLOBBER, ncid_out)
   call hdlerr(status)
 
   status = NF_DEF_DIM(ncid_out, 'x', jpi, xid)
@@ -125,17 +125,17 @@ program netcdf_demo
   status = NF_CLOSE(ncid_out)
   call hdlerr(status)
 
-  print '(A)', "--- sample_in.nc written ---"
+  print '(A)', "--- netcdf_demo_sample_in.nc written ---"
 
 
   ! 3 - Read it back
 
-  print '(A)', "--- Reading sample_in.nc ---"
+  print '(A)', "--- Reading netcdf_demo_sample_in.nc ---"
 
-  status = NF_OPEN('sample_in.nc', NF_NOWRITE, ncid_in)
+  status = NF_OPEN('/home/kardaneh/Fgpt/benchmark/demo-ios/netcdf_demo_sample_in.nc', NF_NOWRITE, ncid_in)
   if (status /= NF_NOERR) then
     print '(A)', NF_STRERROR(status)
-    stop 'Could not open sample_in.nc'
+    stop 'Could not open netcdf_demo_sample_in.nc'
   end if
 
   status = NF_INQ_VARID(ncid_in, 'nav_lon', id_lon)
@@ -193,9 +193,9 @@ program netcdf_demo
 
   ! 5 - Write the output file
 
-  print '(A)', "--- Writing sample_out.nc ---"
+  print '(A)', "--- Writing netcdf_demo_sample_out.nc ---"
 
-  status = NF_CREATE('sample_out.nc', NF_CLOBBER, ncid_out)
+  status = NF_CREATE('/home/kardaneh/Fgpt/benchmark/demo-ios/netcdf_demo_sample_out.nc', NF_CLOBBER, ncid_out)
   call hdlerr(status)
 
   status = NF_DEF_DIM(ncid_out, 'x', jpi, xid)
@@ -245,7 +245,7 @@ program netcdf_demo
   status = NF_CLOSE(ncid_out)
   call hdlerr(status)
 
-  print '(A)', "--- sample_out.nc written ---"
+  print '(A)', "--- netcdf_demo_sample_out.nc written ---"
   print '(A)', "Program completed successfully!"
 
 contains

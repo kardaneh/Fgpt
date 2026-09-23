@@ -219,12 +219,12 @@ program test_procedures
 
     ! Pass 3: dump, partial reset, verify
 
-    call dump_to_file(data_array, n, "output_data.txt")
+    call dump_to_file(data_array, n, "/home/kardaneh/Fgpt/benchmark/demo-ios/example_01_output_data_.txt")
 
     call reset_data(data_array, n, 9.0, 2, 4)
     call display_data(data_array, n, "Pass 3: partial reset to 9.0")
 
-    call dump_to_file(data_array, n, "output_rst.txt")
+    call dump_to_file(data_array, n, "/home/kardaneh/Fgpt/benchmark/demo-ios/example_01_output_rst.txt")
 
     call reset_data(data_array, n, 0.1, 3, 5)
     call display_data(data_array, n, "Final: full reset to 0.0")
