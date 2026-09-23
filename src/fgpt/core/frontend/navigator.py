@@ -158,7 +158,8 @@ class Navigator:
                                 current,
                                 F23.Subroutine_Subprogram
                                 | F23.Function_Subprogram
-                                | F23.Module,
+                                | F23.Module
+                                | F23.Main_Program,
                             ):
                                 current = getattr(current, "parent", None)
                             morr = walk(current, F23.Name)[0].tostr()
@@ -734,7 +735,7 @@ class FortranSearcher:
 
                 # --- Parse or reuse module tree ---
                 self.processor.logger.info(
-                    f"🔎 Searching for module name '{module_name}'"
+                    f"🔎 Searching start from the module name '{module_name}'"
                 )
                 module_tree, module_file_path = self._get_or_parse_module(module_name)
                 if module_tree is None:
