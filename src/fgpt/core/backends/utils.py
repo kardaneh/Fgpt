@@ -212,7 +212,7 @@ def convert_np_jnp(node) -> ast.AST:
     return node
 
 
-def get_class_info_from_ast(cls_ast: ast.AST) -> dict:
+def get_class_info_from_ast(cls_ast: ast.AST, struct_classes=frozenset()) -> dict:
     """
     Extract class attribute and method metadata from a class AST.
 
@@ -289,10 +289,6 @@ def get_class_info_from_ast(cls_ast: ast.AST) -> dict:
     """
     if not isinstance(cls_ast, ast.AST):
         raise TypeError(f"Expected ast.AST, got {type(cls_ast).__name__}")
-    class_info = {
-        "attributes": {},
-        "methods": {},
-    }
 
     class_defs = []
     for node in ast.walk(cls_ast):
@@ -302,6 +298,7 @@ def get_class_info_from_ast(cls_ast: ast.AST) -> dict:
 
     cls_info = {}
     for class_def in class_defs:
+        class_info = {"attributes": {}, "methods": {}}
         for node in ast.walk(class_def):
             # Check if it's a class attribute (scalar or jax numpy array)
             if isinstance(node, ast.Assign):
@@ -317,6 +314,35 @@ def get_class_info_from_ast(cls_ast: ast.AST) -> dict:
                         if isinstance(value, ast.Call) and isinstance(
                             value.func, ast.Attribute
                         ):
+                            if (
+                                isinstance(value.func.value, ast.Name)
+                                and value.func.value.id in struct_classes
+                                and value.func.attr in {"zeros", "ones"}
+                            ):
+                                shape = value.args[0] if value.args else None
+                                elts = (
+                                    shape.elts
+                                    if isinstance(shape, ast.Tuple)
+                                    else [shape]
+                                    if shape is not None
+                                    else []
+                                )
+                                dims = [
+                                    e.attr
+                                    if isinstance(e, ast.Attribute)
+                                    else e.id
+                                    if isinstance(e, ast.Name)
+                                    else e.value
+                                    if isinstance(e, ast.Constant)
+                                    else ast.unparse(e)
+                                    for e in elts
+                                ]
+                                class_info["attributes"][attr_name] = {
+                                    "type": "struct",
+                                    "struct_type": value.func.value.id,
+                                    "dimensions": dims,
+                                }
+                                continue
                             # in the case of attributes scalars being modified then
                             # we need to ensure that it's not applied as static
                             # Check if the assignment is a jax numpy array (using jnp.array)
@@ -417,6 +443,16 @@ def get_class_info_from_ast(cls_ast: ast.AST) -> dict:
                                     f"The instance of where the value is not \
                                     already present in the cls_info: {ast.unparse(ast.fix_missing_locations(value))}"
                                 )
+                        elif isinstance(value, ast.Constant):
+                            py_type = type(
+                                value.value
+                            ).__name__  # 'int', 'float', 'bool', 'str'
+                            if py_type in {"int", "float", "bool"}:
+                                class_info["attributes"][attr_name] = {
+                                    "type": py_type,
+                                    "value": value.value,
+                                    "dtype": py_type,
+                                }
             # Check if it's a method definition (excluding __init__)
             if isinstance(node, ast.FunctionDef):
                 if node.name not in ["__init__", "wrapper", "timer"]:
@@ -496,6 +532,70 @@ def get_class_info_from_ast(cls_ast: ast.AST) -> dict:
         cls_info[class_def.name] = class_info
 
     return cls_info
+
+
+def _inner_dims_and_dtype(value):
+    """AnnAssign default -> (inner_dims, dtype)."""
+    # scalar default: np.float64(0)
+    if (
+        isinstance(value, ast.Call)
+        and isinstance(value.func, ast.Attribute)
+        and value.func.attr != "field"
+    ):
+        return [], value.func.attr
+    # field(default_factory=lambda: np.zeros((10,), dtype=np.float64))
+    if isinstance(value, ast.Call):
+        for kw in value.keywords:
+            if kw.arg == "default_factory" and isinstance(kw.value, ast.Lambda):
+                call = kw.value.body
+                dims, dtype = [], None
+                if isinstance(call, ast.Call) and call.args:
+                    a0 = call.args[0]
+                    elts = a0.elts if isinstance(a0, ast.Tuple) else [a0]
+                    for d in elts:
+                        if isinstance(d, ast.Constant):
+                            dims.append(d.value)
+                        elif isinstance(d, ast.Attribute):
+                            dims.append(d.attr)
+                        elif isinstance(d, ast.Name):
+                            dims.append(d.id)
+                    for k in call.keywords:
+                        if k.arg == "dtype" and isinstance(k.value, ast.Attribute):
+                            dtype = k.value.attr
+                return dims, dtype
+    return [], None
+
+
+def get_struct_info_from_ast(tree, struct_classes):
+    info = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef) and node.name in struct_classes:
+            info[node.name] = {
+                st.target.id: dict(
+                    zip(("inner_dims", "dtype"), _inner_dims_and_dtype(st.value))
+                )
+                for st in node.body
+                if isinstance(st, ast.AnnAssign) and isinstance(st.target, ast.Name)
+            }
+    return info
+
+
+def _zeros_shape_dims(call: ast.Call) -> list:
+    if not call.args:
+        return []
+    shape = call.args[0]
+    elts = shape.elts if isinstance(shape, ast.Tuple) else [shape]
+    dims = []
+    for e in elts:
+        if isinstance(e, ast.Attribute):  # gmasme.kjpindex -> 'kjpindex'
+            dims.append(e.attr)
+        elif isinstance(e, ast.Name):
+            dims.append(e.id)
+        elif isinstance(e, ast.Constant):
+            dims.append(e.value)
+        else:
+            dims.append(ast.unparse(e))
+    return dims
 
 
 def collect_reads_before_def(
@@ -918,6 +1018,7 @@ class ReductionHandler:
         cls_name: str,
         func_name: str | None = None,
         vectorization_axis: dict | None = None,
+        struct_info: dict | None = None,
     ) -> None:
         self.vectorization_axis = vectorization_axis or {}
         self.loop_info = {}
@@ -927,6 +1028,60 @@ class ReductionHandler:
         self.func_name = func_name
         self.func_input_dim = None
         self.dynamic_variable_lift = None
+        self.batch_reduce_keys = None
+        self.struct_info = struct_info or {}
+
+    def _is_masked_batch_reduction(self, node: ast.Call) -> bool:
+        axis_kw = next((kw for kw in node.keywords if kw.arg == "axis"), None)
+        if axis_kw is None or not node.args:
+            return False
+        if not isinstance(axis_kw.value, ast.Constant):
+            return False
+        arg0 = node.args[0]
+        if not (
+            isinstance(arg0, ast.Call)
+            and self._get_func_name(arg0.func) == "where"
+            and arg0.args
+        ):
+            return False
+        cond = arg0.args[0]
+        while isinstance(cond, ast.Subscript):
+            cond = cond.value
+        return (
+            isinstance(cond, ast.Name)
+            and (cond.id, axis_kw.value.value) in self.batch_reduce_keys
+        )
+
+    def _struct_field_dims(self, node):
+        """var.f / self.var.f -> struct batch dims + field inner dims, else None."""
+        if not isinstance(node, ast.Attribute):
+            return None
+        base = node.value
+        if (
+            isinstance(base, ast.Attribute)
+            and isinstance(base.value, ast.Name)
+            and base.value.id == "self"
+        ):
+            var = base.attr
+        elif isinstance(base, ast.Name) and base.id != "self":
+            var = base.id
+        else:
+            return None
+        info = self.cls_info.get(self.cls_name, {})
+        s = (
+            info.get("methods", {})
+            .get(self.func_name, {})
+            .get("struct_args", {})
+            .get(var)
+        )
+        if not s:
+            a = info.get("attributes", {}).get(var)
+            s = a if a and a.get("type") == "struct" else None
+        if not s:
+            return None
+        t = s.get("type") or s.get("struct_type")
+        fld = self.struct_info.get(t, {}).get(node.attr)
+        return None if fld is None else list(s["dimensions"]) + list(fld["inner_dims"])
 
     def process_call(self, node: ast.Call) -> ast.AST:
         """
@@ -959,6 +1114,8 @@ class ReductionHandler:
             if not is_reduction:
                 return node
 
+            if self._is_masked_batch_reduction(node):
+                return node
             axes = self._infer_axes(node)
 
             if axes is None:
@@ -1239,7 +1396,11 @@ class ReductionHandler:
                     return set(range(len(dims)))
 
             if isinstance(node, ast.Attribute):
-                dims = self._get_array_info(node.attr)
+                dims = (
+                    self._struct_field_dims(node)
+                    or self._get_array_info(node.attr)
+                    or []
+                )
                 if dims:
                     return set(range(len(dims)))
 
@@ -1380,7 +1541,11 @@ class ReductionHandler:
                 return dims
 
             if isinstance(node, ast.Attribute):
-                dims = self._get_array_info(node.attr) or []
+                dims = (
+                    self._struct_field_dims(node)
+                    or self._get_array_info(node.attr)
+                    or []
+                )
                 return dims
 
             if isinstance(node, ast.Subscript):
@@ -1762,6 +1927,7 @@ class MaybeAddIndexTransformer(ast.NodeTransformer):
         func_input_dim: dict,
         dynamic_variable_lift: dict,
         inferred_ranks: dict,
+        struct_info: dict,
     ) -> None:
         super().__init__()
         self.cls_info = cls_info
@@ -1775,6 +1941,7 @@ class MaybeAddIndexTransformer(ast.NodeTransformer):
         self.func_input_dim = func_input_dim
         self.dynamic_variable_lift = dynamic_variable_lift
         self.inferred_ranks = inferred_ranks
+        self.struct_info = struct_info
 
     def visit(self, node: ast.AST) -> ast.AST:
         """
@@ -1989,7 +2156,8 @@ class MaybeAddIndexTransformer(ast.NodeTransformer):
             def analyze_operand(operand):
                 if self._is_lifted(operand):
                     rank = self.ranks.get(operand, 1)
-                    name = get_name(operand)
+                    # name = get_name(operand)
+                    name = self._var_key(operand)
 
                     axis = None
                     if name:
@@ -2112,7 +2280,8 @@ class MaybeAddIndexTransformer(ast.NodeTransformer):
                 if isinstance(operand, ast.Subscript):
                     # rank = self.ranks.get(operand, 0)
 
-                    array_name = get_name(operand)
+                    # array_name = get_name(operand)
+                    array_name = self._var_key(operand)
                     inferred_present = array_name in self.inferred_ranks
                     if inferred_present:
                         rank = self.inferred_ranks[array_name]
@@ -2361,6 +2530,44 @@ class MaybeAddIndexTransformer(ast.NodeTransformer):
             return set()
         return {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)}
 
+    def _struct_field_dims(self, node):
+        if not isinstance(node, ast.Attribute):
+            return None
+        base = node.value
+        if (
+            isinstance(base, ast.Attribute)
+            and isinstance(base.value, ast.Name)
+            and base.value.id == "self"
+        ):
+            var = base.attr
+        elif isinstance(base, ast.Name):
+            var = base.id
+        else:
+            return None
+        info = self.cls_info[self.cls_name]
+        s = info["methods"].get(self.func_name, {}).get("struct_args", {}).get(var)
+        if not s:
+            a = info["attributes"].get(var)
+            s = a if a and a.get("type") == "struct" else None
+        if not s:
+            return None
+        t = s.get("type") or s.get("struct_type")
+        fld = self.struct_info.get(t, {}).get(node.attr)
+        return None if fld is None else list(s["dimensions"]) + list(fld["inner_dims"])
+
+    def _var_key(self, node):
+        base = node
+        while isinstance(base, ast.Subscript):
+            base = base.value
+        if (
+            isinstance(base, ast.Attribute)
+            and self._struct_field_dims(base) is not None
+        ):
+            inner = base.value
+            var = inner.attr if isinstance(inner, ast.Attribute) else inner.id
+            return f"{var}.{base.attr}"
+        return get_name(node)
+
     def get_declared_dims(self, node: ast.AST) -> list | None:
         """
         Retrieve declared dimensions associated with an array expression.
@@ -2398,6 +2605,12 @@ class MaybeAddIndexTransformer(ast.NodeTransformer):
 
             # Class attributes
             attributes = self.cls_info[self.cls_name]["attributes"]
+            base = node
+            while isinstance(base, ast.Subscript):
+                base = base.value
+            d = self._struct_field_dims(base)
+            if d is not None:
+                return d
             if isinstance(node, ast.Name):
                 if node.id in local_arr:
                     return local_arr[node.id].get("dimensions")
@@ -2415,7 +2628,7 @@ class MaybeAddIndexTransformer(ast.NodeTransformer):
                     attr = node.attr
                     if attr in attributes:
                         return attributes[attr].get("dimensions")
-                    elif self.func_input_dim and node.id in list(
+                    elif self.func_input_dim and attr in list(
                         self.func_input_dim.keys()
                     ):
                         return self.func_input_dim.get(node.id)
@@ -2828,12 +3041,23 @@ class VectorizationAnalyzer(ast.NodeVisitor):
         if len(node.iter.args) < 2:
             return False
         vect_variable = node.iter.args[1]
-        return (
-            isinstance(vect_variable, ast.Name) and vect_variable.id in self.vectorize
-        ) or (
-            isinstance(vect_variable, ast.Attribute)
-            and vect_variable.attr in self.vectorize
-        )
+        # Direct variable: range(..., nvm, ...)
+        if isinstance(vect_variable, ast.Name):
+            return vect_variable.id in self.vectorize
+
+        # Attribute: range(..., self.nvm, ...)
+        if isinstance(vect_variable, ast.Attribute):
+            return vect_variable.attr in self.vectorize
+
+        # Expression such as: range(..., self.nvm + 1, ...)
+        if isinstance(vect_variable, ast.BinOp):
+            if isinstance(vect_variable.left, ast.Name):
+                return vect_variable.left.id in self.vectorize
+
+            if isinstance(vect_variable.left, ast.Attribute):
+                return vect_variable.left.attr in self.vectorize
+
+        return False
 
     def _collect_loop_vars(self, stmts: list[ast.AST]) -> set[str]:
         """
@@ -3676,6 +3900,15 @@ class RemoveLogging(ast.NodeTransformer):
             return True
 
         return False
+
+    def _remove_logging(self, statements):
+        """Remove standalone logging/print expressions from a statement list."""
+        return [stmt for stmt in statements if not self._is_logging_call(stmt)]
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> ast.FunctionDef:
+        self.generic_visit(node)
+        node.body = self._remove_logging(node.body)
+        return node
 
     def visit_If(self, node: ast.If) -> ast.If | None:
         """

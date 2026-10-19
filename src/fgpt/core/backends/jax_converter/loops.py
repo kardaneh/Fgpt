@@ -185,15 +185,23 @@ class _LoopLowering:
 
             if isinstance(stop, ast.Subscript | ast.Call):
                 self.symbol_table[loop_index] = "int64"
-                return self.handle_dynamic_loop(node, start, stop, step, loop_index)
+                self._continue_stack.append(None)
+                try:
+                    return self.handle_dynamic_loop(node, start, stop, step, loop_index)
+                finally:
+                    self._continue_stack.pop()
 
             if any(
-                isinstance(node, ast.Name) and node.id in self._stateful_vars
-                for node in (start, stop, step)
-                if node is not None
+                isinstance(n, ast.Name) and n.id in self._stateful_vars
+                for n in (start, stop, step)
+                if n is not None
             ):
                 self.symbol_table[loop_index] = "int64"
-                return self.handle_dynamic_loop(node, start, stop, step, loop_index)
+                self._continue_stack.append(None)
+                try:
+                    return self.handle_dynamic_loop(node, start, stop, step, loop_index)
+                finally:
+                    self._continue_stack.pop()
 
             cond_type = self.analyzer.classify_for(node)
             # First we need to verify if the range args has start loop at 0 then we just send the args[1],
@@ -206,6 +214,7 @@ class _LoopLowering:
             elif cond_type == "vector":
                 self._push_scope()
                 self._vector_loop_stack.append(loop_index)
+                self._continue_stack.append(None)
                 try:
                     vectorization_axis = self._setup_vector_control(
                         loop_index, get_name(stop), cond_type, node
@@ -237,6 +246,7 @@ class _LoopLowering:
 
                     return new_stmts
                 finally:
+                    self._continue_stack.pop()
                     self._vector_loop_stack.pop()
                     self._pop_scope()
 
@@ -372,6 +382,14 @@ class _LoopLowering:
             read_before_write = self._first_reads(branch_stmts)
             inputs = []
 
+            mutated_attr_inputs = {
+                f"self.{attr}" for attr in self._mutated_attrs if attr in assigned
+            }
+
+            candidate_inputs = list(
+                dict.fromkeys(read_before_write + sorted(mutated_attr_inputs))
+            )
+
             # These contain attributes that were newly mutated by function calls and
             # have already been marked as assigned, but have not yet been propagated
             # to `mutated_attrs`. This situation occurs for function calls nested
@@ -391,7 +409,7 @@ class _LoopLowering:
                 self.to_arg(name) in self._context_stack[-1]["helper_args"]
                 for name in self._mutated_attrs
             )
-            for name in read_before_write:
+            for name in candidate_inputs:  # read_before_write
                 if name.startswith("self."):
                     attr = self.to_arg(name)
 
@@ -426,7 +444,18 @@ class _LoopLowering:
                     inputs.append(name)
 
             if self._local_defined_stack and self._local_defined_stack[-1]:
-                inputs.extend(list(self._local_defined_stack[-1]))
+                referenced_in_body = {
+                    n.id
+                    for stmt in node.body
+                    for n in ast.walk(stmt)
+                    if isinstance(n, ast.Name)
+                }
+                relevant_locals = (
+                    set(self._local_defined_stack[-1]) & referenced_in_body
+                )
+
+                inputs.extend(relevant_locals)
+                # inputs.extend(list(self._local_defined_stack[-1]))
 
             inputs.sort()  # sort the input
 
@@ -441,14 +470,21 @@ class _LoopLowering:
                         inputs.remove(key)
 
             existing = {name.removeprefix("self.") for name in inputs}
-
-            for name in set(assigned) & self._seen_assigned_names:
+            enclosing_sequential_scope = (
+                set(self._sequential_scope_stack[-1])
+                if self._sequential_scope_stack
+                else set()
+            )
+            for name in (
+                set(assigned) & enclosing_sequential_scope
+            ):  # & self._seen_assigned_names:
                 base = name.removeprefix("self.")
 
                 if (
                     name not in used_after
                     and base not in existing
                     and name not in self._always_exclude
+                    and name != loop_index
                 ):
                     inputs.append(name)
                     existing.add(base)
@@ -500,54 +536,66 @@ class _LoopLowering:
                     "parent_reads": set(inputs),
                 }
             )
-            for stmt in node.body:
-                transformed = self.visit(stmt)
-                if isinstance(transformed, list):
-                    for v in transformed:
-                        if isinstance(v, ast.Assign):
-                            if vectorization_context and vectorization_context[
-                                "metadata"
-                            ].get("current_mask_assign"):
-                                mask_name = vectorization_context["metadata"].get(
-                                    "current_mask_assign"
-                                )
-                                helper_fn.body.extend(
-                                    self._mask_vector_assign(
-                                        v, mask_name.targets[0].id, assigned, used_after
+            self._continue_stack.append(None)
+            # self._sequential_scope_stack.append(set())
+            self._sequential_scope_stack.append(set(new_carry))
+            try:
+                for stmt in node.body:
+                    transformed = self.visit(stmt)
+                    if isinstance(transformed, list):
+                        for v in transformed:
+                            if isinstance(v, ast.Assign):
+                                if vectorization_context and vectorization_context[
+                                    "metadata"
+                                ].get("current_mask_assign"):
+                                    mask_name = vectorization_context["metadata"].get(
+                                        "current_mask_assign"
                                     )
-                                )
+                                    helper_fn.body.extend(
+                                        self._mask_vector_assign(
+                                            v,
+                                            mask_name.targets[0].id,
+                                            assigned,
+                                            used_after,
+                                        )
+                                    )
+                                else:
+                                    helper_fn.body.append(v)
                             else:
                                 helper_fn.body.append(v)
-                        else:
-                            helper_fn.body.append(v)
-                elif isinstance(transformed, ast.Assign):
-                    if vectorization_context and vectorization_context["metadata"].get(
-                        "current_mask_assign"
-                    ):
-                        mask_name = vectorization_context["metadata"].get(
-                            "current_mask_assign"
-                        )
-                        helper_fn.body.extend(
-                            self._mask_vector_assign(
-                                transformed,
-                                mask_name.targets[0].id,
-                                assigned,
-                                used_after,
+                    elif isinstance(transformed, ast.Assign):
+                        if vectorization_context and vectorization_context[
+                            "metadata"
+                        ].get("current_mask_assign"):
+                            mask_name = vectorization_context["metadata"].get(
+                                "current_mask_assign"
                             )
-                        )
-                    else:
-                        if isinstance(stmt, ast.Assign) and isinstance(
-                            stmt.targets[0], ast.Subscript
-                        ):
-                            target_rank = self._target_rank(stmt.targets[0].slice)
-                            transformed.value, _ = self.maybe_add_index(
-                                transformed.value, target_rank, vectorization_context
+                            helper_fn.body.extend(
+                                self._mask_vector_assign(
+                                    transformed,
+                                    mask_name.targets[0].id,
+                                    assigned,
+                                    used_after,
+                                )
                             )
-                            helper_fn.body.append(transformed)
                         else:
-                            helper_fn.body.extend([transformed])
-                elif transformed is not None:
-                    helper_fn.body.append(transformed)
+                            if isinstance(stmt, ast.Assign) and isinstance(
+                                stmt.targets[0], ast.Subscript
+                            ):
+                                target_rank = self._target_rank(stmt.targets[0].slice)
+                                transformed.value, _ = self.maybe_add_index(
+                                    transformed.value,
+                                    target_rank,
+                                    vectorization_context,
+                                )
+                                helper_fn.body.append(transformed)
+                            else:
+                                helper_fn.body.extend([transformed])
+                    elif transformed is not None:
+                        helper_fn.body.append(transformed)
+            finally:
+                self._sequential_scope_stack.pop()
+                self._continue_stack.pop()
 
             ctx = self._scan_stack.pop()
             # Need to check if the the functions has modiifed any element
@@ -616,6 +664,12 @@ class _LoopLowering:
                 parent["introduced"].update(escaping)
 
                 parent["carry"].update(set(new_carry) - self._seen_assigned_names)
+
+            # Names bound in this scan's carry become known to whatever sequential
+            # code follows at the enclosing level — same principle as an ordinary
+            # assignment extending that scope.
+            if self._sequential_scope_stack:
+                self._sequential_scope_stack[-1].update(new_carry)
 
             # Construct the initial carry
             updated_inputs = []
@@ -717,7 +771,8 @@ class _LoopLowering:
                                 ctx=ast.Store(),
                             ),
                             ast.Name(id="_", ctx=ast.Store()),
-                        ]
+                        ],
+                        ctx=ast.Store(),
                     )
                 ],
                 value=ast.Call(

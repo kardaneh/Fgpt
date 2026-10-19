@@ -1,4 +1,4 @@
-# Copyright 2026 IPSL / CNRS / Sorbonne University
+# Copyright 2026 CNRS / Sorbonne University
 # Authors: Shivamshan Sivanesan and Kazem Ardaneh
 #
 # This work is licensed under the Creative Commons
@@ -318,6 +318,35 @@ class _BranchAnalysis:
             self.logger.exception("Exception in _collect_assigned:", e)
             raise
 
+    def _get_target_root_name(
+        self,
+        node: ast.AST,
+    ) -> str | None:
+        """Return the root variable of a nested attribute/subscript."""
+        while isinstance(node, (ast.Attribute | ast.Subscript)):
+            node = node.value
+
+        if isinstance(node, ast.Name):
+            return node.id
+
+        return None
+
+    def _get_self_attr_root(self, node: ast.AST) -> str | None:
+        """Return the root self attribute for a nested assignment target."""
+        current = node
+
+        while isinstance(current, (ast.Attribute | ast.Subscript)):
+            if isinstance(current, ast.Attribute):
+                if isinstance(current.value, ast.Name) and current.value.id == "self":
+                    return current.attr
+
+                current = current.value
+
+            elif isinstance(current, ast.Subscript):
+                current = current.value
+
+        return None
+
     def _assigned_name_or_attr(
         self,
         target: ast.AST,
@@ -356,48 +385,24 @@ class _BranchAnalysis:
             Re-raises any unexpected error after logging.
         """
         try:
-            names = []
-
             if isinstance(target, ast.Name):
-                if target.id not in assigned:
-                    names.append(target.id)
+                return [target.id] if target.id not in assigned else []
 
-            elif (
-                isinstance(target, ast.Attribute)
-                and isinstance(target.value, ast.Name)
-                and target.value.id == "self"
-            ):
-                attr = target.attr
-                if attr not in assigned:
-                    names.append(attr)
+            if isinstance(target, (ast.Attribute | ast.Subscript)):
+                # Handle self.soil_fit.a[i], self.total[i], etc.
+                attr = self._get_self_attr_root(target)
+
+                if attr is not None:
                     self._mutated_attrs.add(attr)
+                    return [attr] if attr not in assigned else []
 
-            elif isinstance(target, ast.Subscript):
-                inner = target.value
+                # Handle total[i], soil_fit.a[i], matrix[i][j], etc.
+                root = self._get_target_root_name(target)
 
-                # self.attr[i]
-                if (
-                    isinstance(inner, ast.Attribute)
-                    and isinstance(inner.value, ast.Name)
-                    and inner.value.id == "self"
-                ):
-                    attr = inner.attr
-                    if attr not in assigned:
-                        names.append(attr)
-                        self._mutated_attrs.add(attr)
+                if root is not None and root not in assigned:
+                    return [root]
 
-                # plain_var[i]
-                elif isinstance(inner, ast.Name):
-                    if inner.id not in assigned:
-                        names.append(inner.id)
-
-                # nested subscript: a[i][j]
-                elif isinstance(inner, ast.Subscript):
-                    nested = self._assigned_name_or_attr(inner, assigned)
-                    if not set(nested).issubset(names):
-                        names.extend(nested)
-
-            return names
+            return []
 
         except Exception as e:
             self.logger.exception("Exception in _assigned_name_or_attr:", e)

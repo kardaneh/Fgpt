@@ -14,7 +14,6 @@ from fgpt.core.backends.utils import (
     ReductionHandler,
     VectorizationAnalyzer,
     WhileVectorToScalar,
-    get_name,
 )
 from fgpt.core.common.logger import Logger
 
@@ -168,6 +167,9 @@ class JaxConverter(
         vectorize: list[str],
         logger: Logger = None,
         mode: str = "jax",
+        struct_classes=None,
+        struct_info=None,
+        scalar_state_attrs=None,
     ) -> None:
         # Counters for unique helper-function name generation
         self.counter = 0
@@ -201,10 +203,12 @@ class JaxConverter(
         self._var_modif: dict[str, set] = {"attr": set(), "args": set()}
 
         # Class metadata
+        self.struct_classes = set(struct_classes or ())
+        cls_info = {k: v for k, v in cls_info.items() if k not in self.struct_classes}
         self.cls_info = cls_info
-        self.cls_name = (
-            list(cls_info.keys())[0] if len(cls_info) == 1 else list(cls_info.keys())
-        )
+        self.cls_name = next(iter(cls_info))  # exactly one host class expected
+        if len(cls_info) != 1:
+            raise ValueError(f"Expected one host class, got {list(cls_info)}")
 
         # Defines the loop bounds of which are vectorizable
         self.vectorize = vectorize
@@ -229,6 +233,8 @@ class JaxConverter(
         self._local_defaults: dict = {}
         self._local_defined_stack: list[dict] = [{}]
 
+        self._pending_helper_meta = []
+
         # Stateful-variable analysis (filled once before each function transform)
         self.var_state: dict = {}
         self._stateful_vars_stack: list[set] = []
@@ -236,8 +242,10 @@ class JaxConverter(
         # Scan-specific stacks
         # _scan_stack: per-scan-body carry / mutated / introduced sets
         # _modified_ret_stack: attributes returned from nested calls, stacked by region
+        # _sequential_scope_stack:  Determine which names are already defined in the enclosing sequential scope.
         self._scan_stack: list[dict] = []
         self._modified_ret_stack: list[list[str]] = []
+        self._sequential_scope_stack: list[set] = []
 
         # Dynamic variable lifting due to vectorisation promotion
         self.dynamic_variable_lift: dict = {}
@@ -262,6 +270,19 @@ class JaxConverter(
 
         self._seen_assigned_names: set[str] = set()
         self._chain_pre_existing: dict[str, bool] = {}
+
+        # Continue handling
+        self._continue_stack: list = []
+        self._valid_counter = 0
+
+        self._batch_reduce_keys: set = set()
+        # NOTE: Meant for scalar variables that are string which are transformed to jnp.int32 to be
+        # JAX compatible
+        self._scalar_state_attrs = set(scalar_state_attrs or ())
+        # NOTE: This defines what type of dataclass field look like
+        # Thus this is required since the laieff_fit.a where the laieff can be an array and/or "a"
+        # be an array thus their dimension unique to each is necessary
+        self.struct_info = struct_info or {}
 
         if logger is None:
             self.logger = Logger()
@@ -309,7 +330,12 @@ class JaxConverter(
                 self._outer_func_args = args
 
             node = self._lift_if_return(node)
-            new_node = self.generic_visit(node)
+
+            self._sequential_scope_stack.append(set())
+            try:
+                new_node = self.generic_visit(node)
+            finally:
+                self._sequential_scope_stack.pop()
 
             if any(self._var_modif.values()):
                 self.fn_index[node.name] = node
@@ -555,7 +581,8 @@ class JaxConverter(
             else:
                 return False
 
-            var_name = get_name(target_node)
+            # var_name = get_name(target_node)
+            var_name = self._var_key(target_node)
             if not var_name:
                 return False
 
@@ -715,6 +742,86 @@ class JaxConverter(
             self.logger.exception("Exception in _is_control_temporary:", e)
             raise
 
+    def _active_continue_mask(self):
+        for m in reversed(self._continue_stack):
+            if m:
+                return m
+        return None
+
+    def _is_continue_guard(self, node):
+        body = [s for s in node.body if not self._is_logging_call(s)]
+        return (
+            bool(body)
+            and isinstance(body[-1], ast.Continue)
+            and not node.orelse
+            and bool(self._continue_stack)
+        )  # and bool(self._control_stack)
+
+    def visit_If(self, node):
+        guard = self._is_continue_guard(node)
+        result = super().visit_If(node)
+        if guard and result is not None:
+            result = self._register_continue_mask(node, result)
+        return result
+
+    def _register_continue_mask(self, node, result):
+        stmts = result if isinstance(result, list) else [result]
+        mask = next(
+            (
+                s
+                for s in stmts
+                if isinstance(s, ast.Assign)
+                and isinstance(s.targets[0], ast.Name)
+                and s.targets[0].id.startswith("_mask_")
+            ),
+            None,
+        )
+        if mask is None:
+            return result
+        vect = (
+            self._control_stack[-1].to_dict().get("vectorization_axis")
+            if self._control_stack
+            else None
+        )
+        rank = self.subscript_ranks(node.test).get(node.test, 0)
+        rank = max(rank, 1) if vect else 0
+        not_m = ast.Call(
+            func=ast.Attribute(
+                value=ast.Name(id="jnp", ctx=ast.Load()),
+                attr="logical_not",
+                ctx=ast.Load(),
+            ),
+            args=[ast.Name(id=mask.targets[0].id, ctx=ast.Load())],
+            keywords=[],
+        )
+        prev = self._active_continue_mask()
+        value = not_m
+        if prev is not None:
+            value = ast.Call(
+                func=ast.Attribute(
+                    value=ast.Name(id="jnp", ctx=ast.Load()),
+                    attr="logical_and",
+                    ctx=ast.Load(),
+                ),
+                args=[ast.Name(id=prev[0], ctx=ast.Load()), not_m],
+                keywords=[],
+            )
+            rank = max(rank, prev[1])
+        vname = f"_valid_{self._valid_counter}"
+        self._valid_counter += 1
+        self._continue_stack[-1] = (vname, rank)
+        return stmts + [
+            ast.fix_missing_locations(
+                ast.Assign(targets=[ast.Name(id=vname, ctx=ast.Store())], value=value)
+            )
+        ]
+
+    def visit_Assign(self, node):
+        return self._apply_continue_masks(super().visit_Assign(node))
+
+    def visit_Expr(self, node):
+        return self._apply_continue_masks(super().visit_Expr(node))
+
     def set_working_function(
         self, func_name: str, func_input_dim: dict, call_edge: CallEdge | list
     ) -> None:
@@ -760,3 +867,6 @@ class JaxConverter(
         self._inferred_ranks = {}
         self._seen_assigned_names = set()
         self._chain_pre_existing = {}
+        self._sequential_scope_stack = []
+        self._continue_stack: list = []
+        self._valid_counter = 0

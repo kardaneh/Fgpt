@@ -535,10 +535,32 @@ class _ConditionalLowering:
                     inputs.append(name)
 
             if self._local_defined_stack and self._local_defined_stack[-1]:
-                inputs.extend(self._local_defined_stack[-1].keys())
+                # _local_defined_stack is scoped to vectorization push/pop regions,
+                # not to individual lax.cond boundaries — a name locally defined in
+                # one branch (e.g. _if_true_0's snow_alb_diffuse/f_mu/snow_alb_direct)
+                # can still be sitting in the active frame once control moves to an
+                # unrelated sibling branch (_if_false_0 and its descendants), even
+                # though that branch never references it. Only pull in names that
+                # are actually read somewhere in this conditional's own branches.
+                referenced_in_branches = {
+                    n.id
+                    for stmt in (node.body + node.orelse)
+                    for n in ast.walk(stmt)
+                    if isinstance(n, ast.Name)
+                }
+                relevant_locals = (
+                    set(self._local_defined_stack[-1].keys()) & referenced_in_branches
+                )
+                inputs.extend(relevant_locals)
                 inputs = list(set(inputs))
 
-            for name in assigned:
+            enclosing_sequential_scope = (
+                set(self._sequential_scope_stack[-1])
+                if self._sequential_scope_stack
+                else set()
+            )
+
+            for name in set(assigned) & enclosing_sequential_scope:
                 if (
                     self._chain_pre_existing.get(name, False)
                     and name not in used_after
@@ -598,33 +620,37 @@ class _ConditionalLowering:
                 if self._local_defaults:
                     self._local_defaults.popitem()
 
-                new_body = []
-                for stmt in body_stmts:
-                    visited = self.visit(stmt)
-                    if isinstance(visited, list):
-                        for v in visited:
-                            if isinstance(v, ast.Assign) and mask_name:
-                                new_body.extend(
-                                    self._mask_vector_assign(
-                                        v, mask_name, assigned, used_after
+                self._sequential_scope_stack.append(set(inputs))
+                try:
+                    new_body = []
+                    for stmt in body_stmts:
+                        visited = self.visit(stmt)
+                        if isinstance(visited, list):
+                            for v in visited:
+                                if isinstance(v, ast.Assign) and mask_name:
+                                    new_body.extend(
+                                        self._mask_vector_assign(
+                                            v, mask_name, assigned, used_after
+                                        )
                                     )
+                                elif isinstance(v, ast.Continue):
+                                    continue
+                                else:
+                                    new_body.append(v)
+                        elif isinstance(visited, ast.Continue):
+                            pass
+                        elif isinstance(visited, ast.Assign) and mask_name:
+                            new_body.extend(
+                                self._mask_vector_assign(
+                                    visited, mask_name, assigned, used_after
                                 )
-                            elif isinstance(v, ast.Continue):
-                                continue
-                            else:
-                                new_body.append(v)
-                    elif isinstance(visited, ast.Continue):
-                        pass
-                    elif isinstance(visited, ast.Assign) and mask_name:
-                        new_body.extend(
-                            self._mask_vector_assign(
-                                visited, mask_name, assigned, used_after
                             )
-                        )
-                    elif visited is not None:
-                        new_body.append(visited)
+                        elif visited is not None:
+                            new_body.append(visited)
 
-                body_stmts = new_body
+                    body_stmts = new_body
+                finally:
+                    self._sequential_scope_stack.pop()
 
                 collected = []
                 while len(self._modified_ret_stack) > start_idx:

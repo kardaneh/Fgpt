@@ -122,7 +122,10 @@ class _ArrayUpdate:
             and isinstance(node.targets[0], ast.Name)
             and not self.check_if_array(node)
         ):
+            name = node.targets[0].id
             self._seen_assigned_names.add(node.targets[0].id)
+            if self._sequential_scope_stack:
+                self._sequential_scope_stack[-1].add(name)
         assign_vect = None
         if self._control_stack:
             assign_vect = self._control_stack[-1].to_dict()
@@ -276,6 +279,11 @@ class _ArrayUpdate:
                     value=at_call,
                 )
 
+            if new_assign is None:
+                new_assign = self._build_with_field_write(
+                    sub, operator, node.value, slice_value
+                )
+
             if mask_stmts:
                 return mask_stmts + [ast.copy_location(new_assign, node)]
             elif new_assign:
@@ -296,6 +304,22 @@ class _ArrayUpdate:
                 mask_stmts, node = self.handle_dynamic_slice(node)
             else:
                 mask_stmts = []
+
+            # TODO: Added this
+            if (
+                isinstance(node.targets[0], ast.Attribute)
+                and isinstance(node.targets[0].value, ast.Name)
+                and node.targets[0].value.id == "self"
+                and self._scan_stack
+            ):
+                attr = node.targets[0].attr
+                carry = self._scan_stack[-1].get("carry", set())
+                if attr in carry:
+                    node.targets[0] = ast.copy_location(
+                        ast.Name(id=attr, ctx=ast.Store()),
+                        node.targets[0],
+                    )
+                    self._var_modif["attr"].add(attr)
 
             if vectorization_context:
                 deps_rhs = self._expr_depends_on_axes(
@@ -439,13 +463,103 @@ class _ArrayUpdate:
                     if isinstance(target.value, ast.Name) and target.value.id == "self":
                         self.var_deps[target.attr] = deps_rhs
 
-            node.value = self.generic_visit(node.value)
+            # node.value = self.generic_visit(node.value)
+            if isinstance(node.value, ast.Subscript):
+                node.value = self.visit(node.value)  # dispatches to visit_Subscript
+            else:
+                node.value = self.generic_visit(node.value)
             if mask_stmts:
                 return mask_stmts + [node]
 
             return node
 
         return node
+
+    def _struct_info_for(self, name):
+        info = self.cls_info[self.cls_name]
+        m = info["methods"].get(self.func_name, {})
+        s = m.get("struct_args", {}).get(name)
+        if s:
+            return s
+        attr = info["attributes"].get(name)
+        if attr and attr.get("type") == "struct":
+            return attr
+        return None
+
+    def _is_derived_type_var(self, name: str) -> bool:
+        """True if `name` is declared with one of the generated struct classes."""
+        s = self._struct_info_for(name)
+        if not s:
+            return False
+        t = s.get("struct_type") or s.get("type")
+        return t in self.struct_classes
+
+    def _build_with_field_write(self, sub, operator, value, slice_value):
+        base = sub.value
+        if not isinstance(base, ast.Attribute):
+            return None
+        inner = base.value
+        is_self_struct = (
+            isinstance(inner, ast.Attribute)
+            and isinstance(inner.value, ast.Name)
+            and inner.value.id == "self"
+        )
+        if is_self_struct:
+            var = inner.attr
+        elif isinstance(inner, ast.Name) and inner.id != "self":
+            var = inner.id
+        else:
+            return None
+        if not self._is_derived_type_var(var):
+            return None
+        field = base.attr
+
+        if not is_self_struct or var in self._mutated_attrs:
+            recv_first = ast.Name(id=var, ctx=ast.Load())
+        else:
+            recv_first = ast.Attribute(
+                value=ast.Name(id="self", ctx=ast.Load()), attr=var, ctx=ast.Load()
+            )
+
+        def recv():
+            return copy.deepcopy(recv_first)
+
+        if is_self_struct:
+            self._var_modif["attr"].add(var)
+        elif self._outer_func_args and var in self._outer_func_args:
+            self._var_modif["args"].add(var)
+
+        at_call = ast.Call(
+            func=ast.Attribute(
+                value=ast.Subscript(
+                    value=ast.Attribute(
+                        value=ast.Attribute(value=recv(), attr=field, ctx=ast.Load()),
+                        attr="at",
+                        ctx=ast.Load(),
+                    ),
+                    slice=slice_value,
+                    ctx=ast.Load(),
+                ),
+                attr=operator,
+                ctx=ast.Load(),
+            ),
+            args=[value],
+            keywords=[],
+        )
+
+        new_assign = ast.Assign(
+            targets=[ast.Name(id=var, ctx=ast.Store())],
+            value=ast.Call(
+                func=ast.Attribute(value=recv(), attr="with_field", ctx=ast.Load()),
+                args=[ast.Constant(value=field), at_call],
+                keywords=[],
+            ),
+        )
+
+        # Only now mark as mutated, so later reads/writes use the bare name.
+        if is_self_struct:
+            self._mutated_attrs.add(var)
+        return new_assign
 
     def check_in_place_modif(self, node: ast.Assign) -> tuple[str, ast.AST]:
         """
@@ -678,6 +792,19 @@ class _ArrayUpdate:
             self.logger.exception("Exception in update_cls_dict", e)
             raise
 
+    def _var_key(self, node):
+        base = node
+        while isinstance(base, ast.Subscript):
+            base = base.value
+        if (
+            isinstance(base, ast.Attribute)
+            and self._struct_field_dims(base) is not None
+        ):
+            inner = base.value
+            var = inner.attr if isinstance(inner, ast.Attribute) else inner.id
+            return f"{var}.{base.attr}"
+        return get_name(node)
+
     def visit_Subscript(self, node: ast.Subscript) -> ast.AST:
         """
         Transform subscript expressions during vectorization.
@@ -762,7 +889,8 @@ class _ArrayUpdate:
                 self.index_variables.add(node.slice.id)
 
         # Array lifting
-        var_name = get_name(node)
+        # var_name = get_name(node)
+        var_name = self._var_key(node)
         lift_info = self.dynamic_variable_lift.get(var_name)
         if lift_info:
             batched_axes = lift_info["batched_axis"]

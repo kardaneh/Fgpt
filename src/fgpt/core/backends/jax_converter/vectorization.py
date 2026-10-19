@@ -138,7 +138,8 @@ class _Vectorization:
             results: dict[str, list[tuple]] = {}
             for sub in ast.walk(node):
                 if isinstance(sub, ast.Subscript):
-                    arr = get_name(sub.value)
+                    # arr = get_name(sub.value)
+                    arr = self._var_key(sub.value)
                     if arr is None:
                         continue
                     idx = self._extract_indices(sub.slice)
@@ -248,7 +249,8 @@ class _Vectorization:
                         if isinstance(sub.slice, ast.Tuple)
                         else [sub.slice]
                     )
-                    sub_name = get_name(sub)
+                    # sub_name = get_name(sub)
+                    sub_name = self._var_key(sub)
                     for i, idx in enumerate(indices):
                         if isinstance(idx, ast.Slice):
                             if i in list(vectorization_axis.values()):
@@ -265,7 +267,8 @@ class _Vectorization:
                     local_arrays = func_data.get("local_arr", {}) if func_data else {}
 
                     loop_info = vectorization_context.get("loop_info", {})
-                    sub_name = get_name(sub)
+                    # sub_name = get_name(sub)
+                    sub_name = self._var_key(sub)
                     if sub_name in attributes:
                         dimension = attributes.get(sub_name).get("dimensions")
                         for idx in dimension:
@@ -320,6 +323,29 @@ class _Vectorization:
             self.logger.exception("Exception in check_condition:", e)
             raise
 
+    def _struct_field_dims(self, node):
+        """Attribute(var, field) or self.var.field -> batch dims + field inner dims, else None."""
+        if not isinstance(node, ast.Attribute):
+            return None
+        base = node.value
+        if (
+            isinstance(base, ast.Attribute)
+            and isinstance(base.value, ast.Name)
+            and base.value.id == "self"
+        ):
+            var = base.attr
+        elif isinstance(base, ast.Name):
+            var = base.id
+        else:
+            return None
+        s = self._struct_info_for(var)
+        if not s:
+            return None
+        fld = self.struct_info.get(s.get("type") or s.get("struct_type"), {}).get(
+            node.attr
+        )
+        return None if fld is None else list(s["dimensions"]) + list(fld["inner_dims"])
+
     def get_declared_dims(self, node: ast.AST) -> list | None:
         """
         Resolve the declared dimension names for *node*.
@@ -354,6 +380,14 @@ class _Vectorization:
 
             local_arr = self.cls_info[cls]["methods"][func].get("local_arr", {})
             attributes = self.cls_info[cls]["attributes"]
+
+            # struct field  var.field[...]  or  self.var.field[...]
+            base = node
+            while isinstance(base, ast.Subscript):
+                base = base.value
+            struct_dims = self._struct_field_dims(base)
+            if struct_dims is not None:
+                return struct_dims
 
             if isinstance(node, ast.Name):
                 if node.id in local_arr:
@@ -425,8 +459,10 @@ class _Vectorization:
                         ):
                             continue
                         active.append(dim)
+                    active.extend(declared[len(sl.elts) :])
                 else:
-                    active = declared[1:]
+                    # active = declared[1:]
+                    active = declared if isinstance(sl, ast.Slice) else declared[1:]
                 return active
 
             return declared
@@ -606,6 +642,13 @@ class _Vectorization:
             self.logger.exception("Exception in _is_arange_over_dim:", e)
             raise
 
+    def _local_rank(self, name: str) -> int:
+        for scope in reversed(self._local_defined_stack):
+            shape = scope.get(name)
+            if shape:
+                return len(shape)
+        return 0
+
     def subscript_ranks(
         self,
         node: ast.AST,
@@ -669,7 +712,7 @@ class _Vectorization:
                 if isinstance(sl, ast.Tuple):
                     rank = 0
                     for elt in sl.elts:
-                        if isinstance(elt, ast.Slice) and self.is_full_slice(elt):
+                        if isinstance(elt, ast.Slice):  # and self.is_full_slice(elt)
                             rank += 1
                         elif isinstance(elt, ast.Constant) and elt.value is None:
                             rank += 1
@@ -784,6 +827,8 @@ class _Vectorization:
                         and state[0] == "stateful"
                     ):
                         left_rank = 1
+                    if left_rank == 0:
+                        left_rank = self._local_rank(node.left.id)
 
                 if right_rank == 0:
                     for comp in node.comparators:
@@ -796,6 +841,8 @@ class _Vectorization:
                                 and state[0] == "stateful"
                             ):
                                 comp_rank = 1
+                            if comp_rank == 0:
+                                comp_rank = self._local_rank(comp.id)
                             right_rank = max(right_rank, comp_rank)
 
                 rank = max(left_rank, right_rank)
@@ -869,6 +916,7 @@ class _Vectorization:
                 func_input_dim=self.func_input_dim
                 if hasattr(self, "func_input_dim")
                 else None,
+                struct_info=self.struct_info,
             )
             return transformer.visit(node), transformer.elts_list
         except Exception as e:
@@ -1254,7 +1302,8 @@ class _Vectorization:
                 return
 
             target_node = self._extract_target(node)
-            array_name = get_name(target_node)
+            # array_name = get_name(target_node)
+            array_name = self._var_key(target_node)
 
             local_arrays = (
                 self.cls_info[self.cls_name]

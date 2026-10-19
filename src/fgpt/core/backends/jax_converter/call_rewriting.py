@@ -174,7 +174,6 @@ class _CallRewriting:
                         continue
 
                     needs_vmap = False  # reset per edge
-                    in_axes = []
                     fn_input_dim = {}
 
                     call_node = edge.call_node
@@ -188,11 +187,24 @@ class _CallRewriting:
                             expected_shape = fn_input_dim.get(arg_name, [])
                             if len(actual_shape) > len(expected_shape):
                                 needs_vmap = True
-                                for i, sh in enumerate(actual_shape):
-                                    if sh in loop_info and len(in_axes) < len(
-                                        node.args
-                                    ):
-                                        in_axes.append(i)
+                                break
+
+                    if needs_vmap:
+                        in_axes = []
+                        for arg_node, param in zip(node.args, edge.func_args):
+                            actual = edge.arg_shapes.get(param, [])
+                            expected = fn_input_dim.get(param, [])
+                            axis = None
+                            if len(actual) > len(expected):
+                                for pos, sh in enumerate(actual):
+                                    if sh in loop_info:
+                                        axis = pos
+                                        break
+                            in_axes.append(axis)
+
+                        # If no argument actually has a batched axis, vmap is invalid
+                        if all(a is None for a in in_axes):
+                            needs_vmap = False
 
                     if needs_vmap:
                         vmap_call = ast.Call(
@@ -267,7 +279,8 @@ class _CallRewriting:
                             )
 
             self.reduction.dynamic_variable_lift = self.dynamic_variable_lift
-
+            self.reduction.batch_reduce_keys = self._batch_reduce_keys
+            self.reduction.struct_info = self.struct_info
             self.reduction.func_name = (
                 self.func_name if hasattr(self, "func_name") else None
             )
@@ -291,6 +304,17 @@ class _CallRewriting:
         except Exception as e:
             self.logger.exception("Exception in visit_Call:", e)
             raise
+
+    def _batched_arg(self, arg: ast.AST, loop_var: str, forced: set) -> bool:
+        names = {n.id for n in ast.walk(arg) if isinstance(n, ast.Name)} - {"self"}
+        if loop_var in names or names & forced:
+            return True
+        for n in names:
+            if n in self.dynamic_variable_lift or self.var_deps.get(n):
+                return True
+            # if any(n in scope and scope[n] for scope in self._local_defined_stack):
+            #     return True   # lifted temporaries, e.g. cosine_sun_angle
+        return False
 
     def _is_vectorized_child_call(self, node: ast.Expr) -> bool:
         """
@@ -381,15 +405,96 @@ class _CallRewriting:
 
             # Check that at least one loop_info entry maps to a vectorized axis and is
             # present inside the arguments of the function
-            arg_names = [get_name(n) for n in rhs.args]
+            # arg_names = [get_name(n) for n in rhs.args]
             for dim, loop_var in loop_info.items():
-                if loop_var in vectorization_axis and loop_var in arg_names:
-                    return True
-
+                if loop_var in vectorization_axis:
+                    if any(self._batched_arg(a, loop_var, set()) for a in rhs.args):
+                        return True
             return False
         except Exception as e:
             self.logger.exception("Exception in _is_vectorized_child_call:", e)
             raise
+
+    def _emit_vmap_call(
+        self,
+        new_assign,
+        new_call,
+        modified_vars,
+        func_args,
+        loop_var,
+        vect_dim,
+        vectorization_context,
+    ):
+        # Outputs of a batched call are batched, so they must be lifted.
+        # Mirror the registration format used in visit_Assign.
+        axes = vectorization_context.get("vectorization_axis", {})
+        loop_info = vectorization_context.get("loop_info", {})
+        local_arrays = (
+            self.cls_info[self.cls_name]
+            .get("methods", {})
+            .get(self.func_name, {})
+            .get("local_arr", {})
+        )
+        for v in modified_vars:
+            self._process_lift(v, axes, loop_info, local_arrays)
+            self.var_deps[v] = (vect_dim,)
+        forced = set(modified_vars)
+        params, batched_actuals, body_args = [], [], []
+        for i, arg in enumerate(new_call.args):
+            if self._batched_arg(arg, loop_var, forced):
+                p = f"_b_{func_args[i] if i < len(func_args) else i}"
+                params.append(p)
+                batched_actuals.append(arg)
+                body_args.append(ast.Name(id=p, ctx=ast.Load()))
+            else:
+                body_args.append(arg)
+
+        fn_name = f"_vmap_body_{new_call.func.attr}"
+        body_fn = ast.FunctionDef(
+            name=fn_name,
+            args=ast.arguments(
+                posonlyargs=[],
+                args=[ast.arg(arg=p) for p in params],
+                vararg=None,
+                kwonlyargs=[],
+                kw_defaults=[],
+                kwarg=None,
+                defaults=[],
+            ),
+            body=[
+                ast.Return(
+                    value=ast.Call(
+                        func=new_call.func, args=body_args, keywords=new_call.keywords
+                    )
+                )
+            ],
+            decorator_list=[],
+            returns=None,
+        )
+
+        vmapped = ast.Call(
+            func=ast.Call(
+                func=ast.Attribute(
+                    value=ast.Name(id="jax", ctx=ast.Load()),
+                    attr="vmap",
+                    ctx=ast.Load(),
+                ),
+                args=[ast.Name(id=fn_name, ctx=ast.Load())],
+                keywords=[
+                    ast.keyword(
+                        arg="in_axes",
+                        value=ast.Tuple(
+                            elts=[ast.Constant(value=0)] * len(params), ctx=ast.Load()
+                        ),
+                    )
+                ],
+            ),
+            args=batched_actuals,
+            keywords=[],
+        )
+
+        out = ast.Assign(targets=new_assign.targets, value=vmapped)
+        return [body_fn, out]
 
     def _emit_scan_wrapped_call(
         self,
@@ -496,6 +601,18 @@ class _CallRewriting:
 
             if vect_dim is None:
                 return new_assign
+
+            arg_names = [get_name(a) for a in new_call.args]
+            if loop_var not in arg_names:  # index not passed -> vmap
+                return self._emit_vmap_call(
+                    new_assign,
+                    new_call,
+                    modified_vars,
+                    func_args,
+                    loop_var,
+                    vect_dim,
+                    vectorization_context,
+                )
 
             inner_func_name = f"_scan_body_{callee_name}"
 
@@ -616,6 +733,19 @@ class _CallRewriting:
             self.logger.exception("Exception in _emit_scan_wrapped_call:", e)
             raise
 
+    def _actual_arg_name(self, arg: ast.AST) -> str | None:
+        if isinstance(arg, ast.Name):
+            return arg.id
+        if isinstance(arg, ast.Attribute):
+            return arg.attr
+        if isinstance(arg, ast.Starred):
+            return self._actual_arg_name(arg.value)
+        # BinOp, Constant, Call, Subscript, ...: not a mutable variable.
+        # A Subscript like x[i] still points at a variable, so unwrap it:
+        if isinstance(arg, ast.Subscript):
+            return self._actual_arg_name(arg.value)
+        return None
+
     def visit_Expr(self, node: ast.Expr) -> ast.AST | list[ast.AST]:
         """
         Transform expression statements containing calls to tracked helper
@@ -713,9 +843,7 @@ class _CallRewriting:
             # Function arguments
             func_args = methods.get(callee_name).get("args")
             # Actual arguments list
-            actual_args = [
-                arg.id if isinstance(arg, ast.Name) else arg.attr for arg in value.args
-            ]
+            actual_args = [self._actual_arg_name(arg) for arg in value.args]
             # NOTE:
             # The arguments passed at the call site may differ from the function’s
             # formal parameters. In such cases, we use both the actual arguments and
@@ -729,7 +857,7 @@ class _CallRewriting:
             for arg in ret_info["var_modif_args"]:
                 if arg in func_args:
                     index = func_args.index(arg)
-                    if index < len(actual_args):
+                    if index < len(actual_args) and actual_args[index] is not None:
                         mapped_args.append(actual_args[index])
                     else:
                         mapped_args.append(arg)
@@ -1039,7 +1167,11 @@ class _CallRewriting:
                 if (
                     attr in self._mutated_attrs
                     and attr in self._var_modif["attr"]
-                    or (self._func_arg_stack[-1] and attr in self._func_arg_stack[-1])
+                    or (
+                        self._func_arg_stack
+                        and self._func_arg_stack[-1]
+                        and attr in self._func_arg_stack[-1]
+                    )
                     or (
                         self._modified_ret_stack
                         and attr in self._modified_ret_stack[-1]

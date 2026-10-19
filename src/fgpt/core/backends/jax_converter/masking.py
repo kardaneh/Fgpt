@@ -7,8 +7,7 @@
 # http://creativecommons.org/licenses/by-nc-sa/4.0/
 
 import ast
-
-from fgpt.core.backends.utils import get_name
+import copy
 
 
 class _Masking:
@@ -366,6 +365,16 @@ class _Masking:
 
             var_name = target.id
             mask_expr = ast.Name(id=mask_name, ctx=ast.Load())
+            if var_name in self._scalar_state_attrs:
+                mask_expr = ast.Call(
+                    func=ast.Attribute(
+                        value=ast.Name(id="jnp", ctx=ast.Load()),
+                        attr="any",
+                        ctx=ast.Load(),
+                    ),
+                    args=[mask_expr],
+                    keywords=[],
+                )
 
             if self.is_arr_at_op_call(assign.value, var_name):
                 value = assign.value.func.args[0]
@@ -517,9 +526,18 @@ class _Masking:
 
             target = assign.targets[0]
             value = assign.value
-            target_name = get_name(target)
+            if isinstance(target, ast.Name) and target.id in self._scalar_state_attrs:
+                return self._mask_plain_assign(assign, mask_name)
+            # target_name = get_name(target)
+            target_name = self._var_key(target)
+            # struct field write: unwrap, mask the inner .at[] call, re-wrap at the end
+            wf = self._split_with_field(value, target_name)
+            field, recv = None, None
+            if wf:
+                field, value = wf
+                recv = copy.deepcopy(assign.value.func.value)  # x  or  self.x
             # Only handle arr = arr.at[...].<op>(...) pattern
-            if not self.is_arr_at_op_call(value, target_name):
+            if not (wf or self.is_arr_at_op_call(value, target_name)):
                 if isinstance(assign, ast.Assign) and self._control_stack:
                     if not self.check_if_array(assign) or (
                         target_name in self.var_state
@@ -540,40 +558,45 @@ class _Masking:
             op_name = value.func.attr  # set / add / multiply / etc...
             args = value.args
 
-            arr_name = (
-                at_sub.value.value.id
-                if isinstance(at_sub.value.value, ast.Name)
-                else at_sub.value.value.attr
-            )
-
-            if arr_name is None:
-                return [assign]
-
-            # Determine old value expression
-            if (self.counter == 0 and self.for_counter == 0) and self.cls_info[
-                self.cls_name
-            ].get("attributes").get(arr_name):
-                target_value = ast.Attribute(
-                    value=ast.Name(id="self", ctx=ast.Load()),
-                    attr=arr_name,
-                    ctx=ast.Load(),
+            if wf:
+                arr_expr = copy.deepcopy(at_sub.value.value)  # x.b  or  self.x.b
+                target_value = arr_expr
+                arr_name = target_name
+                dims_node = arr_expr  # used for every dims lookup below
+            else:
+                arr_expr = None
+                arr_name = (
+                    at_sub.value.value.id
+                    if isinstance(at_sub.value.value, ast.Name)
+                    else at_sub.value.value.attr
                 )
-                if isinstance(at_sub.value.value, ast.Name):
-                    at_sub.value.value = ast.Attribute(
+
+                if arr_name is None:
+                    return [assign]
+
+                # Determine old value expression
+                if (self.counter == 0 and self.for_counter == 0) and self.cls_info[
+                    self.cls_name
+                ].get("attributes").get(arr_name):
+                    target_value = ast.Attribute(
                         value=ast.Name(id="self", ctx=ast.Load()),
                         attr=arr_name,
                         ctx=ast.Load(),
                     )
-            else:
-                target_value = ast.Name(id=arr_name, ctx=ast.Load())
-
-            if isinstance(at_sub.slice, ast.Tuple):
-                if all(isinstance(s, ast.Slice) for s in at_sub.slice.elts):
-                    old_val = target_value
+                    if isinstance(at_sub.value.value, ast.Name):
+                        at_sub.value.value = ast.Attribute(
+                            value=ast.Name(id="self", ctx=ast.Load()),
+                            attr=arr_name,
+                            ctx=ast.Load(),
+                        )
                 else:
-                    old_val = ast.Subscript(
-                        value=target_value, slice=at_sub.slice, ctx=ast.Load()
-                    )
+                    target_value = ast.Name(id=arr_name, ctx=ast.Load())
+                dims_node = target
+
+            if isinstance(at_sub.slice, ast.Tuple) and all(
+                isinstance(s, ast.Slice) for s in at_sub.slice.elts
+            ):
+                old_val = target_value
             else:
                 old_val = ast.Subscript(
                     value=target_value, slice=at_sub.slice, ctx=ast.Load()
@@ -596,9 +619,9 @@ class _Masking:
                 )
             )
 
-            vect_context = None
-            if self._control_stack:
-                vect_context = self._control_stack[-1].to_dict()
+            vect_context = (
+                self._control_stack[-1].to_dict() if self._control_stack else None
+            )
 
             mask_expr = ast.Name(id=mask_name, ctx=ast.Load())
             target_rank = self._target_rank(at_sub.slice)
@@ -613,112 +636,117 @@ class _Masking:
             # additional dimensions. The mask must broadcast to the same rank
             # as the assignment target.
             if elts_list:
-                if (
+                if not (
                     vect_context
                     and vect_context.get("metadata", {}).get("current_mask_rank", 0)
                     == 0
                 ):
-                    pass
-                else:
                     mask_expr = ast.Subscript(
                         value=mask_expr,
                         slice=ast.Tuple(elts=elts_list, ctx=ast.Load()),
                         ctx=ast.Load(),
                     )
-            else:
-                if target_rank > 1 and vect_context:
-                    current_mask_rank = vect_context.get("metadata", {}).get(
-                        "current_mask_rank", 0
-                    )
-                    if current_mask_rank == 0:
-                        pass
-                    elif current_mask_rank < target_rank:
-                        dimensions = self.get_active_dims(target)
-                        loop_info = vect_context.get("loop_info", {})
-                        vectorization_axis = vect_context.get("vectorization_axis", {})
+            elif target_rank > 1 and vect_context:
+                current_mask_rank = vect_context.get("metadata", {}).get(
+                    "current_mask_rank", 0
+                )
+                if current_mask_rank != 0 and current_mask_rank < target_rank:
+                    dimensions = self.get_active_dims(dims_node)
+                    loop_info = vect_context.get("loop_info", {})
+                    vectorization_axis = vect_context.get("vectorization_axis", {})
 
-                        elts = [ast.Constant(value=None)] * target_rank
-                        for loop_dim, loop_var in loop_info.items():
-                            if loop_dim not in dimensions:
-                                continue
-                            dim_index = dimensions.index(loop_dim)
-                            vect_axis = vectorization_axis.get(loop_var, [])
-                            if dim_index not in vect_axis:
-                                continue
-                            elts[dim_index] = ast.Slice()
+                    elts = [ast.Constant(value=None)] * target_rank
+                    for loop_dim, loop_var in loop_info.items():
+                        if loop_dim not in dimensions:
+                            continue
+                        dim_index = dimensions.index(loop_dim)
+                        if dim_index not in vectorization_axis.get(loop_var, []):
+                            continue
+                        elts[dim_index] = ast.Slice()
 
-                        if any(isinstance(e, ast.Slice) for e in elts):
-                            mask_expr = ast.Subscript(
-                                value=mask_expr,
-                                slice=ast.Tuple(elts=elts, ctx=ast.Load()),
-                                ctx=ast.Load(),
-                            )
+                    if any(isinstance(e, ast.Slice) for e in elts):
+                        mask_expr = ast.Subscript(
+                            value=mask_expr,
+                            slice=ast.Tuple(elts=elts, ctx=ast.Load()),
+                            ctx=ast.Load(),
+                        )
 
             if op_name != "set" and isinstance(rhs_expr, ast.BinOp):
                 # Select the appropriate identity element for the update dtype.
+                dtype = "float64"
                 attributes = self.cls_info[self.cls_name].get("attributes")
                 methods = self.cls_info[self.cls_name]["methods"].get(self.func_name)
                 local_arrays = methods.get("local_arr")
-                dtype = "float64"
-                if attributes and target_name in attributes:
-                    attr_data = attributes.get(target_name)
-                    if attr_data:
-                        dtype = attr_data.get("dtype", "float64")
+                if wf:
+                    s = self._struct_info_for(target_name) or {}
+                    t = s.get("type") or s.get("struct_type")
+                    dtype = (
+                        self.struct_info.get(t, {}).get(field, {}).get("dtype")
+                        or "float64"
+                    )
+                elif attributes and target_name in attributes:
+                    dtype = (attributes.get(target_name) or {}).get("dtype", "float64")
                 elif local_arrays and target_name in local_arrays:
-                    arr_data = local_arrays.get(target_name)
-                    if arr_data:
-                        dtype = arr_data.get("dtype", "float64")
+                    dtype = (local_arrays.get(target_name) or {}).get(
+                        "dtype", "float64"
+                    )
 
                 is_float = dtype == "float64"
-                constant_value = 0.0 if is_float else 0
-                multi_constant_value = 1.0 if is_float else 1
+                zero = 0.0 if is_float else 0
+                one = 1.0 if is_float else 1
 
-                if isinstance(rhs_expr.op, ast.Add):
-                    op_name = "add"
-                    identity = ast.Constant(value=constant_value)
-                    delta_expr = rhs_expr.right
+                op_map = {
+                    ast.Add: ("add", zero),
+                    ast.Sub: ("subtract", zero),
+                    ast.Mult: ("multiply", one),
+                    ast.Div: ("divide", one),
+                    ast.Pow: ("power", one),
+                }
+                op_name, ident = op_map[type(rhs_expr.op)]
+                identity = ast.Constant(value=ident)
+                delta_expr = rhs_expr.right
 
-                elif isinstance(rhs_expr.op, ast.Sub):
-                    op_name = "subtract"
-                    identity = ast.Constant(value=constant_value)
-                    delta_expr = rhs_expr.right
-
-                elif isinstance(rhs_expr.op, ast.Mult):
-                    op_name = "multiply"
-                    identity = ast.Constant(value=multi_constant_value)
-                    delta_expr = rhs_expr.right
-
-                elif isinstance(rhs_expr.op, ast.Div):
-                    op_name = "divide"
-                    identity = ast.Constant(value=multi_constant_value)
-                    delta_expr = rhs_expr.right
-
-                elif isinstance(rhs_expr.op, ast.Pow):
-                    op_name = "power"
-                    identity = ast.Constant(value=multi_constant_value)
-                    delta_expr = rhs_expr.right
-
-                masked_delta = ast.Call(
-                    func=ast.Attribute(
-                        value=ast.Name(id="jnp", ctx=ast.Load()),
-                        attr="where",
-                        ctx=ast.Load(),
-                    ),
-                    args=[mask_expr, delta_expr, identity],
-                    keywords=[],
+                reduce_batch = (
+                    op_name in ("add", "subtract")
+                    and vect_context
+                    and vect_context.get("vectorization_axis")
+                    and self._is_unbatched_target(
+                        arr_expr if wf else arr_name, vect_context
+                    )
+                    and self._batched_arg(
+                        delta_expr,
+                        next(iter(vect_context["vectorization_axis"])),
+                        set(),
+                    )
                 )
-                delta_name = f"delta_{target_name}{mask_name}"
+                if reduce_batch:
+                    b_axis, r = self._batch_axis(delta_expr, vect_context)
+                    d_rank = max(r, self._expr_rank(delta_expr), 1)
+                    b_axis += d_rank - r  # re-right-align to the final rank
+                    m = self._expand_valid(mask_name, 1, d_rank, b_axis)
+                    masked_delta = self._final_sum(
+                        self._where(m, delta_expr, identity), b_axis
+                    )
+                    self._batch_reduce_keys.add((mask_name, b_axis))
+                else:
+                    masked_delta = self._where(mask_expr, delta_expr, identity)
+                # field-specific name so x.a and x.b under one mask don't collide
+                delta_name = (
+                    f"delta_{target_name}{'_' + field if wf else ''}{mask_name}"
+                )
                 delta_value = ast.Assign(
                     targets=[ast.Name(id=delta_name, ctx=ast.Store())],
                     value=masked_delta,
                 )
-                new_assign = ast.Assign(
-                    targets=[ast.Name(id=arr_name, ctx=ast.Store())],
-                    value=ast.Call(
-                        func=ast.Attribute(value=at_sub, attr=op_name, ctx=ast.Load()),
-                        args=[ast.Name(id=delta_name, ctx=ast.Load())],
-                        keywords=[],
-                    ),
+                new_assign = self._emit(
+                    at_sub,
+                    op_name,
+                    ast.Name(id=delta_name, ctx=ast.Load()),
+                    wf,
+                    field,
+                    recv,
+                    arr_name,
+                    target_name,
                 )
                 return [
                     ast.fix_missing_locations(delta_value),
@@ -726,29 +754,293 @@ class _Masking:
                 ]
             else:
                 # Overwrite / set pattern
-                masked_val = ast.Call(
-                    func=ast.Attribute(
-                        value=ast.Name(id="jnp", ctx=ast.Load()),
-                        attr="where",
-                        ctx=ast.Load(),
-                    ),
-                    args=[mask_expr, rhs_expr, old_val],
-                    keywords=[],
+                masked_val = self._where(mask_expr, rhs_expr, old_val)
+                new_assign = self._emit(
+                    at_sub, "set", masked_val, wf, field, recv, arr_name, target_name
                 )
-
-                new_assign = ast.Assign(
-                    targets=[ast.Name(id=arr_name, ctx=ast.Store())],
-                    value=ast.Call(
-                        func=ast.Attribute(value=at_sub, attr="set", ctx=ast.Load()),
-                        args=[masked_val],
-                        keywords=[],
-                    ),
-                )
-
                 return [ast.fix_missing_locations(new_assign)]
         except Exception as e:
             self.logger.exception("Exception in _mask_vector_assign:", e)
             raise
+
+    def _emit(self, at_sub, op, arg, wf, field, recv, arr_name, target_name):
+        """Build the final statement, re-wrapping with_field for struct writes."""
+        inner = ast.Call(
+            func=ast.Attribute(value=at_sub, attr=op, ctx=ast.Load()),
+            args=[arg],
+            keywords=[],
+        )
+        if wf:
+            return ast.Assign(
+                targets=[ast.Name(id=target_name, ctx=ast.Store())],
+                value=ast.Call(
+                    func=ast.Attribute(value=recv, attr="with_field", ctx=ast.Load()),
+                    args=[ast.Constant(value=field), inner],
+                    keywords=[],
+                ),
+            )
+        return ast.Assign(targets=[ast.Name(id=arr_name, ctx=ast.Store())], value=inner)
+
+    def _split_with_field(self, value, target_name):
+        if not (
+            isinstance(value, ast.Call)
+            and isinstance(value.func, ast.Attribute)
+            and value.func.attr == "with_field"
+            and len(value.args) == 2
+            and isinstance(value.args[0], ast.Constant)
+        ):
+            return None
+        recv = value.func.value
+        ok = (isinstance(recv, ast.Name) and recv.id == target_name) or (
+            isinstance(recv, ast.Attribute)
+            and recv.attr == target_name
+            and isinstance(recv.value, ast.Name)
+            and recv.value.id == "self"
+        )
+        return (value.args[0].value, value.args[1]) if ok else None
+
+    def _rewrap(self, var, field, at_call):
+        return ast.Call(
+            func=ast.Attribute(
+                value=ast.Name(id=var, ctx=ast.Load()),
+                attr="with_field",
+                ctx=ast.Load(),
+            ),
+            args=[ast.Constant(value=field), at_call],
+            keywords=[],
+        )
+
+    def _var_rank(self, name: str) -> int:
+        dims = self.get_declared_dims(ast.Name(id=name, ctx=ast.Load())) or []
+        r = len(dims)
+        ctx = self._control_stack[-1].to_dict() if self._control_stack else {}
+        if name in self.dynamic_variable_lift and not any(
+            d in dims for d in ctx.get("loop_info", {})
+        ):
+            r += 1  # lifted array gained the batch axis
+        return r
+
+    def _expr_rank(self, expr) -> int:
+        ranks = [0]
+        for n in ast.walk(expr):
+            if isinstance(n, ast.Attribute):
+                d = self._struct_field_dims(n)
+                if d is not None:
+                    ranks.append(len(d))
+        names = {n.id for n in ast.walk(expr) if isinstance(n, ast.Name)} - {"self"}
+        return max(ranks + [self._var_rank(n) for n in names])
+
+    def _final_sum(self, arg, axis):
+        call = ast.Call(
+            func=ast.Attribute(
+                value=ast.Name(id="jnp", ctx=ast.Load()), attr="sum", ctx=ast.Load()
+            ),
+            args=[arg],
+            keywords=[ast.keyword(arg="axis", value=ast.Constant(value=axis))],
+        )
+        return call
+
+    def _dims_after_index(self, node):
+        """Dims left on an operand after its subscript (None = newaxis)."""
+        if isinstance(node, ast.Subscript):
+            base = node
+            while isinstance(base, ast.Subscript):
+                base = base.value
+            dims = list(self.get_declared_dims(base) or [])
+            idx = node.slice
+            elts = idx.elts if isinstance(idx, ast.Tuple) else [idx]
+            out, k = [], 0
+            for e in elts:
+                if isinstance(e, ast.Slice):
+                    out.append(dims[k] if k < len(dims) else None)
+                    k += 1
+                elif isinstance(e, ast.Constant) and e.value is None:
+                    out.append(None)
+                else:
+                    k += 1  # scalar index consumes a dim
+            out.extend(dims[k:])
+            return out, base
+        return list(self.get_declared_dims(node) or []), node
+
+    def _batch_axis(self, expr, ctx) -> tuple[int, int]:
+        """(axis, rank) of the batch dimension inside `expr`, right-aligned
+        under numpy broadcasting. Falls back to (0, 1)."""
+        loop_info = ctx.get("loop_info", {})
+        vect = ctx.get("vectorization_axis", {})
+        batch_dims = {d for d, lv in loop_info.items() if lv in vect}
+
+        cands, seen = [], set()
+        # outermost subscripts / bare names only
+        inner = {id(n.value) for n in ast.walk(expr) if isinstance(n, ast.Subscript)}
+        for n in ast.walk(expr):
+            if id(n) in inner or not isinstance(
+                n, ast.Subscript | ast.Name | ast.Attribute
+            ):
+                continue
+            dims, base = self._dims_after_index(n)
+            name = (
+                self._var_key(base)
+                if isinstance(base, ast.Attribute)
+                else getattr(base, "id", None)
+            )
+            if name in (None, "self") or id(n) in seen:
+                continue
+            pos = next((i for i, d in enumerate(dims) if d in batch_dims), None)
+            if pos is None and name in self.dynamic_variable_lift:
+                pos = min(self.dynamic_variable_lift[name]["batched_axis"], default=0)
+                dims = [None] + dims  # lifted: batch axis not in dims
+            if pos is not None:
+                cands.append((len(dims), pos))
+        if not cands:
+            return 0, 1
+        R = max(r for r, _ in cands)
+        # right-align: axis_from_end is invariant under broadcasting
+        r, p = max(cands)
+        return p + (R - r), R
+
+    def _expand_valid(self, vname, vrank, rank, axis=0):
+        name = ast.Name(id=vname, ctx=ast.Load())
+        if vrank == 0 or rank <= 1 or vrank == rank:
+            return name
+        elts = [ast.Constant(value=None)] * rank
+        for k in range(vrank):
+            elts[axis + k] = ast.Slice()
+        return ast.Subscript(
+            value=name, slice=ast.Tuple(elts=elts, ctx=ast.Load()), ctx=ast.Load()
+        )
+
+    def _is_unbatched_target(self, arr, ctx):
+        node = arr if isinstance(arr, ast.AST) else ast.Name(id=arr, ctx=ast.Load())
+        if self._var_key(node) in self.dynamic_variable_lift:  # get_name(node)
+            return False
+        dims = self.get_declared_dims(node) or []
+        return not any(d in ctx.get("loop_info", {}) for d in dims)
+
+    def _where(self, cond, a, b):
+        return ast.Call(
+            func=ast.Attribute(
+                value=ast.Name(id="jnp", ctx=ast.Load()), attr="where", ctx=ast.Load()
+            ),
+            args=[cond, a, b],
+            keywords=[],
+        )
+
+    def _is_vmap_assign(self, s) -> bool:
+        return (
+            isinstance(s, ast.Assign)
+            and isinstance(s.value, ast.Call)
+            and isinstance(s.value.func, ast.Call)
+            and isinstance(s.value.func.func, ast.Attribute)
+            and s.value.func.func.attr == "vmap"
+            and isinstance(s.targets[0], ast.Tuple)
+        )
+
+    def _mask_vmap_outputs(self, assign, vname, vrank):
+        names = [t.id for t in assign.targets[0].elts if isinstance(t, ast.Name)]
+        n = self._mask_counter
+        self._mask_counter += 1
+        old, new = f"_old_{n}", f"_new_{n}"
+        call = assign.value
+        ctx = self._control_stack[-1].to_dict()
+        # 1) safe inputs: skipped points must not produce inf/NaN
+        #    (also keeps gradients finite, since where(m, nan, x) still yields nan grads)
+        safe_args = []
+        for a in call.args:
+            if isinstance(a, ast.Name) and a.id in names:
+                safe_args.append(a)  # carried outputs: untouched
+            # elif self._batched_arg(a, "", set()):
+            #     r = max(self._expr_rank(a), 1)
+            #     safe_args.append(self._where(self._expand_valid(vname, vrank, r),
+            #                                 a, ast.Constant(value=1.0)))
+            elif self._batched_arg(a, "", set()):
+                ax, r = self._batch_axis(a, ctx)
+                r = max(self._expr_rank(a), r, 1)
+                safe_args.append(
+                    self._where(
+                        self._expand_valid(vname, vrank, r, ax),
+                        a,
+                        ast.Constant(value=1.0),
+                    )
+                )
+            else:
+                safe_args.append(a)
+        call.args = safe_args
+
+        # 2) run on all points, 3) keep old values at skipped points
+        out = [
+            ast.Assign(
+                targets=[ast.Name(id=old, ctx=ast.Store())],
+                value=ast.Tuple(
+                    elts=[ast.Name(id=x, ctx=ast.Load()) for x in names], ctx=ast.Load()
+                ),
+            ),
+            ast.Assign(targets=[ast.Name(id=new, ctx=ast.Store())], value=call),
+        ]
+        for i, nm in enumerate(names):
+            v = self._expand_valid(
+                vname,
+                vrank,
+                max(self._var_rank(nm), 1),
+                self._batch_axis(ast.Name(id=nm, ctx=ast.Load()), ctx)[0],
+            )
+
+            def pick(base):
+                return ast.Subscript(
+                    value=ast.Name(id=base, ctx=ast.Load()),
+                    slice=ast.Constant(value=i),
+                    ctx=ast.Load(),
+                )
+
+            out.append(
+                ast.Assign(
+                    targets=[ast.Name(id=nm, ctx=ast.Store())],
+                    value=self._where(v, pick(new), pick(old)),
+                )
+            )
+        return [ast.fix_missing_locations(s) for s in out]
+
+    _CONT_SKIP = ("_mask_", "_valid_", "delta_", "mask_axis_", "_old_", "_new_", "idx")
+
+    def _apply_continue_masks(self, result):
+        cm = self._active_continue_mask()
+        if cm is None or result is None:  # or not self._control_stack
+            return result
+        vname, vrank = cm
+        was_list = isinstance(result, list)
+        stmts = result if was_list else [result]
+
+        ctrl = self._control_stack[-1] if self._control_stack else None
+        had = ctrl is not None and "current_mask_rank" in ctrl.metadata
+        saved = ctrl.metadata.get("current_mask_rank") if ctrl else None
+        if ctrl is not None:
+            ctrl.metadata["current_mask_rank"] = vrank
+        out = []
+        try:
+            for s in stmts:
+                if not isinstance(s, ast.Assign):
+                    out.append(s)
+                    continue
+                t = s.targets[0]
+                if isinstance(t, ast.Name) and t.id.startswith(self._CONT_SKIP):
+                    out.append(s)
+                elif isinstance(t, ast.Name) and t.id in self._scalar_state_attrs:
+                    out.extend(self._mask_plain_assign(s, vname))
+                elif self._is_vmap_assign(s):
+                    out.extend(self._mask_vmap_outputs(s, vname, vrank))
+                elif isinstance(t, ast.Name) and (
+                    self.is_arr_at_op_call(s.value, t.id)
+                    or self._split_with_field(s.value, t.id)
+                ):
+                    out.extend(self._mask_vector_assign(s, vname, [], []))
+                else:
+                    out.append(s)
+        finally:
+            if ctrl is not None:
+                if had:
+                    ctrl.metadata["current_mask_rank"] = saved
+                else:
+                    ctrl.metadata.pop("current_mask_rank", None)
+        return out if (was_list or len(out) != 1) else out[0]
 
     def _boolean_mask(self, node: ast.Assign) -> ast.Assign:
         """
@@ -1753,7 +2045,8 @@ class _Masking:
                     continue
                 # Case 2c: plain variable -> check dependency list
                 if isinstance(part, ast.Name | ast.Attribute):
-                    name = get_name(part)
+                    # name = get_name(part)
+                    name = self._var_key(part)
                     if name in self.var_deps:
                         return True
                     else:

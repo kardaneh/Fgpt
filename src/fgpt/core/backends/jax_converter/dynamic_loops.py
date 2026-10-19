@@ -120,7 +120,8 @@ class _DynamicLoop:
                 vectorization_axis = vectorization_context.get("vectorization_axis", {})
                 loop_info = vectorization_context.get("loop_info", {})
 
-                arr_name = get_name(target_node.value)
+                # arr_name = get_name(target_node.value)
+                arr_name = self._var_key(target_node.value)
                 if arr_name and arr_name in self.dynamic_variable_lift:
                     data = self.dynamic_variable_lift[arr_name]
                     vectorized_loop = data.get("vectorized_loop", [])
@@ -184,6 +185,11 @@ class _DynamicLoop:
         except Exception as e:
             self.logger.exception("Exception in make_depth_index:", e)
             raise
+
+    def _restore_metadata(self, ctx, saved: dict) -> None:
+        md = ctx["metadata"]  # same object as Control.metadata
+        md.clear()
+        md.update(saved)
 
     def handle_dynamic_loop(
         self,
@@ -323,89 +329,130 @@ class _DynamicLoop:
             ranks = self.subscript_ranks(mask_assign.value)
             mask_rank = ranks.get(mask_assign.value, 0)
 
-            pushed_control = False
-            old_metadata = None
+            try:
+                pushed_control = False
+                old_metadata = None
 
-            if vectorization_context is not None:
-                if not vectorization_context.get("metadata"):
-                    old_metadata = vectorization_context["metadata"].copy()
-                    vectorization_context["metadata"].update(
-                        {
-                            "current_mask_assign": mask_assign,
-                            "current_mask_rank": mask_rank,
-                        }
+                if vectorization_context is not None:
+                    if not vectorization_context.get("metadata"):
+                        old_metadata = vectorization_context["metadata"]  # .copy()
+                        vectorization_context["metadata"].update(
+                            {
+                                "current_mask_assign": mask_assign,
+                                "current_mask_rank": mask_rank,
+                            }
+                        )
+                else:
+                    self._control_stack.append(
+                        Control(
+                            kind="loop",
+                            loop_info={},
+                            transform_type="index_loop",
+                            vectorization_axis={},
+                            metadata={
+                                "current_mask_assign": mask_assign,
+                                "current_mask_rank": mask_rank,
+                            },
+                        )
                     )
-            else:
-                self._control_stack.append(
-                    Control(
-                        kind="loop",
-                        loop_info={},
-                        transform_type="index_loop",
-                        vectorization_axis={},
-                        metadata={
-                            "current_mask_assign": mask_assign,
-                            "current_mask_rank": mask_rank,
-                        },
-                    )
-                )
-                vectorization_context = self._control_stack[-1].to_dict()
-                pushed_control = True
-            for stmt in node.body:
-                if isinstance(stmt, ast.Assign):
-                    lhs_node = stmt.targets[0]
-                    rhs_node = stmt.value
-                    transformed = self._transform_dynamic_assign(
-                        stmt,
-                        lhs_node,
-                        rhs_node,
-                        loop_index,
-                        loop_axis,
-                        vect_axes,
-                        start,
-                        upper_bound_static,
-                        vectorization_context,
-                        start_is_dynamic=start_is_dynamic,
-                    )
-                    result_stmts.extend(transformed)
-
-                elif isinstance(stmt, ast.If):
-                    if contains_name(stmt.test, loop_index):
-                        transformed = self._transform_conditional_search(
+                    vectorization_context = self._control_stack[-1].to_dict()
+                    pushed_control = True
+                for stmt in node.body:
+                    if isinstance(stmt, ast.Assign):
+                        lhs_node = stmt.targets[0]
+                        rhs_node = stmt.value
+                        transformed = self._transform_dynamic_assign(
                             stmt,
+                            lhs_node,
+                            rhs_node,
                             loop_index,
                             loop_axis,
                             vect_axes,
                             start,
                             upper_bound_static,
                             vectorization_context,
-                            layer_value=layers_assign.value if layers_assign else None,
                             start_is_dynamic=start_is_dynamic,
                         )
                         result_stmts.extend(transformed)
-                    else:
+
+                    elif isinstance(stmt, ast.If):
+                        if contains_name(stmt.test, loop_index):
+                            transformed = self._transform_conditional_search(
+                                stmt,
+                                loop_index,
+                                loop_axis,
+                                vect_axes,
+                                start,
+                                upper_bound_static,
+                                vectorization_context,
+                                layer_value=layers_assign.value
+                                if layers_assign
+                                else None,
+                                start_is_dynamic=start_is_dynamic,
+                            )
+                            result_stmts.extend(transformed)
+                        else:
+                            # visited = self.visit(stmt)
+                            # if isinstance(visited, list):
+                            #     # print(vectorization_context)
+                            #     # for l in visited:
+                            #     #     print(ast.unparse(ast.fix_missing_locations(l)))
+                            #     result_stmts.extend(visited)
+                            # elif visited is not None:
+                            #     result_stmts.append(visited)
+                            # Transform the original if/elif/else normally.
+                            visited = self.visit(stmt)
+
+                            if isinstance(visited, list):
+                                visited_stmts = visited
+                            elif visited is not None:
+                                visited_stmts = [visited]
+                            else:
+                                visited_stmts = []
+
+                            # Identify variables assigned and subsequently used
+                            # within this conditional.
+                            assigned = self._collect_assigned([stmt])
+                            rhs_uses = self._collect_rhs_uses([stmt])
+                            used_after = set(assigned) & rhs_uses
+
+                            # The mask generated by the surrounding dynamic loop.
+                            loop_mask_name = mask_assign.targets[0].id
+
+                            for transformed_stmt in visited_stmts:
+                                if isinstance(transformed_stmt, ast.Assign):
+                                    # Apply the outer loop mask to the resulting
+                                    # assignment, after conditional lowering.
+                                    result_stmts.extend(
+                                        self._mask_vector_assign(
+                                            transformed_stmt,
+                                            loop_mask_name,
+                                            assigned,
+                                            used_after,
+                                        )
+                                    )
+                                else:
+                                    result_stmts.append(transformed_stmt)
+
+                    elif isinstance(stmt, ast.For):
                         visited = self.visit(stmt)
                         if isinstance(visited, list):
                             result_stmts.extend(visited)
                         elif visited is not None:
                             result_stmts.append(visited)
 
-                elif isinstance(stmt, ast.For):
-                    visited = self.visit(stmt)
-                    if isinstance(visited, list):
-                        result_stmts.extend(visited)
-                    elif visited is not None:
-                        result_stmts.append(visited)
+                return result_stmts
 
-            if (
-                pushed_control
-                and self._control_stack
-                and self._control_stack[-1].kind == "loop"
-            ):
-                self._control_stack.pop()
-            elif old_metadata is not None:
-                vectorization_context["metadata"] = old_metadata
-
-            return result_stmts
+            finally:
+                if (
+                    pushed_control
+                    and self._control_stack
+                    and self._control_stack[-1].kind == "loop"
+                ):
+                    self._control_stack.pop()
+                elif old_metadata is not None:
+                    # vectorization_context["metadata"] = old_metadata
+                    self._restore_metadata(vectorization_context, old_metadata)
 
         except NotImplementedError:
             raise
@@ -912,7 +959,8 @@ class _DynamicLoop:
             if isinstance(node, ast.Name):
                 return node.id in self.dynamic_variable_lift
             if isinstance(node, ast.Subscript):
-                arr_name = get_name(node.value)
+                # arr_name = get_name(node.value)
+                arr_name = self._var_key(node.value)
                 if arr_name is not None and arr_name in self.dynamic_variable_lift:
                     return True
                 # not a lifted array, but still a runtime subscript -> dynamic
@@ -1284,7 +1332,8 @@ class _DynamicLoop:
 
             if target_node is not None:
                 if isinstance(target_node, ast.Subscript):
-                    arr_name = get_name(target_node.value)
+                    # arr_name = get_name(target_node.value)
+                    arr_name = self._var_key(target_node.value)
                     if arr_name and arr_name in self.dynamic_variable_lift:
                         data = self.dynamic_variable_lift[arr_name]
                         vectorized_loop = data.get("vectorized_loop", [])
@@ -1362,7 +1411,11 @@ class _DynamicLoop:
                 if loop_index is None or loop_index == "_":
                     mask_assign = ast.Assign(
                         targets=[ast.Name(id="mask", ctx=ast.Store())],
-                        value=ast.Name(id="depth_idx", ctx=ast.Load()),
+                        value=ast.Compare(
+                            left=ast.Name(id="depth_idx", ctx=ast.Load()),
+                            ops=[ast.Gt()],
+                            comparators=[ast.Constant(value=0)],
+                        ),
                     )
                     return None, mask_assign, 0, vect_axes
 
@@ -1372,25 +1425,44 @@ class _DynamicLoop:
             loop_axis = max_vect_axis + 1
             ndim = loop_axis + 1
 
-            elts = [ast.Constant(value=None)] * ndim
-            for ax in vect_axes:
-                elts[ax] = ast.Slice()
+            if len(vect_axes) == 1:
+                # single batch axis: use the shared helper
+                # NOTE: layers is jnp.arange(...), a 1-D array, so vrank=1.
+                # Likewise depth_idx_start is a per-batch-element vector (shape (kjpindex,)),
+                # so vrank=1 there too.
+                layers_subscript = self._expand_valid("layers", 1, ndim, loop_axis)
+                depth_index_subscript = self._expand_valid(
+                    "depth_idx", 1, ndim, max_vect_axis
+                )
+                start_subscript = self._expand_valid(
+                    "depth_idx_start", 1, ndim, max_vect_axis
+                )
+            else:
+                # several (possibly non-adjacent) batch axes: keep the manual construction
+                elts = [ast.Constant(value=None)] * ndim
+                for ax in vect_axes:
+                    elts[ax] = ast.Slice()
 
-            layers_elts = [
-                ast.Slice() if i == loop_axis else ast.Constant(value=None)
-                for i in range(ndim)
-            ]
-            layers_subscript = ast.Subscript(
-                value=ast.Name(id="layers", ctx=ast.Load()),
-                slice=ast.Tuple(elts=layers_elts, ctx=ast.Load()),
-                ctx=ast.Load(),
-            )
+                layers_elts = [
+                    ast.Slice() if i == loop_axis else ast.Constant(value=None)
+                    for i in range(ndim)
+                ]
+                layers_subscript = ast.Subscript(
+                    value=ast.Name(id="layers", ctx=ast.Load()),
+                    slice=ast.Tuple(elts=layers_elts, ctx=ast.Load()),
+                    ctx=ast.Load(),
+                )
+                depth_index_subscript = ast.Subscript(
+                    value=ast.Name(id="depth_idx", ctx=ast.Load()),
+                    slice=ast.Tuple(elts=list(elts), ctx=ast.Load()),
+                    ctx=ast.Load(),
+                )
+                start_subscript = ast.Subscript(
+                    value=ast.Name(id="depth_idx_start", ctx=ast.Load()),
+                    slice=ast.Tuple(elts=list(elts), ctx=ast.Load()),
+                    ctx=ast.Load(),
+                )
 
-            depth_index_subscript = ast.Subscript(
-                value=ast.Name(id="depth_idx", ctx=ast.Load()),
-                slice=ast.Tuple(elts=list(elts), ctx=ast.Load()),
-                ctx=ast.Load(),
-            )
             upper_cmp = ast.Compare(
                 left=layers_subscript,
                 ops=[ast.Lt()],
@@ -1398,11 +1470,6 @@ class _DynamicLoop:
             )
 
             if start_depth_index is not None:
-                start_subscript = ast.Subscript(
-                    value=ast.Name(id="depth_idx_start", ctx=ast.Load()),
-                    slice=ast.Tuple(elts=list(elts), ctx=ast.Load()),
-                    ctx=ast.Load(),
-                )
                 lower_cmp = ast.Compare(
                     left=layers_subscript,
                     ops=[ast.GtE()],
@@ -1418,7 +1485,11 @@ class _DynamicLoop:
             if loop_index is None or loop_index == "_":
                 mask_assign = ast.Assign(
                     targets=[ast.Name(id="mask", ctx=ast.Store())],
-                    value=ast.Name(id="depth_idx", ctx=ast.Load()),
+                    value=ast.Compare(
+                        left=ast.Name(id="depth_idx", ctx=ast.Load()),
+                        ops=[ast.Gt()],
+                        comparators=[ast.Constant(value=0)],
+                    ),
                 )
                 return None, mask_assign, 0, vect_axes
 
@@ -1532,7 +1603,57 @@ class _DynamicLoop:
         """
         try:
             if loop_index is None or loop_index == "_":
-                return [self.visit(assign_node)]
+                visited = self.visit(assign_node)
+
+                nodes = visited if isinstance(visited, list) else [visited]
+
+                # Preserve the existing implementation for the non-vectorized case.
+                # Since the mask of the for loop is considered as a mask, the mask
+                # is therefore is placed using masked_vector_assign
+                # TODO: Added this
+                if not vect_axes:
+                    out = []
+                    for stmt in nodes:
+                        if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1:
+                            out.extend(self._mask_vector_assign(stmt, "mask", [], []))
+                        else:
+                            out.append(stmt)
+                    return out
+
+                # Vectorized case: use the existing masking implementation.
+                metadata = (
+                    vectorization_context.get("metadata", {})
+                    if vectorization_context is not None
+                    else {}
+                )
+
+                active_mask_assign = metadata.get("current_mask_assign")
+
+                if active_mask_assign is None:
+                    return nodes
+
+                mask_name = active_mask_assign.targets[0].id
+
+                assigned = self._collect_assigned([assign_node])
+                rhs_uses = self._collect_rhs_uses([assign_node])
+                used_after = set(assigned) & set(rhs_uses)
+
+                result = []
+
+                for stmt in nodes:
+                    if isinstance(stmt, ast.Assign):
+                        result.extend(
+                            self._mask_vector_assign(
+                                stmt,
+                                mask_name,
+                                assigned,
+                                used_after,
+                            )
+                        )
+                    elif stmt is not None:
+                        result.append(stmt)
+
+                return result
 
             if self._lhs_contains_loop_index(lhs_node, loop_index):
                 return self._transform_elementwise(
@@ -1625,7 +1746,8 @@ class _DynamicLoop:
         """
         try:
             node_dims = self.get_declared_dims(lhs_node)
-            array_name = get_name(lhs_node)
+            # array_name = get_name(lhs_node)
+            array_name = self._var_key(lhs_node)
             local_arrays = (
                 self.cls_info[self.cls_name]
                 .get("methods")
@@ -1709,7 +1831,8 @@ class _DynamicLoop:
                 ],
                 keywords=[],
             )
-            assign_node.value.args = [mask_cond]
+            # assign_node.value.args = [mask_cond]
+            self._set_payload_arg(assign_node, mask_cond)
             if vectorization_context and vectorization_context.get("metadata"):
                 vectorization_context["metadata"] = old_metadata
 
@@ -1747,12 +1870,34 @@ class _DynamicLoop:
         """
         try:
             value = assign_node.value
+            wf = self._split_with_field(value, target_name)
+            if wf:
+                _field, inner = wf
+                # inner must look like  <recv>.<field>.at[idx].<op>(payload)
+                if (
+                    isinstance(inner, ast.Call)
+                    and isinstance(inner.func, ast.Attribute)
+                    and isinstance(inner.func.value, ast.Subscript)
+                    and isinstance(inner.func.value.value, ast.Attribute)
+                    and inner.func.value.value.attr == "at"
+                    and inner.args
+                ):
+                    return inner.args[0]
+                return None
             if self.is_arr_at_op_call(value, target_name) and value.args:
                 return value.args[0]
             return None
         except Exception as e:
             self.logger.exception("Exception in _extract_set_payload:", e)
             raise
+
+    def _set_payload_arg(self, assign, new_arg):
+        value = assign.value
+        wf = self._split_with_field(value, get_name(assign.targets[0]))
+        if wf:
+            wf[1].args = [new_arg]  # the inner .at[...].set(...) call
+        else:
+            value.args = [new_arg]
 
     def _transform_accumulation(
         self,
@@ -1836,7 +1981,8 @@ class _DynamicLoop:
             )
 
             node_dims = self.get_declared_dims(lhs_node)
-            array_name = get_name(lhs_node)
+            # array_name = get_name(lhs_node)
+            array_name = self._var_key(lhs_node)
             is_local_array = array_name in local_arrays
 
             if isinstance(lhs_node, ast.Subscript):
@@ -1899,21 +2045,45 @@ class _DynamicLoop:
             visited_assign = self.visit(copy.deepcopy(assign_node))
             lhs_visited = visited_assign.targets[0]
             target_name = get_name(lhs_visited)
+            # For struct writes the comparison reference is the field expression (x.a),
+            # not the bare struct name.
+            lhs_ref = lhs_visited
+            wf = self._split_with_field(visited_assign.value, target_name)
+            if wf:
+                inner = wf[1]  # x.a.at[idx].set(payload)
+                lhs_ref = inner.func.value.value.value  # Subscript -> x.a.at -> x.a
+
             payload = self._extract_set_payload(visited_assign, target_name)
 
             if payload is None:
                 payload = self.visit(copy.deepcopy(rhs_node))
 
-            accum_base = self._extract_accum_base_from_payload(payload, lhs_visited)
+            accum_base = self._extract_accum_base_from_payload(payload, lhs_ref)
             reduction_term = self._extract_reduction_term(
                 payload, accum_base, loop_index
             )
 
+            ctx = vectorization_context or {}
+            if array_has_batch_axis and ctx.get("vectorization_axis"):
+                # NOTE: if batch_axis has dimension of array unknown then returns (0, 1) thus the term rank added to
+                # counterweight the rank of the braodcasting
+                batch_axis, term_rank = self._batch_axis(reduction_term, ctx)
+            else:
+                batch_axis, term_rank = 0, 1
             if start_is_dynamic:
                 reduction_term = self._substitute_loop_index_with_offset(
-                    reduction_term, loop_index, has_batch_dimension=array_has_batch_axis
+                    reduction_term,
+                    loop_index,
+                    has_batch_dimension=array_has_batch_axis,
+                    loop_axis=loop_axis,
+                    batch_axis=batch_axis,
+                    term_rank=term_rank,
                 )
 
+            # NOTE: The mask here doesn't need any mask correction since this is already done externally
+            # layers = jnp.arange(0, self.nsnow, 1)
+            # mask = (layers[None, :] >= depth_idx_start[:, None]) & (layers[None, :] < depth_idx[:, None])
+            # Thus it's only sent to the jnp.where call
             where_call = ast.Call(
                 func=ast.Attribute(
                     value=ast.Name(id="jnp", ctx=ast.Load()),
@@ -1942,7 +2112,8 @@ class _DynamicLoop:
             )
 
             if payload:
-                visited_assign.value.args = [new_rhs]
+                # visited_assign.value.args = [new_rhs]
+                self._set_payload_arg(visited_assign, new_rhs)
                 new_assign = visited_assign
             else:
                 new_assign = ast.Assign(targets=[lhs_visited], value=new_rhs)
@@ -1959,7 +2130,13 @@ class _DynamicLoop:
             raise
 
     def _substitute_loop_index_with_offset(
-        self, node: ast.AST, loop_index: str, has_batch_dimension: bool = False
+        self,
+        node: ast.AST,
+        loop_index: str,
+        has_batch_dimension: bool = False,
+        loop_axis: int = 1,
+        batch_axis: int = 0,
+        term_rank: int = 1,
     ) -> ast.AST:
         """
         Replace a bare ``loop_index - <anything>`` minuend with
@@ -1998,6 +2175,16 @@ class _DynamicLoop:
             Re-raises any unexpected error after logging.
         """
         try:
+            if has_batch_dimension:
+                # NOTE: layers is jnp.arange(...), a 1-D array, so vrank=1.
+                # Likewise depth_idx_start is a per-batch-element vector (shape (kjpindex,)),
+                # so vrank=1 there too.
+                rank = max(loop_axis, batch_axis, term_rank - 1) + 1
+                layers_node = self._expand_valid("layers", 1, rank, loop_axis)
+                start_node = self._expand_valid("depth_idx_start", 1, rank, batch_axis)
+            else:
+                layers_node = ast.Name(id="layers", ctx=ast.Load())
+                start_node = ast.Name(id="depth_idx_start", ctx=ast.Load())
 
             class OffsetSubstitutor(ast.NodeTransformer):
                 def visit_BinOp(self, n):
@@ -2007,26 +2194,8 @@ class _DynamicLoop:
                         and isinstance(n.left, ast.Name)
                         and n.left.id == loop_index
                     ):
-                        if has_batch_dimension:
-                            n.left = ast.Subscript(
-                                value=ast.Name(id="layers", ctx=ast.Load()),
-                                slice=ast.Tuple(
-                                    elts=[ast.Constant(value=None), ast.Slice()],
-                                    ctx=ast.Load(),
-                                ),
-                                ctx=ast.Load(),
-                            )
-                            n.right = ast.Subscript(
-                                value=ast.Name(id="depth_idx_start", ctx=ast.Load()),
-                                slice=ast.Tuple(
-                                    elts=[ast.Slice(), ast.Constant(value=None)],
-                                    ctx=ast.Load(),
-                                ),
-                                ctx=ast.Load(),
-                            )
-                        else:
-                            n.left = ast.Name(id="layers", ctx=ast.Load())
-                            n.right = ast.Name(id="depth_idx_start", ctx=ast.Load())
+                        n.left = copy.deepcopy(layers_node)
+                        n.right = copy.deepcopy(start_node)
                     return n
 
             return OffsetSubstitutor().visit(copy.deepcopy(node))
@@ -2126,9 +2295,9 @@ class _DynamicLoop:
             ):
                 return lhs_visited
 
-            lhs_arr = get_name(lhs_visited)
+            lhs_arr = self._var_key(lhs_visited)
             for candidate in (payload.left, payload.right):
-                candidate_arr = get_name(candidate)
+                candidate_arr = self._var_key(candidate)
                 if candidate_arr and candidate_arr == lhs_arr:
                     return candidate
 
