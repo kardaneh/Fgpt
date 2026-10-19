@@ -72,6 +72,7 @@ def test_env(request):
         func_input_dim={},
         dynamic_variable_lift={},
         inferred_ranks={},
+        struct_info={},
     )
     request.cls.indexer = indextransformer
 
@@ -502,6 +503,28 @@ class TestReductionHandler:
         axis_kw = next(kw for kw in result.keywords if kw.arg == "axis")
         assert isinstance(axis_kw.value, ast.Constant)
         assert axis_kw.value.value == 1
+
+    def test_reduction_uses_struct_field_dims(self):
+        self.reducer.cls_info = {
+            "M": {
+                "attributes": {},
+                "methods": {
+                    "f": {
+                        "local_arr": {},
+                        "struct_args": {
+                            "x": {"type": "t", "dimensions": ["kjpindex", "nvm"]}
+                        },
+                    }
+                },
+            }
+        }
+        self.reducer.cls_name = "M"  # was missing
+        self.reducer.func_name = "f"
+        self.reducer.struct_info = {"t": {"b": {"inner_dims": [10]}}}
+        self.reducer.func_input_dim = {}
+        node = ast.parse("x.b").body[0].value
+        assert self.reducer._get_tensor_shape(node) == ["kjpindex", "nvm", 10]
+        assert self.reducer._extract_axes(node) == {0, 1, 2}
 
 
 @pytest.mark.usefixtures("test_env")

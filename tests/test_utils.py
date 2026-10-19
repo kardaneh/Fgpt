@@ -90,6 +90,10 @@ def _stmt(code: str):
     return ast.parse(code).body[0]
 
 
+def _sub(t, code):
+    return ast.unparse(t.visit_Subscript(_expr(code)).slice)
+
+
 @pytest.mark.usefixtures("test_env")
 class TestAdjustIndices:
     def test_adjust_index(self):
@@ -118,7 +122,8 @@ class TestAdjustIndices:
         node = ast.Name(id="i", ctx=ast.Load())
         result = self.transformer._apply_offset_if_convvar(node, offset=-4)
         assert isinstance(result, ast.BinOp)
-        assert result.right.value == -4
+        assert isinstance(result.op, ast.Sub)
+        assert result.right.value == 4
 
         # Non conv var
         node = ast.Name(id="idx", ctx=ast.Load())
@@ -141,7 +146,8 @@ class TestAdjustIndices:
         node = _expr("arr5[i]")
         result = self.transformer.visit_Subscript(node)
         assert isinstance(result.slice, ast.BinOp)
-        assert result.slice.right.value == -4
+        assert isinstance(result.slice.op, ast.Sub)
+        assert result.slice.right.value == 4
 
     def test_visit_Assign(self):
         node = _stmt("i = idx")
@@ -187,6 +193,59 @@ class TestAdjustIndices:
         node = _expr("foo(x)")
         result = self.transformer.visit_Call(node)
         assert isinstance(result, ast.Call)
+
+    def test_raw_default_lb(self):
+        self.transformer._raw_override.add("k")
+        assert _sub(self.transformer, "arr[k]") == "k - 1"
+
+    def test_raw_lb(self):
+        # raw_override : to handle the case when it directly holds Fortran value
+        # compared to conv_vars which holds Fortran DO loop which are directly corrected
+        # but sometimes the same name holds a raw Fortran value,
+        # for example after k = 2 * nl in a loop emitted with Fortran bounds.
+        # In those cases visit_Assign / visit_For adds k to _raw_override, and
+        # _is_preadjusted("k") flips to False.
+
+        # lower bound 0: k - 0 -> k
+        self.transformer._raw_override.add("k")
+        assert _sub(self.transformer, "arr0[k]") == "k"
+
+        # lower bound 5: k - 5
+        assert _sub(self.transformer, "arr5[k]") == "k - 5"
+        # lower bound 5: k + 1 - 5 -> k +
+        assert _sub(self.transformer, "arr5[k + 1]") == "k - 4"
+
+    def test_preadjusted_lb_unchanged_behaviour(self):
+        result = self.transformer.visit_Subscript(_expr("arr5[i]"))
+        assert isinstance(result.slice.op, ast.Sub)
+        assert result.slice.right.value == 4
+
+    # Handles the case of the Name and Name in index values
+    def test_name_name_index_values(self):
+        # n = 10 i_F = 1
+        # arr[9] <-- Fortran index
+        # n = 10 i_P = 0
+        # arr[10 - 0 - 2] = arr[8]
+        assert _sub(self.transformer, "arr[n - i]") == "n - i - 2"
+
+        # Both names are raw values
+        assert _sub(self.transformer, "arr[n - m]") == "n - m - 1"
+
+        # Two Names are preadjusted values
+        assert _sub(self.transformer, "arr[i + j]") == "i + j + 1"
+
+        # Trailing consts
+        assert _sub(self.transformer, "arr[n - i + 1]") == "n - i - 1"
+
+    def test_excluded_counts_as_zero_based(self):
+        self.transformer.exclude_index = {"p"}
+        assert _sub(self.transformer, "arr[n - p]") == "n - p - 2"
+
+    def test_single_term_rules_untouched(self):
+        self.transformer.adjusted_vars.remove("idx")  # This was removed for the test
+        assert _sub(self.transformer, "arr[i + 1]") == "i + 1"
+        assert _sub(self.transformer, "arr[i - 1]") == "i - 1"
+        assert _sub(self.transformer, "arr[idx - 1]") == "idx - 2"
 
 
 @pytest.mark.usefixtures("test_env")

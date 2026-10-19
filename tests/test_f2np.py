@@ -1,4 +1,7 @@
 import ast
+import logging
+import os
+from dataclasses import MISSING, dataclass, field, fields
 from unittest.mock import MagicMock
 
 import numpy as np
@@ -369,6 +372,536 @@ class TestF2NP:
             for v in joined_values
         )
 
+        # Regression test: uneven interleaving of string literals and values
+        # (4 strings, 3 values) must not misalign the f-string.
+        code = """
+        subroutine do_neg()
+            print *, "Data processed successfully!", &
+                                " a=", a, " b=", b, " c=", c
+        end subroutine do_neg
+        """
+        stmt = self.parse_and_get(code, F23.Print_Stmt)
+        result = self.f2np.handle_print_stmt(stmt)
+
+        call = result.value
+        joined = call.args[0]
+        assert isinstance(joined, ast.JoinedStr)
+
+        code_out = ast.unparse(ast.fix_missing_locations(call))
+        assert (
+            code_out
+            == "logging.info(f'Data processed successfully! a={a} b={b} c={c}')"
+        )
+
+        # Bare consecutive values (no label strings between them) still get
+        # a readable separator.
+        code = """
+        subroutine do_neg()
+            print *, a, b, c
+        end subroutine do_neg
+        """
+        stmt = self.parse_and_get(code, F23.Print_Stmt)
+        result = self.f2np.handle_print_stmt(stmt)
+
+        code_out = ast.unparse(ast.fix_missing_locations(result.value))
+        assert code_out == "logging.info(f'{a}, {b}, {c}')"
+
+        code = """
+        subroutine do_neg()
+            print '(A,ES12.4,A,I0,A,I0,A)', "Data reset to ", value, &
+            " over [", lo, ",", hi, "]"
+        end subroutine do_neg
+        """
+        stmt = self.parse_and_get(code, F23.Print_Stmt)
+        result = self.f2np.handle_print_stmt(stmt)
+
+        code_out = ast.unparse(ast.fix_missing_locations(result.value))
+        assert code_out == "logging.info(f'Data reset to {value} over [{lo},{hi}]')"
+
+    def test_resolve_var_dtype_finds_global_declaration(self):
+        code = """
+        module m
+            real :: gvar
+            integer :: gcount
+        contains
+            subroutine t()
+            end subroutine t
+        end module m
+        """
+        tree = self.parse(code)
+        self.f2np.func_name = "t"
+        self.f2np.extractor.var_dummy = {"t": []}
+        self.f2np.extractor.dec_global = {
+            "t": {
+                "gvar": [
+                    d
+                    for d in walk(tree, F23.Type_Declaration_Stmt)
+                    if d.tostr().startswith("REAL")
+                ],
+                "gcount": [
+                    d
+                    for d in walk(tree, F23.Type_Declaration_Stmt)
+                    if d.tostr().startswith("INTEGER")
+                ],
+            }
+        }
+
+        assert self.f2np._resolve_var_dtype("gvar") == ("np", "float64")
+        assert self.f2np._resolve_var_dtype("gcount") == ("np", "int32")
+
+    def test_resolve_var_dtype_prefers_dummy_over_global(self):
+        # A dummy arg shadowing a global name of a different type should
+        # resolve via var_dummy, not accidentally fall through to dec_global.
+        code = """
+        subroutine t(x)
+            integer, intent(in) :: x
+        end subroutine t
+        """
+        decl = self.parse_and_get(code, F23.Type_Declaration_Stmt)
+        self.f2np.func_name = "t"
+        self.f2np.extractor.var_dummy = {"t": [decl]}
+        self.f2np.extractor.dec_global = {"t": {"x": []}}  # no matching entity here
+
+        assert self.f2np._resolve_var_dtype("x") == ("np", "int32")
+
+    def test_resolve_var_dtype_unresolvable_name_defaults_to_float64(self):
+        self.f2np.func_name = "t"
+        self.f2np.extractor.var_dummy = {"t": []}
+        self.f2np.extractor.dec_global = {"t": {}}
+
+        assert self.f2np._resolve_var_dtype("unknown_local") == ("np", "float64")
+
+    def test_is_supported_print_target(self):
+        # PRINT * -> supported (list-directed)
+        stmt = self.parse_and_get(
+            'subroutine t()\nprint *, "hello"\nend subroutine t\n', F23.Print_Stmt
+        )
+        assert self.f2np._is_supported_print_target(stmt) is True
+
+        # PRINT is always supported (no unit specifier exists in Fortran's
+        # PRINT), regardless of its format
+        for code in (
+            'subroutine t()\nprint *, "hello"\nend subroutine t\n',
+            "subroutine t()\nprint '(A)', \"hello\"\nend subroutine t\n",
+        ):
+            stmt = self.parse_and_get(code, F23.Print_Stmt)
+            assert self.f2np._is_supported_print_target(stmt) is True
+
+        # WRITE(*,*) / WRITE(6,...) / WRITE(numout,...) -> supported (stdout)
+        for code in (
+            'subroutine t()\nwrite(*,*) "hello"\nend subroutine t\n',
+            'subroutine t()\nwrite(6,*) "hello"\nend subroutine t\n',
+            'subroutine t()\nwrite(numout,*) "hello"\nend subroutine t\n',
+            'subroutine t()\nwrite(unit=6, fmt=*) "hello"\nend subroutine t\n',
+            'subroutine t()\nwrite(numout,100) "hello"\nend subroutine t\n',
+            "subroutine t()\nwrite(6,'(A)') \"hello\"\nend subroutine t\n",
+        ):
+            stmt = self.parse_and_get(code, F23.Write_Stmt)
+            assert self.f2np._is_supported_print_target(stmt) is True
+
+        # WRITE(1363,*) -> unsupported (a genuine file unit)
+        stmt = self.parse_and_get(
+            'subroutine t()\nwrite(1363,*) "hello"\nend subroutine t\n', F23.Write_Stmt
+        )
+        assert self.f2np._is_supported_print_target(stmt) is False
+
+        # WRITE(*,*) -> supported
+        stmt = self.parse_and_get(
+            'subroutine t()\nwrite(*,*) "hello"\nend subroutine t\n', F23.Write_Stmt
+        )
+        assert self.f2np._is_supported_print_target(stmt) is True
+
+        # WRITE(6,*) -> supported (unit 6 is conventional stdout)
+        stmt = self.parse_and_get(
+            'subroutine t()\nwrite(6,*) "hello"\nend subroutine t\n', F23.Write_Stmt
+        )
+        assert self.f2np._is_supported_print_target(stmt) is True
+
+        # WRITE(numout,*) -> supported (variable assumed to alias stdout)
+        stmt = self.parse_and_get(
+            'subroutine t()\nwrite(numout,*) "hello"\nend subroutine t\n',
+            F23.Write_Stmt,
+        )
+        assert self.f2np._is_supported_print_target(stmt) is True
+
+        # WRITE(UNIT=6, FMT=*) -> supported (explicit keyword form)
+        stmt = self.parse_and_get(
+            'subroutine t()\nwrite(unit=6, fmt=*) "hello"\nend subroutine t\n',
+            F23.Write_Stmt,
+        )
+        assert self.f2np._is_supported_print_target(stmt) is True
+
+        # WRITE(1363,*) -> unsupported (a genuine file unit)
+        stmt = self.parse_and_get(
+            'subroutine t()\nwrite(1363,*) "hello"\nend subroutine t\n', F23.Write_Stmt
+        )
+        assert self.f2np._is_supported_print_target(stmt) is False
+
+    def test_recursive_ast_write_stmt_targets(self):
+        # WRITE(6,*) and WRITE(*,*) should lower to logging.info, same as PRINT
+        for unit in ("6", "*"):
+            code = f"""
+            subroutine test_write()
+                write({unit},*) "hello", var
+            end subroutine test_write
+            """
+            stmt = self.parse_and_get(code, F23.Subroutine_Subprogram)
+            _, _, result = self.f2np.recursive_ast(stmt)
+            func = result[0]
+            assert len(func.body) == 1
+            call = func.body[0].value
+            assert isinstance(call, ast.Call)
+            assert call.func.attr == "info"
+
+        # A genuine file unit (not 6, not stdout) must still be rejected
+        code = """
+        subroutine test_write_file()
+            write(1363,*) "hello", var
+        end subroutine test_write_file
+        """
+        stmt = self.parse_and_get(code, F23.Subroutine_Subprogram)
+        with pytest.raises(NotImplementedError):
+            self.f2np.recursive_ast(stmt)
+
+    def test_handle_intrinsic_function_reference_trim(self):
+        code = """
+        subroutine do_neg()
+            m1 = TRIM(name)
+        end subroutine do_neg
+        """
+        stmt = self.parse_and_get(code, F23.Intrinsic_Function_Reference)
+        result = self.f2np.handle_intrinsic_function_reference(stmt)
+
+        assert isinstance(result, ast.Call)
+        assert isinstance(result.func, ast.Attribute)
+        assert result.func.attr == "strip"
+        assert (
+            isinstance(result.func.value, ast.Name) and result.func.value.id == "name"
+        )
+        assert result.args == []
+
+        call_code = ast.unparse(ast.fix_missing_locations(result))
+        assert call_code == "name.strip()"
+        assert eval(call_code, {"name": "hello   "}) == "hello"
+
+    def test_handle_print_stmt_with_trim(self):
+        code = """
+        subroutine do_neg()
+            PRINT *, TRIM(name)
+        end subroutine do_neg
+        """
+        stmt = self.parse_and_get(code, F23.Print_Stmt)
+        result = self.f2np.handle_print_stmt(stmt)
+
+        assert isinstance(result, ast.Expr)
+        call = result.value
+        assert isinstance(call, ast.Call)
+        assert call.func.attr == "info"
+        assert isinstance(call.args[0], ast.JoinedStr)
+
+        formatted = call.args[0].values[0]
+        assert isinstance(formatted, ast.FormattedValue)
+        inner_call = formatted.value
+        assert isinstance(inner_call, ast.Call)
+        assert inner_call.func.attr == "strip"
+        assert inner_call.func.value.id == "name"
+
+        code = """
+        subroutine do_neg()
+            PRINT *, "Value:", TRIM(var)
+        end subroutine do_neg
+        """
+
+        stmt = self.parse_and_get(code, F23.Print_Stmt)
+        result = self.f2np.handle_print_stmt(stmt)
+
+        assert isinstance(result, ast.Expr)
+        call = result.value
+        assert isinstance(call, ast.Call)
+        assert call.func.attr == "info"
+        assert isinstance(call.args[0], ast.JoinedStr)
+        joined_values = call.args[0].values
+        assert any(
+            isinstance(v, ast.Constant) and v.value == "Value:" for v in joined_values
+        )
+        assert any(
+            isinstance(v, ast.FormattedValue)
+            and isinstance(v.value, ast.Call)
+            and v.value.func.attr == "strip"
+            for v in joined_values
+        )
+
+        # Regression test: TRIM(x) // "literal" as a single print item requires
+        # handle_expr to support Level_3_Expr (Fortran's `//` concatenation).
+        code = """
+        subroutine do_neg()
+            print '(A,A,A,A)', "Data written to file: ", trim(filename), &
+                    "  (binary: ", trim(binname)//")"
+        end subroutine do_neg
+        """
+        stmt = self.parse_and_get(code, F23.Print_Stmt)
+        result = self.f2np.handle_print_stmt(stmt)
+
+        call = result.value
+        joined = call.args[0]
+        assert isinstance(joined, ast.JoinedStr)
+
+        code_out = ast.unparse(ast.fix_missing_locations(call))
+        assert code_out == (
+            "logging.info(f\"Data written to file: {filename.strip()}  (binary: {binname.strip() + ')'}\")"
+        )
+
+        code = """
+        subroutine do_neg()
+            b = trim(binname)//")"
+        end subroutine do_neg
+        """
+        stmt = self.parse_and_get(code, F23.Level_3_Expr)
+        result = self.f2np.handle_expr(stmt)
+
+        assert isinstance(result, ast.BinOp)
+        assert isinstance(result.op, ast.Add)
+        assert isinstance(result.left, ast.Call)
+        assert result.left.func.attr == "strip"
+        assert result.left.func.value.id == "binname"
+        assert isinstance(result.right, ast.Constant)
+        assert result.right.value == ")"
+
+    def test_handle_print_with_implied_do(self):
+        code = """
+        subroutine do_test()
+            print *, (a(i), i=1,5)
+        end subroutine do_test
+        """
+
+        stmt = self.parse_and_get(code, F23.Print_Stmt)
+        result = self.f2np.handle_print_stmt(stmt)
+        assert isinstance(result, ast.Expr)
+
+        call = result.value
+        assert isinstance(call, ast.Call)
+        assert call.func.attr == "info"
+
+        assert isinstance(call.args[0], ast.Call)
+        assert isinstance(call.args[0].args[0], ast.Call)
+        assert (
+            isinstance(call.args[0].args[0].func, ast.Name)
+            and call.args[0].args[0].func.id == "map"
+        )
+
+        code = """
+        subroutine do_test()
+            print *, (2*i, i=1,5)
+        end subroutine do_test
+        """
+
+        stmt = self.parse_and_get(code, F23.Print_Stmt)
+        result = self.f2np.handle_print_stmt(stmt)
+
+        assert isinstance(result, ast.Expr)
+
+        call = result.value
+        assert isinstance(call, ast.Call)
+        assert call.func.attr == "info"
+
+        assert isinstance(call.args[0], ast.Call)
+        assert isinstance(call.args[0].args[0], ast.Call)
+        assert (
+            isinstance(call.args[0].args[0].func, ast.Name)
+            and call.args[0].args[0].func.id == "map"
+        )
+
+        code_out = ast.unparse(ast.fix_missing_locations(result))
+        assert (
+            code_out
+            == "logging.info(' '.join(map(str, [2 * i for i in range(0, 5, 1)])))"
+        )
+
+        code = """
+        subroutine do_test()
+            print *, "Values:", (a(i), i=1,5)
+        end subroutine do_test
+        """
+
+        stmt = self.parse_and_get(code, F23.Print_Stmt)
+        result = self.f2np.handle_print_stmt(stmt)
+        assert isinstance(result, ast.Expr)
+
+        call = result.value
+        assert isinstance(call, ast.Call)
+        assert call.func.attr == "info"
+        joined = call.args[0]
+        assert isinstance(joined, ast.JoinedStr)
+
+        assert any(
+            isinstance(v, ast.Constant) and v.value == "Values:" for v in joined.values
+        )
+
+    def test_handle_write_with_implied_do(self, caplog):
+        code = """
+        subroutine do_test()
+            write(*, *) (a(i), i=1,5)
+        end subroutine do_test
+        """
+
+        stmt = self.parse_and_get(code, F23.Write_Stmt)
+        result = self.f2np.handle_print_stmt(stmt)
+
+        assert isinstance(result, ast.Expr)
+
+        call = result.value
+        assert isinstance(call, ast.Call)
+
+        # Check the generated join(map(...)) structure
+        assert isinstance(call.args[0], ast.Call)
+        assert isinstance(call.args[0].args[0], ast.Call)
+
+        assert (
+            isinstance(call.args[0].args[0].func, ast.Name)
+            and call.args[0].args[0].func.id == "map"
+        )
+
+        code = """
+        subroutine do_test()
+            write(*, *) (2*i, i=1,5)
+        end subroutine do_test
+        """
+
+        stmt = self.parse_and_get(code, F23.Write_Stmt)
+        result = self.f2np.handle_print_stmt(stmt)
+
+        assert isinstance(result, ast.Expr)
+
+        call = result.value
+        assert isinstance(call, ast.Call)
+
+        assert isinstance(call.args[0], ast.Call)
+        assert isinstance(call.args[0].args[0], ast.Call)
+        assert (
+            isinstance(call.args[0].args[0].func, ast.Name)
+            and call.args[0].args[0].func.id == "map"
+        )
+
+        code_out = ast.unparse(ast.fix_missing_locations(result))
+        assert code_out == (
+            "logging.info(' '.join(map(str, [2 * i for i in range(0, 5, 1)])))"
+        )
+
+        code = """
+        subroutine do_test()
+            write(*, *) "Values:", (2*i, i=1,5)
+        end subroutine do_test
+        """
+
+        stmt = self.parse_and_get(code, F23.Subroutine_Subprogram)
+        func = self.f2np.recursive_ast(walk(stmt, F23.Subroutine_Subprogram)[0])[2][0]
+        result = func.body[0]
+
+        assert isinstance(result, ast.Expr)
+
+        call = result.value
+        assert isinstance(call, ast.Call)
+
+        # We expect the final output to be a formatted string
+        joined = call.args[0]
+        assert isinstance(joined, ast.JoinedStr)
+
+        assert any(
+            isinstance(v, ast.Constant) and v.value == "Values:" for v in joined.values
+        )
+        code_out = ast.unparse(ast.fix_missing_locations(func))
+        namespace = {"np": np, "logging": logging}
+
+        exec(
+            compile(code_out, "<emitted>", "exec"),
+            namespace,
+        )
+
+        with caplog.at_level(logging.INFO):
+            namespace["do_test"]()
+
+        output = caplog.text
+        assert "Values:[0, 2, 4, 6, 8]" in output
+
+    def test_inq_file_exists(self, tmp_path):
+        code = """
+        logical function inq_file_exists(filename)
+            implicit none
+            character(len=*), intent(in) :: filename
+            logical :: there
+
+            inquire(file=filename, exist=there)
+            inq_file_exists = there
+        end function inq_file_exists
+        """
+        tree = self.parse(code)
+        func_subprogram = self.get_stmt(tree, F23.Function_Subprogram)
+        _, _, result = self.f2np.recursive_ast(func_subprogram)
+        func = result[0]
+
+        code_out = ast.unparse(ast.fix_missing_locations(func))
+        namespace = {"os": os}
+        exec(compile(code_out, "<emitted>", "exec"), namespace)
+
+        existing = tmp_path / "present.txt"
+        existing.write_text("x")
+        assert namespace["inq_file_exists"](str(existing)) is True
+        assert namespace["inq_file_exists"](str(tmp_path / "absent.txt")) is False
+
+    def test_inq_file_size(self, tmp_path):
+        code = """
+        integer function inq_file_size(filename)
+            implicit none
+            character(len=*), intent(in) :: filename
+            integer :: sz
+            logical :: there
+
+            inquire(file=filename, exist=there, size=sz)
+            if (.not. there) then
+                inq_file_size = 0
+            else
+                inq_file_size = sz
+            end if
+        end function inq_file_size
+        """
+        tree = self.parse(code)
+        func_subprogram = self.get_stmt(tree, F23.Function_Subprogram)
+        _, _, result = self.f2np.recursive_ast(func_subprogram)
+        func = result[0]
+
+        code_out = ast.unparse(ast.fix_missing_locations(func))
+        namespace = {"os": os}
+        exec(compile(code_out, "<emitted>", "exec"), namespace)
+
+        existing = tmp_path / "present.txt"
+        existing.write_text("hello world")  # 11 bytes
+        assert namespace["inq_file_size"](str(existing)) == 11
+        assert namespace["inq_file_size"](str(tmp_path / "absent.txt")) == 0
+
+    def test_handle_inquire_stmt_requires_file_spec(self):
+        code = """
+        subroutine t(u, there)
+            integer :: u
+            logical :: there
+            inquire(unit=u, exist=there)
+        end subroutine t
+        """
+        stmt = self.parse_and_get(code, F23.Inquire_Stmt)
+        with pytest.raises(NotImplementedError):
+            self.f2np.handle_inquire_stmt(stmt)
+
+    def test_handle_inquire_stmt_rejects_unsupported_specifiers(self):
+        code = """
+        subroutine t(filename, is_opened)
+            character(len=*) :: filename
+            logical :: is_opened
+            inquire(file=filename, opened=is_opened)
+        end subroutine t
+        """
+        stmt = self.parse_and_get(code, F23.Inquire_Stmt)
+        with pytest.raises(NotImplementedError):
+            self.f2np.handle_inquire_stmt(stmt)
+
     def test_handle_intrinsic_function_reference(self):
         # Simple maximum function with multiple values
         code = """
@@ -567,7 +1100,7 @@ class TestF2NP:
         assert result.left.id == "x"
         assert result.comparators[0].value == 10
 
-        # Test unknown operator
+        # Not equal
         code = """
         subroutine do_neg()
             b = a /= b
@@ -575,8 +1108,14 @@ class TestF2NP:
         """
         # `/=`` doesn't exist within the conditional or the replacement dict
         stmt = self.parse_and_get(code, F23.Level_4_Expr)
-        with pytest.raises(KeyError):
-            self.f2np.handle_level_4expr(stmt)
+        result = self.f2np.handle_level_4expr(stmt)
+
+        assert isinstance(result.ops[0], ast.NotEq)
+        assert result.left.id == "a"
+        assert (
+            isinstance(result.comparators[0], ast.Name)
+            and result.comparators[0].id == "b"
+        )
 
     def test_handle_OR_AND_Operand(self):
         code = """
@@ -832,6 +1371,40 @@ class TestF2NP:
             for e in result.elts
         )
 
+        stmt = self.parse_and_get(
+            "subroutine t()\narr = (/ (i, i=1,10) /)\nend subroutine t\n",
+            F23.Array_Constructor,
+        )
+        result = self.f2np.handle_expr(stmt)
+
+        code_out = ast.unparse(ast.fix_missing_locations(result))
+        assert isinstance(result, ast.ListComp)
+        assert code_out == "[i for i in range(0, 10, 1)]"
+        assert eval(code_out)
+
+        stmt = self.parse_and_get(
+            "subroutine t()\narr = (/ (2*i-1, i=1,n,2) /)\nend subroutine t\n",
+            F23.Array_Constructor,
+        )
+        result = self.f2np.handle_expr(stmt)
+
+        code_out = ast.unparse(ast.fix_missing_locations(result))
+        assert isinstance(result, ast.ListComp)
+        assert isinstance(result.elt, ast.BinOp)
+        assert code_out == "[2 * i - 1 for i in range(0, n, 2)]"
+        assert eval(code_out, {"n": 10})  # passe for n = 10
+
+        self.f2np.extractor.all_array_info = {"test": {"matrix": []}}
+        stmt = self.parse_and_get(
+            "subroutine t()\narr = (/ ((matrix(i,j), j=1,3), i=1,2) /)\nend subroutine t\n",
+            F23.Array_Constructor,
+        )
+        result = self.f2np.handle_expr(stmt)
+        code_out = ast.unparse(ast.fix_missing_locations(result))
+        assert isinstance(result, ast.ListComp)
+        matrix = np.array([[1, 2, 3], [4, 5, 6]])  # matrix[i][j], 0-based
+        assert eval(code_out, {"matrix": matrix})
+
     def test_recursive_ast(self):
         # Simple case
         code = """
@@ -933,7 +1506,7 @@ def complex_logic(arr, n, threshold, result):
     for i in range(0, n, 1):
         if arr[i] > threshold:
             temp = arr[i]
-            for j in range(0, i, 1):
+            for j in range(0, i + 1, 1):
                 if np.mod(j, 2) == 0:
                     temp = temp + j
                 elif temp > 100.0:
@@ -1023,7 +1596,68 @@ def extreme_case(x, y, n):
     finalize(acc)
         """
         expected_ast = ast.parse(expected_output).body[0]
-        assert_ast_equal(func, expected_ast)
+        assert_ast_equal(func, ast.fix_missing_locations(expected_ast))
+
+        # Outer dependant loop
+        code = """
+        subroutine do_neg()
+            integer :: i, j
+            do i = 1, 10
+                do j = 1, i
+                    arr(i) = x(j)
+                end do
+            end do
+        end subroutine do_neg
+        """
+        self.f2np.extractor.all_array_info = {"do_neg": {"arr": [], "x": []}}
+        stmt = self.parse_and_get(code, F23.Subroutine_Subprogram)
+        _, _, result = self.f2np.recursive_ast(stmt)
+        func = result[0]
+        assert isinstance(func, ast.FunctionDef)
+        assert func.name == "do_neg"
+
+        for_loops = [node for node in ast.walk(func) if isinstance(node, ast.For)]
+        assert len(for_loops) == 2
+        # since in fortran, the inner loop just the outer loop variable as the stop
+        # thus we need to have it at + 1 due to the python exclusive rule
+        assert (
+            ast.unparse(ast.fix_missing_locations(for_loops[0].iter))
+            == "range(0, 10, 1)"
+        )
+        assert (
+            ast.unparse(ast.fix_missing_locations(for_loops[1].iter))
+            == "range(0, i + 1, 1)"
+        )
+
+        code = """
+        subroutine do_neg()
+            integer :: i, j
+            do i = 1, 10
+                do j = i, 1
+                    arr(i) = x(j)
+                end do
+            end do
+        end subroutine do_neg
+        """
+        self.f2np.extractor.all_array_info = {"do_neg": {"arr": [], "x": []}}
+        stmt = self.parse_and_get(code, F23.Subroutine_Subprogram)
+        _, _, result = self.f2np.recursive_ast(stmt)
+        func = result[0]
+        assert isinstance(func, ast.FunctionDef)
+        assert func.name == "do_neg"
+
+        for_loops = [node for node in ast.walk(func) if isinstance(node, ast.For)]
+        assert len(for_loops) == 2
+        # since in fortran, the inner loop just the outer loop variable as the start
+        # meaning they have the same iteration value thus the outer loop runs on the values of the inner
+        assert (
+            ast.unparse(ast.fix_missing_locations(for_loops[0].iter))
+            == "range(0, 10, 1)"
+        )
+        assert (
+            ast.unparse(ast.fix_missing_locations(for_loops[1].iter))
+            == "range(i, 1, 1)"
+        )
 
     def test_extract_dtype_derived_type(self):
         code = """
@@ -1258,6 +1892,144 @@ def extreme_case(x, y, n):
         assert isinstance(result, ast.Attribute)
         assert result.attr == "foo"
 
+    def test_handle_data_ref_array_of_structs_scalar_field(self):
+        code = "subroutine test()\n b = laieff_fit(ipts,ivm,ilevel)%a\n end subroutine test"
+        stmt = self.parse_and_get(code, F23.Data_Ref)
+        result = self.f2np.handle_data_ref(stmt)
+        assert isinstance(result, ast.Subscript)
+        assert isinstance(result.value, ast.Attribute)
+        assert result.value.attr == "a"
+        assert result.value.value.id == "laieff_fit"
+        assert isinstance(result.slice, ast.Tuple)
+        assert len(result.slice.elts) == 3
+        code_out = ast.unparse(ast.fix_missing_locations(result))
+        assert code_out == "laieff_fit.a[ipts, ivm, ilevel]"
+
+    def test_handle_data_ref_array_of_structs_array_field(self):
+        code = "subroutine test()\n b = soil_profile(ipts)%temp(ilevel)\n end subroutine test"
+        stmt = self.parse_and_get(code, F23.Data_Ref)
+        result = self.f2np.handle_data_ref(stmt)
+        assert isinstance(result, ast.Subscript)
+        assert result.value.attr == "temp"
+        assert isinstance(result.slice, ast.Tuple)
+        assert (
+            len(result.slice.elts) == 2
+        )  # outer idx + inner idx concatenated ipts, ilevel
+        code_out = ast.unparse(ast.fix_missing_locations(result))
+        assert code_out == "soil_profile.temp[ipts, ilevel]"
+
+    def test_handle_data_ref_array_of_structs_scalar_field_runtime_write(self):
+        class FortranDerivedType:
+            @classmethod
+            def zeros(cls, shape):
+                kwargs = {}
+                for f in fields(cls):
+                    default = (
+                        f.default_factory()
+                        if f.default_factory is not MISSING
+                        else f.default
+                    )
+                    if isinstance(default, np.ndarray):
+                        full_shape, dtype = shape + default.shape, default.dtype
+                    else:
+                        full_shape, dtype = shape, np.asarray(default).dtype
+                    kwargs[f.name] = np.zeros(full_shape, dtype=dtype)
+                return cls(**kwargs)
+
+            def __getitem__(self, idx):
+                return type(self)(
+                    **{f.name: getattr(self, f.name)[idx] for f in fields(self)}
+                )
+
+        @dataclass
+        class laieff_type(FortranDerivedType):
+            a: np.float64 = np.float64(0)
+            b: np.float64 = np.float64(0)
+
+        # Build the write statement through the real pipeline, exactly as the
+        # transpiler would emit it for `laieff_fit(ipts,ivm,ilevel) % a = 42.0`.
+        code = """
+        subroutine test()
+            laieff_fit(1,0,1)%a = 42.0
+        end subroutine test
+        """
+        stmt = self.parse_and_get(code, F23.Assignment_Stmt)
+        self.f2np.extractor.all_array_info = {"test": {"laieff_fit": []}}
+        assign = self.f2np.handle_assignment(stmt)
+        src = ast.unparse(ast.fix_missing_locations(assign))
+        assert src == "laieff_fit.a[1, 0, 1] = 42.0"
+
+        laieff_fit = laieff_type.zeros((3, 2, 2))
+        ns = {"laieff_fit": laieff_fit}
+        exec(compile(src, "<emitted>", "exec"), ns)
+
+        # The write landed on the real object, not a copy from __getitem__.
+        assert laieff_fit.a[1, 0, 1] == 42.0
+        assert laieff_fit.a[0, 0, 0] == 0.0  # untouched cells unaffected
+
+        # Sanity: __getitem__ itself still works fine for the *other* use case
+        # (passing one element by value into a function)
+        elem = laieff_fit[1, 0, 1]
+        assert isinstance(elem, laieff_type)
+        assert elem.a == 42.0
+
+    def test_handle_data_ref_array_of_structs_array_field_runtime_write(self):
+        class FortranDerivedType:
+            @classmethod
+            def zeros(cls, shape):
+                kwargs = {}
+                for f in fields(cls):
+                    default = (
+                        f.default_factory()
+                        if f.default_factory is not MISSING
+                        else f.default
+                    )
+                    if isinstance(default, np.ndarray):
+                        full_shape, dtype = shape + default.shape, default.dtype
+                    else:
+                        full_shape, dtype = shape, np.asarray(default).dtype
+                    kwargs[f.name] = np.zeros(full_shape, dtype=dtype)
+                instance = cls(**kwargs)
+                instance._shape = tuple(shape)
+                return instance
+
+            def __getitem__(self, idx):
+                return type(self)(
+                    **{f.name: getattr(self, f.name)[idx] for f in fields(self)}
+                )
+
+        @dataclass
+        class laieff_type(FortranDerivedType):
+            a: np.ndarray = field(
+                default_factory=lambda: np.zeros((10,), dtype=np.float64)
+            )
+            b: np.ndarray = field(
+                default_factory=lambda: np.zeros((2, 2), dtype=np.float64)
+            )
+
+        code = """
+        subroutine test()
+            laieff_fit(1,0,1)%a(1) = 42.0
+        end subroutine test
+        """
+        stmt = self.parse_and_get(code, F23.Assignment_Stmt)
+        self.f2np.extractor.all_array_info = {"test": {"laieff_fit": []}}
+        assign = self.f2np.handle_assignment(stmt)
+        src = ast.unparse(ast.fix_missing_locations(assign))
+        assert src == "laieff_fit.a[1, 0, 1, 1] = 42.0"
+
+        laieff_fit = laieff_type.zeros((3, 2, 2))
+        ns = {"laieff_fit": laieff_fit}
+        exec(compile(src, "<emitted>", "exec"), ns)
+
+        # The write landed on the real object, not a copy from __getitem__.
+        assert laieff_fit.a[1, 0, 1, 1] == 42.0
+        assert laieff_fit.a[0, 0, 0, 0] == 0.0  # untouched cells unaffected
+
+        elem = laieff_fit[1, 0, 1]
+        assert isinstance(elem, laieff_type)
+        assert elem.a[1] == 42.0
+
     def test_handle_assignment_lhs_data_ref(self):
         # laieff_fit%foo = 1.0 -> LHS must carry Store context
         code = """
@@ -1341,6 +2113,32 @@ def extreme_case(x, y, n):
         assert isinstance(lambda_body, ast.Call)
         assert lambda_body.func.attr == "zeros"
 
+        code = """
+        module test_mod
+            TYPE :: profile_type
+                REAL(KIND = r_std), DIMENSION(nlevels_tot) :: temp
+                REAL(KIND = r_std), DIMENSION(nlevels_tot) :: dens
+            END TYPE profile_type
+        end module test_mod
+        """
+
+        decl = self.parse_and_get(code, F23.Data_Component_Def_Stmt)
+        fields = self.f2np._build_dataclass_fields(decl)
+
+        assert len(fields) == 1
+        field = fields[0]
+        assert field.target.id == "temp"
+        assert field.annotation.attr == "ndarray"
+
+        assert isinstance(field.value, ast.Call)
+        assert field.value.func.id == "field"
+        assert field.value.keywords[0].arg == "default_factory"
+        assert isinstance(field.value.keywords[0].value, ast.Lambda)
+
+        lambda_body = field.value.keywords[0].value.body
+        assert isinstance(lambda_body, ast.Call)
+        assert lambda_body.func.attr == "zeros"
+
     def test_build_dataclass_fields_nested_derived_type(self):
         code = """
         module test_mod
@@ -1378,6 +2176,53 @@ def extreme_case(x, y, n):
         assert [f.target.id for f in fields] == ["comp1", "comp2"]
         assert all(isinstance(f, ast.AnnAssign) for f in fields)
 
+    def test_build_dataclass_mixed_components(self):
+        code = """
+        module test_mod
+            type :: laieff_type
+                real :: comp1
+                real(kind=r_std), dimension(nlevels_tot) :: temp
+                integer :: A
+            end type laieff_type
+        end module test_mod
+        """
+
+        decl = self.parse(code)
+        fields = []
+        for decl in walk(decl, F23.Data_Component_Def_Stmt | F23.Type_Declaration_Stmt):
+            fields.extend(self.f2np._build_dataclass_fields(decl))
+
+        assert len(fields) == 3
+        assert all(isinstance(f, ast.AnnAssign) for f in fields)
+        assert (
+            ast.unparse(ast.fix_missing_locations(fields[1]))
+            == "temp: np.ndarray = field(default_factory=lambda : np.zeros((nlevels_tot,), dtype=np.float64))"
+        )
+
+        # Mixed components with and inner derived type
+        code = """
+        module test_mod
+            type :: laieff_type
+                real :: comp1
+                real(kind=r_std), dimension(nlevels_tot) :: temp
+                integer :: A
+                TYPE(inner_type) :: comp
+            end type laieff_type
+        end module test_mod
+        """
+
+        decl = self.parse(code)
+        fields = []
+        for decl in walk(decl, F23.Data_Component_Def_Stmt | F23.Type_Declaration_Stmt):
+            fields.extend(self.f2np._build_dataclass_fields(decl))
+
+        assert len(fields) == 4
+        assert all(isinstance(f, ast.AnnAssign) for f in fields)
+        assert (
+            isinstance(fields[-1].annotation, ast.Name)
+            and fields[-1].annotation.id == "inner_type"
+        )
+
     def test_recursive_ast_function_without_result_suffix(self):
         code = """
         REAL(KIND=r_std) FUNCTION calculate_laieff_fit(test_angle, laieff_fit)
@@ -1413,6 +2258,69 @@ def extreme_case(x, y, n):
         return_nodes = [n for n in func.body if isinstance(n, ast.Return)]
         assert len(return_nodes) == 1
         assert return_nodes[0].value.id == "y"
+
+    def test_recursive_ast_prunes_empty_nested_if(self):
+        code = """
+        subroutine test_empty_if(almaoutput, impaze, hist2_id)
+        LOGICAL :: almaoutput, impaze
+        INTEGER :: hist2_id
+
+        IF (.NOT. impaze) THEN
+        END IF
+
+        IF (almaoutput) THEN
+          IF (hist2_id > 0) THEN
+          END IF
+        ELSE
+          IF (.NOT. impaze) THEN
+            IF (hist2_id > 0) THEN
+            END IF
+          END IF
+        END IF
+
+        end subroutine test_empty_if
+        """
+        tree = self.parse(code)
+        subroutine = self.get_stmt(tree, F23.Subroutine_Subprogram)
+        _, _, module_stack = self.f2np.recursive_ast(subroutine)
+
+        func_def = module_stack[-1]
+        assert isinstance(func_def, ast.FunctionDef)
+
+        # Every IF in the source, at every nesting level, was empty in
+        # both branches -- all of them (including the outer IF/ELSE,
+        # once its only content -- the inner empty IFs -- collapses)
+        # should be pruned away entirely.
+        assert not any(isinstance(n, ast.If) for n in ast.walk(func_def))
+
+    def test_recursive_ast_keeps_partially_empty_if(self):
+        code = """
+        subroutine test_partial_if(almaoutput, hist2_id, numout)
+        LOGICAL :: almaoutput
+        INTEGER :: hist2_id, numout
+
+        IF (almaoutput) THEN
+        ELSE
+          numout = hist2_id
+        END IF
+
+        end subroutine test_partial_if
+        """
+        tree = self.parse(code)
+        subroutine = self.get_stmt(tree, F23.Subroutine_Subprogram)
+        _, _, module_stack = self.f2np.recursive_ast(subroutine)
+
+        func_def = module_stack[-1]
+        if_nodes = [n for n in ast.walk(func_def) if isinstance(n, ast.If)]
+
+        # The IF/ELSE has real content in `orelse`, so it must survive --
+        # but its empty `body` needs a `pass` inserted since Python
+        # doesn't allow an empty if-body even when else has content.
+        assert len(if_nodes) == 1
+        assert len(if_nodes[0].body) == 1
+        assert isinstance(if_nodes[0].body[0], ast.Pass)
+        assert len(if_nodes[0].orelse) == 1
+        assert isinstance(if_nodes[0].orelse[0], ast.Assign)
 
 
 @pytest.mark.usefixtures("test_env")

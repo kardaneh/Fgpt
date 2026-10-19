@@ -6,7 +6,7 @@ import jax.numpy as jnp
 import pytest
 
 from fgpt.autodiff import AutoDiff
-from fgpt.core.backends.utils import contains_name, convert_np_jnp, get_name
+from fgpt.core.backends.utils import CallEdge, contains_name, convert_np_jnp, get_name
 from fgpt.core.common.logger import Logger
 
 
@@ -33,6 +33,23 @@ def _parse(code: str) -> ast.Module:
 def _func(code: str) -> ast.FunctionDef:
     """Parse a code string and return its first ``FunctionDef``."""
     return _parse(code).body[0]
+
+
+CLASS_SRC = """
+class Mod:
+    def __init__(self):
+        self.which_rt = '                    '
+        self.other = 3
+
+    def run(self, x):
+        if self.which_rt == 'Matrixial':
+            x = x + 1
+        elif 'Iterative' == self.which_rt:
+            x = x + 2
+        flag = self.which_rt != 'Matrixial'
+        self.which_rt = 'Matrixial'
+        return x
+"""
 
 
 @pytest.mark.usefixtures("test_env")
@@ -256,7 +273,7 @@ def b(y):
         fn_index = self.autodiff._index_functions(funcs)
 
         method_calls = [{"method": "a", "args_shape": {"x": ["n"]}}]
-
+        self.autodiff.cls_info = {}
         shapes = self.autodiff._propagate_shapes(graph, fn_index, method_calls)
 
         assert shapes["a"] == {"x": ["n"]}
@@ -292,7 +309,7 @@ class Model:
             ],
             "attributes_used": set(),
         }
-
+        self.autodiff.struct_classes = {}
         self.autodiff._prepare_class(module, details)
 
         source = ast.unparse(module)
@@ -475,6 +492,22 @@ class Model:
             "not_a_list", ast.Constant(value=0)
         )
         assert result is None
+
+        ad = self.autodiff
+        ad.vectorize = ["kjpindex"]
+        p = ["kjpindex", "nvm", "nlevels_tot"]
+
+        def sl(s):
+            return ast.parse(s).body[0].value.slice
+
+        assert ad._infer_subscript_shape(p, sl("x[:, ivm, 0]")) == ["kjpindex"]
+        assert ad._infer_subscript_shape(p, sl("x[ji, :, :]")) == ["nvm", "nlevels_tot"]
+        assert (
+            ad._infer_subscript_shape(p, sl("x[ji, :, :]"), keep_loop_index=True) == p
+        )
+        assert ad._infer_subscript_shape(p, sl("x[0]")) == ["nvm", "nlevels_tot"]
+        assert ad._infer_subscript_shape(p, sl("x[1, 2, 3, 4]")) is None  # too many
+        assert ad._infer_subscript_shape([], sl("x[0]")) is None
 
     def test_check_dimension_static(self):
         """Missing attribute defaults to static."""
@@ -733,3 +766,303 @@ class Global_module_test:
         jitted = jax.jit(namespace["fortran_reshape"], static_argnums=(1, 3))
         result_jit = jitted(jnp.array([1, 2, 3, 4, 5, 6]), (2, 3), None, (2, 1))
         assert result_jit.tolist() == [[1, 2, 3], [4, 5, 6]]
+
+    def test_get_args_shape_struct_zeros_constant_and_single(self):
+        self.autodiff.struct_classes = {"laieff_type"}
+        tree = ast.parse(
+            "a = laieff_type.zeros((kjpindex, 3))\n"
+            "b = laieff_type.zeros(kjpindex)\n"
+            "c = laieff_type.zeros((gm.kjpindex, nvm))\n"
+        )
+        shapes = self.autodiff._get_args_shape(tree, ["a", "b", "c"])
+        assert shapes["a"] == ["kjpindex", 3]
+        assert shapes["b"] == ["kjpindex"]
+        assert shapes["c"] == ["kjpindex", "nvm"]
+
+    def test_struct_attribute_gets_annassign(self):
+        self.autodiff.struct_classes = {"laieff_type"}
+        self.autodiff.str_codes = {}
+        self.autodiff.cls_info = {
+            "Model": {
+                "attributes": {
+                    "kjpindex": {"type": "int"},
+                    "laieff_fit": {
+                        "type": "struct",
+                        "struct_type": "laieff_type",
+                        "dimensions": ["kjpindex", "nvm"],
+                    },
+                    "soil": {"type": "jnp.ndarray", "dimensions": ["kjpindex"]},
+                },
+                "methods": {},
+            }
+        }
+
+        [fields] = self.autodiff._define_dynamic_and_field_data([], set())
+        src = [ast.unparse(f) for f in fields]
+
+        # struct field is emitted exactly once, annotated with its type
+        assert src.count("laieff_fit: laieff_type") == 1
+        assert "soil: jnp.ndarray" in src
+        assert any(s.startswith("kjpindex: int") for s in src)
+
+        # the struct is not mistaken for a static eqx.field
+        assert not any("laieff_fit" in s and "eqx.field" in s for s in src)
+
+        # unknown struct type is ignored
+        self.autodiff.struct_classes = set()
+        [fields] = self.autodiff._define_dynamic_and_field_data([], set())
+        assert not any("laieff_fit" in ast.unparse(f) for f in fields)
+
+    def test_propagate_struct_args_element_and_field(self):
+        self.autodiff.vectorize = ["kjpindex"]
+        self.autodiff.struct_classes = {"laieff_type"}
+        self.autodiff.cls_info = {
+            "M": {
+                "attributes": {},
+                "methods": {
+                    "outer": {
+                        "args": ["laieff_fit"],
+                        "local_arr": {},
+                        "struct_args": {
+                            "laieff_fit": {
+                                "type": "laieff_type",
+                                "dimensions": ["kjpindex", "nvm", "nlevels_tot"],
+                            }
+                        },
+                    },
+                    "inner": {"args": ["angle", "elem"], "local_arr": {}},
+                },
+            }
+        }
+        call = ast.parse("self.inner(a, laieff_fit[ji, ivm, ilevel])").body[0].value
+        edge = CallEdge(
+            caller="outer",
+            callee="inner",
+            call_node=call,
+            arg_shapes={},
+            func_args=["angle", "elem"],
+        )
+        self.autodiff._propagate_struct_args({"outer": [edge], "inner": []}, {})
+        assert self.autodiff.cls_info["M"]["methods"]["inner"]["struct_args"][
+            "elem"
+        ] == {"type": "laieff_type", "dimensions": ["kjpindex"]}
+
+    def _edge(self, caller, callee, call_src, func_args):
+        call = ast.parse(call_src).body[0].value
+        return CallEdge(
+            caller=caller,
+            callee=callee,
+            call_node=call,
+            arg_shapes={},
+            func_args=func_args,
+        )
+
+    def _setup_struct_cls(self, vectorize=("kjpindex",)):
+        ad = self.autodiff
+        ad.vectorize = list(vectorize)
+        ad.struct_classes = {"laieff_type"}
+        ad.cls_info = {
+            "M": {
+                "attributes": {},
+                "methods": {
+                    "outer": {
+                        "args": ["laieff_fit"],
+                        "local_arr": {},
+                        "struct_args": {
+                            "laieff_fit": {
+                                "type": "laieff_type",
+                                "dimensions": ["kjpindex", "nvm", "nlevels_tot"],
+                            }
+                        },
+                    },
+                    "mid": {"args": ["angle", "elem"], "local_arr": {}},
+                    "inner": {"args": ["angle", "elem"], "local_arr": {}},
+                },
+            }
+        }
+        return ad
+
+    def test_propagate_without_vectorization_gives_scalar_element(self):
+        ad = self._setup_struct_cls(vectorize=())
+        e = self._edge(
+            "outer",
+            "inner",
+            "self.inner(a, laieff_fit[ji, ivm, ilevel])",
+            ["angle", "elem"],
+        )
+        ad._propagate_struct_args({"outer": [e], "inner": []}, {})
+        assert (
+            ad.cls_info["M"]["methods"]["inner"]["struct_args"]["elem"]["dimensions"]
+            == []
+        )
+
+    def test_propagate_slice_keeps_axis_in_both_modes(self):
+        for vec in [("kjpindex",), ()]:
+            ad = self._setup_struct_cls(vectorize=vec)
+            e = self._edge(
+                "outer",
+                "inner",
+                "self.inner(a, laieff_fit[:, ivm, ilevel])",
+                ["angle", "elem"],
+            )
+            ad._propagate_struct_args({"outer": [e], "inner": []}, {})
+            assert ad.cls_info["M"]["methods"]["inner"]["struct_args"]["elem"][
+                "dimensions"
+            ] == ["kjpindex"]
+
+    def test_propagate_whole_struct_unchanged(self):
+        ad = self._setup_struct_cls()
+        e = self._edge("outer", "inner", "self.inner(a, laieff_fit)", ["angle", "elem"])
+        ad._propagate_struct_args({"outer": [e], "inner": []}, {})
+        assert ad.cls_info["M"]["methods"]["inner"]["struct_args"]["elem"][
+            "dimensions"
+        ] == ["kjpindex", "nvm", "nlevels_tot"]
+
+    def test_propagate_partial_index_keeps_trailing_dims(self):
+        ad = self._setup_struct_cls()
+        e = self._edge(
+            "outer", "inner", "self.inner(a, laieff_fit[ji, ivm])", ["angle", "elem"]
+        )
+        ad._propagate_struct_args({"outer": [e], "inner": []}, {})
+        assert ad.cls_info["M"]["methods"]["inner"]["struct_args"]["elem"][
+            "dimensions"
+        ] == ["kjpindex", "nlevels_tot"]
+
+    def test_propagate_conflict_raises(self):
+        ad = self._setup_struct_cls()
+        e1 = self._edge(
+            "outer",
+            "inner",
+            "self.inner(a, laieff_fit[ji, ivm, ilevel])",
+            ["angle", "elem"],
+        )
+        e2 = self._edge(
+            "outer", "inner", "self.inner(a, laieff_fit)", ["angle", "elem"]
+        )
+        with pytest.raises(ValueError, match="Conflicting struct_args"):
+            ad._propagate_struct_args({"outer": [e1, e2], "inner": []}, {})
+
+    def test_propagate_non_struct_arg_ignored(self):
+        ad = self._setup_struct_cls()
+        e = self._edge("outer", "inner", "self.inner(a, other[ji])", ["angle", "elem"])
+        ad._propagate_struct_args({"outer": [e], "inner": []}, {})
+        assert "struct_args" not in ad.cls_info["M"]["methods"]["inner"]
+
+    def _child(self, call_src, arg_shapes):
+        ad = self.autodiff
+        caller = ast.parse(
+            "def f(self, a, laieff_fit, snowrho, rhosnew):\n    pass"
+        ).body[0]
+        callee = ast.parse("def g(self, p, q):\n    pass").body[0]
+        call = ast.parse(call_src).body[0].value
+        return ad._infer_child_args(call, arg_shapes, caller, callee)
+
+    def test_child_args_element_gets_no_shape(self):
+        self._setup_struct_cls()
+        s = {"a": ["kjpindex"], "laieff_fit": ["kjpindex", "nvm", "nlevels_tot"]}
+        arg_shapes = self._child("self.g(a, laieff_fit[ji, ivm, ilevel])", s)
+        assert "q" in arg_shapes
+        assert arg_shapes.get("q") == ["kjpindex", "nvm", "nlevels_tot"]
+
+    def test_child_args_slice_subscript_keeps_passthrough(self):
+        self._setup_struct_cls()
+        s = {"snowrho": ["kjpindex", "nsnow"]}
+        assert self._child("self.g(a, snowrho[ji, :])", s)["q"] == ["kjpindex", "nsnow"]
+
+    def test_child_args_1d_subscript_keeps_passthrough(self):
+        self._setup_struct_cls()
+        s = {"rhosnew": ["kjpindex"]}
+        assert self._child("self.g(a, rhosnew[ji])", s)["q"] == ["kjpindex"]
+
+    def test_child_args_field_access(self):
+        ad = self._setup_struct_cls()
+        ad.struct_vars = {
+            "laieff_fit": {
+                "type": "laieff_type",
+                "dimensions": ["kjpindex", "nvm", "nlevels_tot"],
+            }
+        }
+        ad.struct_info = {
+            "laieff_type": {
+                "a": {"inner_dims": [], "dtype": "float64"},
+                "b": {"inner_dims": [10], "dtype": "float64"},
+            }
+        }
+        s = {}
+        assert self._child("self.g(a, laieff_fit.a[:, ivm, ilevel])", s)["q"] == [
+            "kjpindex"
+        ]
+        assert self._child("self.g(a, laieff_fit.b[:, ivm, ilevel])", s)["q"] == [
+            "kjpindex",
+            10,
+        ]
+        assert self._child("self.g(a, laieff_fit.a[ji, ivm, ilevel])", s).get("q") == []
+
+    def _encode(self, src=CLASS_SRC):
+        self.autodiff.struct_classes = set()
+        mod = _parse(src)
+        codes = self.autodiff._encode_string_attrs(mod)
+        return codes, ast.unparse(mod)
+
+    def test_encode_assign_and_init(self):
+        codes, out = self._encode()
+        c = codes["which_rt"]
+        assert c[0] == ""  # blank-padded init maps to code 0
+        assert "self.which_rt = jnp.int32(0)" in out
+        assert f"self.which_rt = jnp.int32({c.index('Matrixial')})" in out
+
+    def test_encode_if_test_compare(self):
+        codes, out = self._encode()
+        c = codes["which_rt"]
+        assert f"self.which_rt == {c.index('Matrixial')}" in out
+        assert "'Matrixial'" not in out.replace("STR_CODES", "")
+
+    def test_encode_reversed_operand_and_elif(self):
+        codes, out = self._encode()
+        c = codes["which_rt"]
+        assert f"{c.index('Iterative')} == self.which_rt" in out
+
+    def test_encode_compare_inside_assign(self):
+        codes, out = self._encode()
+        c = codes["which_rt"]
+        assert f"flag = self.which_rt != {c.index('Matrixial')}" in out
+
+    def test_compare_only_strings_are_registered(self):
+        codes, _ = self._encode()
+        assert "Iterative" in codes["which_rt"]  # never assigned, only compared
+
+    def test_codebook_unique_and_blank_first(self):
+        codes, _ = self._encode()
+        c = codes["which_rt"]
+        assert c[0] == "" and len(c) == len(set(c))
+
+    def test_non_string_attrs_untouched(self):
+        codes, out = self._encode()
+        assert "other" not in codes
+        assert "self.other = 3" in out
+
+    def test_no_string_attrs_returns_empty(self):
+        codes, out = self._encode(
+            "class A:\n    def __init__(self):\n        self.n = 1\n"
+        )
+        assert codes == {}
+        assert "self.n = 1" in out
+
+    def test_declaration_init_uses_encode_str(self):
+        fn = _func(
+            "def declaration_initialization(self):\n"
+            "    ffile = FortranFile(path, 'r')\n"
+            "    self.which_rt = ffile.read_record('S80')[0].decode('ascii').rstrip()\n"
+        )
+        self.autodiff._add_jax_for_file_reading(fn)
+        out = ast.unparse(ast.fix_missing_locations(fn))
+        assert "_encode_str('which_rt'" in out
+        assert "'which_rt': which_rt" in out
+
+    def test_test_func_decodes_codes(self):
+        self.autodiff.str_codes = {"which_rt": ["", "Matrixial"]}
+        fn = _func("def test_x(gmasme, a):\n    vals = [a, gmasme.which_rt]\n")
+        self.autodiff.correct_test_func(fn)
+        out = ast.unparse(ast.fix_missing_locations(fn))
+        assert "STR_CODES['which_rt'][int(gmasme.which_rt)]" in out
+        self.autodiff.str_codes = {}

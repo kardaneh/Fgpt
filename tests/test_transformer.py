@@ -38,6 +38,16 @@ class TestTransformer:
         assert len(result) == 1
         assert isinstance(result[0], ast.Assign)
 
+        # Test read script creation for boolean values
+        code = "x = np.zeros((n,), dtype=np.bool)"
+        tree = ast.parse(code)
+        assign_nodes = [node for node in tree.body if isinstance(node, ast.Assign)]
+        # Test read script creation for scalar values
+        result = self.transformer.read_file_ast(assign_nodes)
+        assert len(result) == 1
+        # since we will get: x[:] = ffile.read_ints(np.int32).reshape((n,), order='F')
+        assert isinstance(result[0].value, ast.Compare)
+
         # Test empty ast for read_file_ast
         result = self.transformer.read_file_ast([])
         assert result == []
@@ -396,7 +406,7 @@ def foo(a, b): pass
 
         call = ast.Call(func=ast.Name(id="f", ctx=ast.Load()), args=[], keywords=[])
 
-        result = self.transformer._build_assignment(return_node, call)
+        result = self.transformer._build_assignment(return_node, call, "f")
 
         assert isinstance(result.targets[0], ast.Tuple)
 
@@ -454,10 +464,102 @@ def foo(a, b): pass
             and result[0].value.keywords[0].value.attr == "float64"
         )
 
+        # check for the characters with defined length meaning the
+        code = "CHARACTER(LEN = 80) :: which_rt"
+        decl = Processor(logger=Logger()).parse_fortran_statement(code)
+        self.transformer.isolator.processor.remove_intent_and_save = MagicMock(
+            return_value=[decl]
+        )
+        result = self.transformer.convert_SPECIFICATION_PART([[decl]])
+        assert isinstance(result[0], ast.Assign)
+        assert isinstance(result[0].value, ast.Constant)
+        assert isinstance(result[0].value.value, str)
+
+        code = "CHARACTER :: which_rt"
+        decl = Processor(logger=Logger()).parse_fortran_statement(code)
+        self.transformer.isolator.processor.remove_intent_and_save = MagicMock(
+            return_value=[decl]
+        )
+        result = self.transformer.convert_SPECIFICATION_PART([[decl]])
+        assert isinstance(result[0], ast.Assign)
+        assert isinstance(result[0].value, ast.Constant)
+        assert isinstance(result[0].value.value, str)
+        assert (
+            len(result[0].value.value) == 1
+        )  # the length in absence of character length is set to default 1 due to
+        # dynamic assignement which only be know at runtime
+
+        code = "CHARACTER*17 A"
+        decl = Processor(logger=Logger()).parse_fortran_statement(code)
+        self.transformer.isolator.processor.remove_intent_and_save = MagicMock(
+            return_value=[decl]
+        )
+        result = self.transformer.convert_SPECIFICATION_PART([[decl]])
+        assert isinstance(result[0], ast.Assign)
+        assert isinstance(result[0].value, ast.Constant)
+        assert isinstance(result[0].value.value, str)
+        assert len(result[0].value.value) == 17
+
+        code = "CHARACTER(7) :: ORANGES = 'ORANGES'"
+        decl = Processor(logger=Logger()).parse_fortran_statement(code)
+        self.transformer.isolator.processor.remove_intent_and_save = MagicMock(
+            return_value=[decl]
+        )
+        result = self.transformer.convert_SPECIFICATION_PART([[decl]])
+        assert isinstance(result[0], ast.Assign)
+        assert isinstance(result[0].value, ast.Constant)
+        assert isinstance(result[0].value.value, str)
+        assert result[0].value.value.lower() == "oranges"
+
         # Test in the case of the convertion is for a function
         self.transformer._contains_function = MagicMock(return_value=True)
         result = self.transformer.convert_SPECIFICATION_PART(["function foo"])
         assert result == []
+
+    def test_explicit_length_recorded(self):
+        code = """
+        subroutine t(which_char)
+            character(len=12) :: which_char
+        end subroutine t
+        """
+        tree = Processor(logger=Logger()).parse_fortran_string(code)
+        decl = walk(tree, F23.Type_Declaration_Stmt)[0]
+        self.transformer.extractor.var_dummy = {"t": [decl]}
+        self.transformer.extractor.dec_global = {"t": {}}
+
+        result = self.transformer._build_char_lengths_dict(["which_char"], "t")
+
+        assert result == {"which_char": 12}
+
+    def test_no_explicit_length_omitted(self):
+        code = """
+        subroutine t(other_char)
+            character :: other_char
+        end subroutine t
+        """
+        tree = Processor(logger=Logger()).parse_fortran_string(code)
+        decl = walk(tree, F23.Type_Declaration_Stmt)[0]
+        self.transformer.extractor.var_dummy = {"t": [decl]}
+        self.transformer.extractor.dec_global = {"t": {}}
+
+        result = self.transformer._build_char_lengths_dict(["other_char"], "t")
+
+        assert result == {}
+
+    def test_non_character_variable_ignored(self):
+        code = """
+        subroutine t(albedo)
+            real :: albedo
+        end subroutine t
+        """
+        tree = Processor(logger=Logger()).parse_fortran_string(code)
+        decl = walk(tree, F23.Type_Declaration_Stmt)[0]
+        self.transformer.extractor.var_dummy = {"t": [decl]}
+        self.transformer.extractor.dec_global = {"t": {}}
+
+        result = self.transformer._build_char_lengths_dict(["albedo"], "t")
+
+        assert result == {}
 
     def test_pre_init_variables(self):
         # Assign
