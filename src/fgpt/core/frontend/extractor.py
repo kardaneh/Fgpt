@@ -2950,12 +2950,14 @@ class Extractor:
                     items_sep.append(item)
 
             items_sep.sort(
-                key=lambda stmt: 0
-                if any(
-                    decl.children[0].tostr().endswith("_length_character")
-                    for decl in walk(stmt, F23.Entity_Decl)
+                key=lambda stmt: (
+                    0
+                    if any(
+                        decl.children[0].tostr().endswith("_length_character")
+                        for decl in walk(stmt, F23.Entity_Decl)
+                    )
+                    else 1
                 )
-                else 1
             )
 
             # Generate I/O statements for each declaration

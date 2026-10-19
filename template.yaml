@@ -28,11 +28,11 @@ Python_templates:
 
     Python_global_class_template:
         name: "Python_global_class_template"
-        template: |
+        ORCHIDEE: |
+            import os
             import numpy as np
             import logging
             from scipy.io import FortranFile
-            from dataclasses import dataclass
             import time
             import functools
 
@@ -57,13 +57,33 @@ Python_templates:
                 def declaration_initialization(self):
                     pass
 
+        general: |
+            import os
+            import numpy as np
+            import logging
+            from scipy.io import FortranFile
+            import time
+            import functools
+
+            class Global_module:
+                def __init__(self):
+
+                    self.ier = np.int32(0)
+                    self.ic0 = np.int32(0)
+                    self.ic = np.int32(0)
+                    self.icr = np.float64(0.0)
+                    self.start_time = np.float64(0.0)
+                    self.stop_time = np.float64(0.0)
+
+                def declaration_initialization(self):
+                    pass
+
     Python_main_template:
         name: "Python_main_template"
         template: |
             import os
             import numpy as np
             import logging
-            from dataclasses import field, is_dataclass
             from scipy.io import FortranFile
 
             def main():
@@ -84,8 +104,10 @@ Python_templates:
                     arr_shape = attribute.shape
                     if np.issubdtype(attribute.dtype, np.float64):
                         data = ffile.read_reals(np.float64)
-                    elif np.issubdtype(attribute.dtype, np.int32) or np.issubdtype(attribute.dtype, np.bool):
+                    elif np.issubdtype(attribute.dtype, np.int32):
                         data = ffile.read_ints(np.int32)
+                    elif np.issubdtype(attribute.dtype, np.bool):
+                        data = ffile.read_ints(np.int32) != 0
 
                     if data.size != np.prod(arr_shape):
                         continue
@@ -105,8 +127,10 @@ Python_templates:
                         if np.issubdtype(var.dtype, np.float64):
                             data = ffile.read_reals(np.float64)
 
-                        elif np.issubdtype(var.dtype, np.int32) or np.issubdtype(var.dtype, np.bool):
+                        elif np.issubdtype(var.dtype, np.int32):
                             data = ffile.read_ints(np.int32)
+                        elif np.issubdtype(var.dtype, np.bool):
+                            data = ffile.read_ints(np.int32) != 0
 
                         if data.size != np.prod(arr_shape):
                             continue
@@ -133,11 +157,23 @@ Python_templates:
         name: "Python_test_output_template"
         template: |
             fortran_value = None
-            if isinstance(value,np.ndarray):
+            if isinstance(value, str):
+                length = char_lengths.get(variable, len(value))
+                record = ffile.read_record(f'S{length}')
+                fortran_value = record[0].decode('ascii').rstrip()
+                if value.rstrip() == fortran_value:
+                    print(f'Test passed: Variable:{variable} is equal to FORTRAN variable: {variable}')
+                else:
+                    print(f'Test failed: Python variable:{variable} do not match to FORTRAN variable: {variable}')
+                    print(f' Python value: {value!r}')
+                    print(f' FORTRAN value: {fortran_value!r}')
+            elif isinstance(value, np.ndarray):
                 arr_shape = value.shape
-                if np.issubdtype(value.dtype, np.float64):
+                if np.issubdtype(value.dtype, np.bool):
+                    fortran_value = ffile.read_ints(np.int32).reshape(arr_shape, order='F') != 0
+                elif np.issubdtype(value.dtype, np.float64):
                     fortran_value = ffile.read_reals(np.float64).reshape(arr_shape, order='F')
-                elif np.issubdtype(value.dtype, np.int32) or np.issubdtype(value.dtype, np.bool):
+                elif np.issubdtype(value.dtype, np.int32):
                     fortran_value = ffile.read_ints(np.int32).reshape(arr_shape, order='F')
 
                 if np.allclose(value,fortran_value):
@@ -149,15 +185,21 @@ Python_templates:
                     print(f' Min and max of FORTRAN value: {fortran_value.min()}, {fortran_value.max()}')
 
             elif np.isscalar(value):
-                if np.issubdtype(value.dtype, np.int32) or np.issubdtype(value.dtype, np.bool):
+                dtype = np.asarray(value).dtype
+
+                if np.issubdtype(dtype, np.bool):
+                    fortran_value = ffile.read_ints(np.int32)[0] != 0
+                elif np.issubdtype(dtype, np.int32):
                     fortran_value = ffile.read_ints(np.int32)[0]
-                elif np.issubdtype(value.dtype, np.float64):
+                elif np.issubdtype(dtype, np.float64):
                     fortran_value = ffile.read_reals(np.float64)[0]
 
                 if np.isclose(value,fortran_value):
-                    print(f' Test passed: Variable:{variable} is equal to FORTRAN variable: {variable}')
+                    print(f'Test passed: Variable:{variable} is equal to FORTRAN variable: {variable}')
                 else:
                     print(f'Test failed: Python variable:{variable} do not match to FORTRAN variable: {variable}')
+                    print(f' Python value: {value}')
+                    print(f' FORTRAN value: {fortran_value}')
 
 JAX_templates:
 

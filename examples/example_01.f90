@@ -185,8 +185,6 @@ program test_procedures
     real :: average, variance, stddev
     real :: compute_average
 
-    allocate(data_array(n))
-
 
     ! Pass 1: simple sequence, default doubling
 
@@ -229,7 +227,6 @@ program test_procedures
     call reset_data(data_array, n, 0.1, 3, 5)
     call display_data(data_array, n, "Final: full reset to 0.0")
 
-    deallocate(data_array)
 
     print *, "Program completed successfully!"
 end program test_procedures
