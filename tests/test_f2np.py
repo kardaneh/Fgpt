@@ -2194,10 +2194,10 @@ def extreme_case(x, y, n):
 
         assert len(fields) == 3
         assert all(isinstance(f, ast.AnnAssign) for f in fields)
-        assert (
-            ast.unparse(ast.fix_missing_locations(fields[1]))
-            == "temp: np.ndarray = field(default_factory=lambda : np.zeros((nlevels_tot,), dtype=np.float64))"
-        )
+        expected = ast.parse(
+            "temp: np.ndarray = field(default_factory=lambda: np.zeros((nlevels_tot,), dtype=np.float64))"
+        ).body[0]
+        assert ast.dump(fields[1]) == ast.dump(expected)
 
         # Mixed components with and inner derived type
         code = """
