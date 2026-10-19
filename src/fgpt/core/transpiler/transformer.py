@@ -49,9 +49,15 @@ from fgpt.core.common.utils import (
     update_methods,
 )
 from fgpt.core.transpiler.f2np import F2NP
+from fgpt.core.transpiler.fortran_io import (
+    build_fortan_derived_type_array_read,
+    build_fortan_derived_type_scalar_read,
+    build_fortran_derived_type,
+)
 from fgpt.core.transpiler.intrinsic import build_fortran_reshape_helper
 
 DEFAULT_TEMPLATE = Path(__file__).parent / "templates" / "default.yaml"
+DEFAULT_BENCHMARK_DIR = Path(__file__).parent / "benchmark"
 
 
 class Transformer:
@@ -155,6 +161,7 @@ class Transformer:
         ignore_case: list[str],
         config_path: str,
         logger: Logger = None,
+        target_model: str = "ORCHIDEE",
     ):
         if benchmark_dir is None:  # The benchmark directory
             current_dir = os.getcwd()
@@ -176,6 +183,11 @@ class Transformer:
         self.global_state = (
             False  # Allows to define if the given code template is for global or not
         )
+        self.target_model = target_model
+        self.dataclass_field_info: dict = {}
+        self.derived_type_array_usage: set = set()
+        self._shadowed_args: dict[str, set] = {}
+        self.excluded_names = ["FortranDerivedType"]
 
         if logger is None:
             self.logger = Logger()
@@ -290,6 +302,9 @@ class Transformer:
                 if not isinstance(node, ast.ClassDef):
                     raise ValueError(f"Node is not an ast.ClassDef: {node}")
 
+                if node.decorator_list:
+                    continue
+
                 instance_name = get_instance_name(node.name)
                 # Create Class() constructor call
                 constructor_call = ast.Call(
@@ -372,15 +387,32 @@ class Transformer:
         attributes or methods.
         """
         try:
-            class_defs = list(ast_walk(out_module, ast.ClassDef))
-            class_members = {
-                cls.name: self._extract_class_members(
-                    cls, instance_node, subroutine_key
+            class_defs = [
+                cls
+                for cls in ast_walk(out_module, ast.ClassDef)
+                if cls.name not in self.excluded_names
+            ]
+            if not self.dataclass_field_info:
+                self.dataclass_field_info = self._extract_dataclass_field_info(
+                    class_defs
                 )
-                for cls in class_defs
-            }
 
-            specs = [(class_name.lower(), [class_name]) for class_name in class_members]
+            class_members = {}
+            for cls in class_defs:
+                if cls.decorator_list:
+                    class_members[cls.name] = self._extract_dataclass_members(cls)
+                else:
+                    class_members[cls.name] = self._extract_class_members(
+                        cls, instance_node, subroutine_key
+                    )
+
+            primary_names = [c.name for c in class_defs if not c.decorator_list]
+            dataclass_names = [c.name for c in class_defs if c.decorator_list]
+
+            specs = [
+                (class_name.lower(), [class_name] + dataclass_names)
+                for class_name in primary_names
+            ]
             import_nodes = self.get_imports_from_specs(specs)
             instance_nodes = self.create_instances(class_defs)
 
@@ -443,15 +475,44 @@ class Transformer:
             if isinstance(node, ast.FunctionDef):
                 methods[node.name] = node
 
-        result = {
-            "attributes": attributes,
-            "methods": methods,
-        }
+        result = {"attributes": attributes, "methods": methods, "is_dataclass": False}
 
         if instance_node:
             result["instances"] = instances
 
         return result
+
+    def _extract_dataclass_members(self, class_def: ast.ClassDef) -> dict:
+        """
+        Extract attribute metadata from a ``@dataclass`` ClassDef.
+
+        Mirrors :meth:`_extract_class_members`'s return shape
+        (``{'attributes': ..., 'methods': ...}``) so downstream consumers of
+        ``cls_info`` (e.g. :meth:`correct_function`, :meth:`AdjustIndices`)
+        don't need to special-case dataclass entries. Attribute dtype metadata
+        is read straight from :attr:`dataclass_field_info` (populated by
+        :meth:`_extract_dataclass_field_info`) rather than re-parsed here,
+        since the annotation/value shapes are already known from that pass.
+
+        Parameters
+        ----------
+        class_def : ast.ClassDef
+            The dataclass-decorated class definition to inspect.
+
+        Returns
+        -------
+        dict
+            ``{'attributes': {field_name: [0, dtype_or_None]}, 'methods': {}}``.
+            Dataclasses have no methods and no nested instances, so
+            ``'instances'`` is intentionally omitted.
+        """
+        fields = self.dataclass_field_info.get(class_def.name, [])
+
+        attributes = {
+            field_name: [0, dtype_attr_name] for field_name, dtype_attr_name in fields
+        }
+
+        return {"attributes": attributes, "methods": {}, "is_dataclass": True}
 
     def _handle_assignment(
         self,
@@ -543,6 +604,11 @@ class Transformer:
             ):
                 attributes[name] = self._handle_array(assign, name, subroutine_key)
                 return
+
+            if isinstance(assign.value, ast.Constant) and isinstance(
+                assign.value.value, str
+            ):
+                attributes[name] = [assign.value.value, "character"]
 
             # Attribute copy self.x = ... self.y = self.x
             if isinstance(assign.value, ast.Attribute):
@@ -836,21 +902,45 @@ class Transformer:
         """
         cls_info = {}
 
-        for cls, inst in zip(class_defs, instance_nodes):
-            class_name = cls.name
-
+        inst_by_class = {}
+        for inst in instance_nodes:
             if not isinstance(inst, ast.Assign):
                 raise TypeError("Invalid instance node")
+            if not isinstance(inst.value, ast.Call) or not isinstance(
+                inst.value.func, ast.Name
+            ):
+                raise TypeError("Invalid instance constructor call")
+            inst_by_class[inst.value.func.id] = inst
+
+        for cls in class_defs:
+            class_name = cls.name
+            inst = inst_by_class.get(class_name)
+
+            if inst is None:
+                # Dataclasses (e.g. laieff_type) have no instance node from
+                # create_instances since it skips decorated classes.
+                entry = {
+                    "attributes": class_members[class_name]["attributes"],
+                    "methods": class_members[class_name]["methods"],
+                    "is_dataclass": class_members[class_name].get("is_dataclass", True),
+                }
+                cls_info[class_name] = {class_name: entry}
+                continue
 
             target = inst.targets[0]
-            if not isinstance(target, ast.Name):
+            if not isinstance(target, ast.Name | ast.Attribute):
                 raise TypeError("Invalid instance target")
 
-            instance_name = target.id if not self_mode else "self"
+            instance_name = (
+                "self"
+                if self_mode
+                else (target.id if isinstance(target, ast.Name) else target.attr)
+            )
 
             entry = {
                 "attributes": class_members[class_name]["attributes"],
                 "methods": class_members[class_name]["methods"],
+                "is_dataclass": class_members[class_name].get("is_dataclass", False),
             }
 
             if instance_node:
@@ -1196,7 +1286,7 @@ class Transformer:
             )
 
             if return_stmt:
-                return self._build_assignment(return_stmt, call_expr)
+                return self._build_assignment(return_stmt, call_expr, function_name)
 
             return ast.Expr(value=call_expr)
 
@@ -1205,7 +1295,7 @@ class Transformer:
             raise
 
     def _build_assignment(
-        self, return_node: ast.AST, call_expr: ast.Call
+        self, return_node: ast.AST, call_expr: ast.Call, function_name: str
     ) -> ast.Assign | None:
         """
         Build an assignment mapping a function's return targets to a call
@@ -1244,24 +1334,30 @@ class Transformer:
         """
         value = return_node.value
 
+        def build_target(name: str) -> ast.Name:
+            if name == function_name:
+                name = f"{name}_result"
+            return ast.Name(id=name, ctx=ast.Store())
+
         if isinstance(value, ast.Tuple):
             targets = [
-                ast.Name(id=elt.id, ctx=ast.Store())
-                for elt in value.elts
-                if isinstance(elt, ast.Name)
+                build_target(elt.id) for elt in value.elts if isinstance(elt, ast.Name)
             ]
+
             if targets:
                 return ast.Assign(
-                    targets=[ast.Tuple(elts=targets, ctx=ast.Store())], value=call_expr
+                    targets=[ast.Tuple(elts=targets, ctx=ast.Store())],
+                    value=call_expr,
                 )
 
         elif isinstance(value, ast.Name):
             return ast.Assign(
-                targets=[ast.Name(id=value.id, ctx=ast.Store())], value=call_expr
+                targets=[build_target(value.id)],
+                value=call_expr,
             )
 
         else:
-            raise AttributeError(f"Unexcpected return_node value type:{type(value)}")
+            raise AttributeError(f"Unexpected return_node value type: {type(value)}")
 
     def _build_args(self, function_def: ast.FunctionDef) -> list:
         """
@@ -1361,6 +1457,9 @@ class Transformer:
         function_def: ast.FunctionDef,
         cls_info: dict,
         call_site_preadjustment: dict,
+        module_name: str,
+        instance_name: str,
+        instance_data: dict,
         subroutine_key: str | None = None,
         main_file_attributes: list | None = None,
     ) -> None:
@@ -1403,10 +1502,6 @@ class Transformer:
         """
 
         try:
-            module_name, instance_name, instance_data = self._get_primary_instance(
-                cls_info
-            )
-
             global_attr = instance_data["attributes"]
 
             # 1. Fix arguments
@@ -1455,17 +1550,24 @@ class Transformer:
             self.logger.exception("Exception in correct_function")
             raise
 
-    def _get_primary_instance(self, cls_info: dict) -> tuple:
+    def _get_primary_instance(
+        self,
+        cls_info: dict,
+        subroutine_key: str,
+    ) -> tuple:
         """
-        Extract the first ``(module_name, instance_name, instance_data)``
-        triple from a ``cls_info`` structure.
+        Retrieve the primary instance associated with ``subroutine_key``.
 
-        Used by :meth:`correct_function`.
+        The subroutine may be stored directly under ``subroutine_key`` or
+        under the prefixed key ``Global_module_<subroutine_key>``.
 
         Parameters
         ----------
         cls_info : dict
             Nested ``module -> instance -> metadata`` structure.
+
+        subroutine_key : str
+            Name of the subroutine/module to retrieve.
 
         Returns
         -------
@@ -1474,16 +1576,33 @@ class Transformer:
 
         Raises
         ------
+        KeyError
+            If no matching module is found.
+
         StopIteration
-            if *cls_info* is empty.
+            If the matching module exists but contains no instances.
         """
-        try:
-            module_name = next(iter(cls_info))
-            instance_name = next(iter(cls_info[module_name]))
-            instance_data = cls_info[module_name][instance_name]
-            return module_name, instance_name, instance_data
-        except StopIteration:
-            raise
+        prefixed_key = f"Global_module_{subroutine_key}"
+
+        module_name = None
+
+        if subroutine_key in cls_info:
+            module_name = subroutine_key
+        elif prefixed_key in cls_info:
+            module_name = prefixed_key
+
+        if module_name is None:
+            raise KeyError(
+                f"Could not find subroutine '{subroutine_key}' "
+                f"in cls_info. Available modules: {list(cls_info)}"
+            )
+
+        module_content = cls_info[module_name]
+
+        instance_name = next(iter(module_content))
+        instance_data = module_content[instance_name]
+
+        return module_name, instance_name, instance_data
 
     def _fix_function_arguments(
         self,
@@ -1517,11 +1636,12 @@ class Transformer:
         args = function_def.args.args
         arg_names = [a.arg for a in args]
 
-        global_args = set(arg_names) & set(global_attr)
+        shadowed = getattr(self, "_shadowed_args", {}).get(function_def.name, set())
+        global_args = set(arg_names) & set(global_attr) - shadowed
 
         other_args = set()
         for inst in instance_data.get("instances", {}).values():
-            other_args |= set(arg_names) & set(inst.get("attributes", []))
+            other_args |= set(arg_names) & set(inst.get("attributes", [])) - shadowed
 
         to_remove = global_args | other_args
 
@@ -1553,7 +1673,7 @@ class Transformer:
 
         Only calls whose target name appears in :attr:`extractor`'s
         ``call_within_sub`` for *subroutine_key* are touched; arguments are
-        resolved per call via :meth:`_resolve_call_arguments`. Used by
+        resolved per call via :meth:`_select_call_args`. Used by
         :meth:`correct_function` (step 2).
 
         Parameters
@@ -1582,131 +1702,54 @@ class Transformer:
 
             method = cls_info[module_name][instance_name]["methods"].get(func_name)
 
-            new_args, _ = self._resolve_call_arguments(func_name, call_indices, method)
+            new_args = self._select_call_args(func_name, call_indices, method, node)
             if new_args:
                 node.args = new_args
 
-    def _resolve_call_arguments(
+    def _select_call_args(
         self,
         func_name: str,
         call_indices: dict,
         method: ast.FunctionDef,
+        node: ast.Call,
     ) -> list:
-        """
-        Resolve the actual argument expressions for one call to
-        *func_name*, mapping the callee's dummy-argument positions back to
-        the call site recorded by :attr:`extractor`.
-
-        Tracks per-function call occurrence counts in *call_indices* (since
-        a routine may be called multiple times and each call's actual
-        arguments must be matched independently). Falls back from
-        subroutine-style ``Call_Stmt`` argument lists to function-style
-        ``Part_Ref``/``Assignment_Stmt`` parsing when no ``Call_Stmt`` is
-        found. Used by :meth:`_fix_function_calls`.
-
-        Parameters
-        ----------
-        func_name : str
-            Name of the called function/subroutine.
-        call_indices : dict
-            Mutable per-function call-occurrence counter.
-        method : ast.FunctionDef
-            The callee's already-translated signature, used to determine
-            which dummy-argument positions are needed.
-
-        Returns
-        -------
-        list
-            Resolved argument expression nodes, or an empty list if
-            resolution fails.
-
-        Raises
-        ------
-        AssertionError
-            if the actual-argument count for a
-            function-style call doesn't match the expected dummy-argument
-            count.
-        IndexError
-        KeyError
-        """
-        # This retrieves all the call entries of the called function
-        i = call_indices[func_name]
-        call_indices[func_name] += 1
-        # Clamp i so it doesn’t exceed available subroutine entries
-        i = min(i, len(self.extractor.call_subroutines.get(func_name, [])) - 1)
-        indexes = []
         dummy_args_list = self.extractor.dummy_arg_list[func_name]
         folded_args = [a.casefold() for a in dummy_args_list]
+
+        indexes = []
         for arg in method.args.args:
             key = arg.arg.casefold()
+            if key == "self":
+                continue
             if key in folded_args:
                 indexes.append(folded_args.index(key))
 
-        try:
-            actual_args_list = None
-            part_ref = None
-            if walk(self.extractor.call_subroutines[func_name], F23.Call_Stmt):
-                # Subroutines
-                actual_args_list = walk(
-                    self.extractor.call_subroutines[func_name], F23.Actual_Arg_Spec_List
-                )
-            if actual_args_list:
-                args = [
-                    self.f2np.handle_expr(actual_args_list[i].children[idx])
-                    for idx in indexes
-                ]
-                return args, [actual_args_list[i].children[idx] for idx in indexes]
-            else:
-                # Fall back to another parsing route which usually means
-                # we are in the case of Functions
-                # Functions in most cases, seems to appear as either
-                # Part ref or just as an assign statement like that of def in Python
-                if isinstance(
-                    self.extractor.call_subroutines[func_name][i], F23.Part_Ref
-                ):
-                    part_ref = walk(
-                        self.extractor.call_subroutines[func_name][i], F23.Part_Ref
-                    )
-                else:
-                    if isinstance(
-                        self.extractor.call_subroutines[func_name][i],
-                        F23.Assignment_Stmt,
-                    ):
-                        _, _, func = self.extractor.call_subroutines[func_name][
-                            i
-                        ].children
-                        part_ref = walk(func, F23.Part_Ref)
+        method_args = [
+            arg.arg.casefold()
+            for arg in method.args.args
+            if arg.arg.casefold() != "self"
+        ]
+        # If the call already has exactly the arguments expected by the
+        # fixed Python method, don't try to apply Fortran indices.
+        if len(node.args) == len(method_args):
+            call_indices[func_name] += 1
+            return list(node.args)
 
-                if part_ref:
-                    actual_args_list = walk(part_ref, F23.Section_Subscript_List)[0]
-                assert len(actual_args_list.children) == len(indexes), (
-                    f"The actual arguments for the funciton and \
-                    that of the dummy arg list of function: {func_name} should match"
-                )
-                args = []
-                for idx in indexes:
-                    if idx < len(actual_args_list.children):
-                        args.append(
-                            self.f2np.handle_expr(actual_args_list.children[idx])
-                        )
-                    else:
-                        self.logger.warning(
-                            f"Skipping missing actual argument at index {idx} for {func_name}: "
-                            f"{len(actual_args_list.children)} actual args found."
-                        )
-                return args, [actual_args_list.children[idx] for idx in indexes]
-        except (IndexError, KeyError) as e:
-            self.logger.error(
-                f"Error mapping arguments for expr to '{func_name}' at index {i}:", e
+        if any(idx >= len(node.args) for idx in indexes):
+            self.logger.warning(
+                f"{func_name}: method args = {[a.arg for a in method.args.args]}, "
+                f"dummy args = {dummy_args_list}, "
+                f"indexes = {indexes}, "
+                f"node args = {ast.unparse(node)}, "
+                f"len(node.args) = {len(node.args)}"
             )
-            return [], []
-        except AssertionError as e:
-            self.logger.error(
-                "if the actual-argument count for a \
-            function-style call doesn't match the expected dummy-argument \
-            count.",
-                e,
+            self.logger.warning(
+                f"Skipping arg selection for {func_name}: index out of range "
+                f"in existing call args ({len(node.args)} available)."
             )
+            return []
+
+        return [node.args[idx] for idx in indexes]
 
     def _compute_return_variables(
         self,
@@ -1796,7 +1839,7 @@ class Transformer:
             not in self.extractor.var_modif_info[subroutine_key].get(var, [])
         }
 
-        if scalars_to_return and not any(ast_walk(function_def, ast.Return)):
+        if scalars_to_return:  # and not any(ast_walk(function_def, ast.Return))
             return_list.extend(scalars_to_return)
 
         return return_list, scalar_variables
@@ -1905,8 +1948,21 @@ class Transformer:
             for v in values:
                 cons_var.add(v)
 
+        # Regular loops
         for loop in ast_walk(function_def, ast.For):
             cons_var.update(self._extract_loop_targets(loop.target))
+
+        # Comprehension loops
+        for comp in ast_walk(function_def, ast.comprehension):
+            targets = self._extract_loop_targets(comp.target)
+
+            # A comprehension using range(...) is translated to Python Loops format
+            if (
+                isinstance(comp.iter, ast.Call)
+                and isinstance(comp.iter.func, ast.Name)
+                and comp.iter.func.id == "range"
+            ):
+                cons_var.update(targets)
 
         return cons_var
 
@@ -1940,8 +1996,8 @@ class Transformer:
 
     def _insert_return(self, function_def: ast.FunctionDef, return_list: list) -> None:
         """
-        Append a ``return`` statement to a function body, returning a
-        single value or a tuple depending on *return_list*'s length.
+        Append or update a ``return`` statement in a function body, returning
+        a single value or a tuple depending on *return_list*'s length.
 
         Used by :meth:`correct_function` (step 5).
 
@@ -1952,7 +2008,50 @@ class Transformer:
         return_list : list
             Variable names to return.
         """
-        values = [ast.Name(id=v, ctx=ast.Load()) for v in return_list]
+        if not return_list:
+            return
+
+        values = [ast.Name(id=name, ctx=ast.Load()) for name in return_list]
+
+        # Look for a top-level return statement in the function body.
+        return_stmt = next(
+            (node for node in function_def.body if isinstance(node, ast.Return)),
+            None,
+        )
+
+        if return_stmt is not None:
+            existing_values = []
+
+            if isinstance(return_stmt.value, ast.Tuple):
+                existing_values = return_stmt.value.elts
+            elif isinstance(return_stmt.value, ast.Name):
+                existing_values = [return_stmt.value]
+            elif return_stmt.value is not None:
+                existing_values = [return_stmt.value]
+
+            existing_names = {
+                node.id for node in existing_values if isinstance(node, ast.Name)
+            }
+
+            new_values = [
+                value
+                for value, name in zip(values, return_list)
+                if name not in existing_names
+            ]
+
+            merged_values = [*existing_values, *new_values]
+
+            if not merged_values:
+                return_stmt.value = None
+            elif len(merged_values) == 1:
+                return_stmt.value = merged_values[0]
+            else:
+                return_stmt.value = ast.Tuple(
+                    elts=merged_values,
+                    ctx=ast.Load(),
+                )
+
+            return
 
         return_node = ast.Return(
             value=values[0]
@@ -1988,7 +2087,7 @@ class Transformer:
                 raise ValueError("Templates could not be loaded due to a prior error.")
 
             code = templates["Python_templates"]["Python_global_class_template"][
-                "template"
+                self.target_model
             ]
 
             if code is None:
@@ -2125,10 +2224,23 @@ class Transformer:
 
                 declarations = self._preprocess_declarations(declarations)
 
+                derived_type_defs = walk(declarations, F23.Derived_Type_Def)
+                nested_type_decls = {
+                    id(n)
+                    for dtd in derived_type_defs
+                    for n in walk(dtd, F23.Type_Declaration_Stmt)
+                }
+
                 for node in walk(
                     declarations,
                     (F23.Type_Declaration_Stmt, F23.Use_Stmt, F23.Derived_Type_Def),
                 ):
+                    if (
+                        isinstance(node, F23.Type_Declaration_Stmt)
+                        and id(node) in nested_type_decls
+                    ):
+                        continue
+
                     if isinstance(node, F23.Use_Stmt):
                         ast_nodes.extend(self._handle_use_stmt(node))
 
@@ -2314,7 +2426,13 @@ class Transformer:
         list
             One assignment node per declared entity in *node*.
         """
+        if not walk(node, F23.Intrinsic_Type_Spec):
+            return self._handle_derived_type_decl(node, cls_mode)
+
         intrinsic_type_spec, _, entity_decl_list = node.children
+
+        if intrinsic_type_spec.children[0] == "CHARACTER":
+            return self._handle_character_decl(node, entity_decl_list, cls_mode)
 
         dtype = self._get_dtype(intrinsic_type_spec)
         attr_specs = [p.tostr() for p in walk(node, F23.Attr_Spec)]
@@ -2346,6 +2464,119 @@ class Transformer:
                         target, value, dtype, intrinsic_type_spec, has_kind, cls_mode
                     )
                 )
+
+        return ast_nodes
+
+    def _get_char_length(self, node: Any) -> int:
+        length_selectors = walk(node, F23.Length_Selector)
+        if length_selectors:
+            length_node = length_selectors[0].children[1]
+            if isinstance(length_node, F23.Int_Literal_Constant):
+                return int(length_node.tostr())
+        return None
+
+    def _handle_derived_type_decl(self, node: Any, cls_mode: bool) -> list:
+        decl_spec = walk(node, F23.Declaration_Type_Spec)[0]
+        derived_spec = walk(decl_spec, F23.Derived_Type_Spec)
+        nested_name = (
+            derived_spec[0].children[0].tostr()
+            if derived_spec
+            else decl_spec.children[1].tostr()
+        )
+
+        _, _, entity_decl_list = node.children
+        ast_nodes = []
+        is_array = self._is_array_declaration(node)
+
+        for entity in entity_decl_list.children:
+            target = self._make_target(entity, cls_mode)
+            _, _, _, init = entity.children
+
+            if init is not None and is_array:
+                # DIMENSION-qualified derived type with an initializer requires
+                # an array constructor of instances (e.g. [t(1,2), t(3,4)]),
+                # which needs to be folded into stacked per-field arrays for
+                # laieff_type.zeros()-style SoA storage is not yet implemented.
+                raise NotImplementedError(
+                    f"Initializer on a DIMENSION-qualified derived-type "
+                    f"declaration ('{nested_name}') is not yet supported; "
+                    f"needs a stacked-array-constructor builder."
+                )
+
+            if init is not None:
+                value = self.f2np.handle_expr(
+                    init.children[1]
+                )  # -> handle_structure_constructor
+            elif is_array:
+                shape = self._extract_shape(node, cls_mode)
+                value = ast.Call(
+                    func=ast.Attribute(
+                        value=ast.Name(id=nested_name, ctx=ast.Load()), attr="zeros"
+                    ),
+                    args=[ast.Tuple(elts=shape, ctx=ast.Load())],
+                    keywords=[],
+                )
+            else:
+                value = ast.Call(
+                    func=ast.Name(id=nested_name, ctx=ast.Load()), args=[], keywords=[]
+                )
+
+            ast_nodes.append(self._assign(target, value))
+
+        return ast_nodes
+
+    def _handle_character_decl(
+        self,
+        node: Any,
+        entity_decl_list: Any,
+        cls_mode: bool,
+    ) -> list:
+        """
+        Convert a Fortran CHARACTER declaration into a Python string
+        assignment.
+
+        Unlike REAL/INTEGER/LOGICAL, CHARACTER has no NumPy scalar
+        equivalent worth using here, Fortran string semantics (fixed-width,
+        blank-padded) map most naturally onto a plain Python ``str``, which
+        also lets the emitted code use ordinary string comparisons/operations
+        downstream without needing NumPy string dtype machinery.
+
+        Declarations with no initializer default to a blank string of the
+        declared length (Fortran's default fill for uninitialized CHARACTER
+        storage); declarations with a string-literal initializer use that
+        literal's text directly.
+
+        Parameters
+        ----------
+        node : Any
+            The Fortran ``Type_Declaration_Stmt`` for the CHARACTER
+            declaration, used to extract the declared length.
+        entity_decl_list : Any
+            The list of declared entities sharing this CHARACTER
+            specification.
+        cls_mode : bool
+            Whether targets should be ``self.<attr>`` or plain names.
+
+        Returns
+        -------
+        list
+            One ``ast.Assign`` per declared entity.
+        """
+        length = self._get_char_length(node)
+        ast_nodes = []
+
+        for entity in entity_decl_list.children:
+            target = self._make_target(entity, cls_mode)
+            _, _, _, init = entity.children
+            value = init.children[1] if init else None
+
+            if value is not None:
+                expr = self.f2np.handle_expr(value)
+                expr = self._maybe_attach(expr, cls_mode)
+                ast_nodes.append(self._assign(target, expr))
+            else:
+                length = length if length else 1
+                ast_nodes.append(self._assign(target, ast.Constant(value=" " * length)))
 
         return ast_nodes
 
@@ -2836,20 +3067,36 @@ class Transformer:
         self.dependant_variables = {}
         try:
             symbol_table = self._build_symbol_table(declaration_stmts)
+            all_names = set(symbol_table)
 
             for decl in declaration_stmts:
                 decl = self._preprocess_declarations(decl)
 
-                if not self._is_array_declaration(decl):
+                if self._is_array_declaration(decl):
+                    var_name = self._get_decl_name(decl)
+                    bounds = self._extract_bounds(decl)
+                    deps = self._resolve_dependencies(bounds, symbol_table)
+                    if deps:
+                        self.dependant_variables[var_name] = deps
                     continue
 
-                var_name = self._get_decl_name(decl)
-                bounds = self._extract_bounds(decl)
-
-                deps = self._resolve_dependencies(bounds, symbol_table)
-
-                if deps:
-                    self.dependant_variables[var_name] = deps
+                # Dynamic-length CHARACTER (LEN=* / assumed-size dummy arg):
+                # isolation writes a companion `<name>_length_character` scalar
+                # into the binary immediately before the string bytes, since
+                # the length isn't known at declaration time. Register the
+                # same dependency shape array bounds use, so
+                # init_dependant_variables places the string's read right
+                # after its length's read -- no separate ordering logic needed.
+                intrinsic_type_specs = walk(decl, F23.Intrinsic_Type_Spec)
+                if (
+                    intrinsic_type_specs
+                    and intrinsic_type_specs[0].children[0] == "CHARACTER"
+                    and self._get_char_length(decl) is None
+                ):
+                    var_name = self._get_decl_name(decl)
+                    length_var = f"{var_name}_length_character"
+                    if length_var in all_names:
+                        self.dependant_variables[var_name] = [length_var]
 
         except Exception:
             self.logger.exception("Exception in search_dependant_variables")
@@ -3789,6 +4036,8 @@ class Transformer:
         Declarations containing initialization expressions, dimension
         attributes, or explicit shape specifications are excluded.
         """
+        if not walk(dec_statement, F23.Intrinsic_Type_Spec):
+            return None  # derived-type instance, not a numpy scalar
         var = walk(dec_statement, F23.Entity_Decl)[0].tostr()
         init_spec = any(walk(dec_statement, F23.Initialization))
         alloc_spec = any(walk(dec_statement, F23.Dimension_Attr_Spec))
@@ -3900,15 +4149,148 @@ class Transformer:
 
             target = self._make_read_target(node)
             value = node.value
-
-            if isinstance(value, ast.Call) and len(value.keywords) > 0:
-                new_node = self._build_array_read(target, value)
+            if self._is_dataclass_zeros_call(value):
+                var_list.extend(
+                    self._build_dataclass_read(["read_fortran_struct_array", target])
+                )
+            elif isinstance(value, ast.Call) and isinstance(value.func, ast.Name):
+                var_list.extend(
+                    [self._build_dataclass_read("read_fortran_struct_scalar", target)]
+                )
+            elif isinstance(value, ast.Constant) and isinstance(value.value, str):
+                name = self._get_assigned_name(node)
+                length_var = f"{name}_length_character"
+                has_dynamic_length = True if name in self.dependant_variables else False
+                var_list.append(
+                    self._build_character_read(
+                        target,
+                        value,
+                        length_var_name=length_var if has_dynamic_length else None,
+                    )
+                )
+            elif isinstance(value, ast.Call) and len(value.keywords) > 0:
+                var_list.append(self._build_array_read(target, value))
             else:
-                new_node = self._build_scalar_read(target, value)
-
-            var_list.append(new_node)
+                var_list.append(self._build_scalar_read(target, value))
 
         return var_list
+
+    def _is_dataclass_zeros_call(self, value: ast.AST) -> bool:
+        return (
+            isinstance(value, ast.Call)
+            and isinstance(value.func, ast.Attribute)
+            and value.func.attr == "zeros"
+            and isinstance(value.func.value, ast.Name)
+            and value.func.value.id in self.dataclass_field_info
+        )
+
+    def _extract_dataclass_field_info(self, class_defs: list) -> dict:
+        """
+        Build ``{dataclass_name: [(field_name, np_dtype_attr_or_None), ...]}``
+        from already-built ``@dataclass`` ClassDefs, in declaration order.
+
+        ``np_dtype_attr_or_None`` is ``None`` for a nested derived-type field
+        (annotation is a bare ``ast.Name`` rather than ``np.<dtype>``), which
+        :meth:`_build_dataclass_read` doesn't yet know how to read.
+        """
+        info = {}
+        for cls in class_defs:
+            if not cls.decorator_list:
+                continue
+
+            fields = []
+            for stmt in cls.body:
+                if not (
+                    isinstance(stmt, ast.AnnAssign)
+                    and isinstance(stmt.target, ast.Name)
+                ):
+                    continue
+
+                ann = stmt.annotation
+                if (
+                    isinstance(ann, ast.Attribute)
+                    and isinstance(ann.value, ast.Name)
+                    and ann.value.id == "np"
+                ):
+                    fields.append((stmt.target.id, ann.attr))
+                else:
+                    fields.append((stmt.target.id, None))
+
+            info[cls.name] = fields
+
+        return info
+
+    def _build_dataclass_read(self, func_name: str, target: ast.AST) -> ast.Expr:
+        return ast.Expr(
+            value=ast.Call(
+                func=ast.Name(id=func_name, ctx=ast.Load()),
+                args=[ast.Name(id="ffile", ctx=ast.Load()), target],
+                keywords=[],
+            )
+        )
+
+    def _build_character_read(
+        self, target: ast.AST, value: ast.Constant, length_var_name: str | None = None
+    ) -> ast.Assign:
+        """
+        Build an AST assignment that reads a fixed-width CHARACTER value from
+        a binary file.
+
+        Fortran writes CHARACTER data as a fixed-length byte record rather
+        than through the numeric read_reals/read_ints paths, so this reads
+        via FortranFile.read_record with an explicit byte-string dtype sized
+        to the declared length, decodes it, and strips the trailing blank
+        padding Fortran uses to fill unused character storage.
+
+        Parameters
+        ----------
+        target : ast.AST
+            Assignment target.
+        value : ast.Constant
+            The declaration's default value (a blank string of the declared
+            length, from :meth:`_handle_character_decl`), used only to
+            recover the declared length for the record's byte-string dtype.
+
+        Returns
+        -------
+        ast.Assign
+            Assignment statement that performs the character read operation.
+        """
+        if length_var_name is not None:
+            dtype_arg = ast.JoinedStr(
+                values=[
+                    ast.Constant(value="S"),
+                    ast.FormattedValue(
+                        value=ast.Name(id=length_var_name, ctx=ast.Load()),
+                        conversion=-1,
+                    ),
+                ]
+            )
+        else:
+            length = len(value.value)
+            dtype_arg = ast.Constant(value=f"S{length}")
+
+        read_call = ast.Call(
+            func=ast.Attribute(
+                value=ast.Name(id="ffile", ctx=ast.Load()),
+                attr="read_record",
+                ctx=ast.Load(),
+            ),
+            args=[dtype_arg],
+            keywords=[],
+        )
+        raw_item = ast.Subscript(read_call, ast.Constant(0), ctx=ast.Load())
+        decode_call = ast.Call(
+            func=ast.Attribute(value=raw_item, attr="decode", ctx=ast.Load()),
+            args=[ast.Constant(value="ascii")],
+            keywords=[],
+        )
+        rstrip_call = ast.Call(
+            func=ast.Attribute(value=decode_call, attr="rstrip", ctx=ast.Load()),
+            args=[],
+            keywords=[],
+        )
+        return self._assign(target=target, value=rstrip_call)
 
     def _make_read_target(self, node: ast.Assign) -> ast.Attribute | ast.Name:
         """
@@ -4034,7 +4416,7 @@ class Transformer:
                 attr=read_type,
                 ctx=ast.Load(),
             ),
-            args=[dtype_attr(("np", attr_type))],
+            args=[dtype_attr(("np", "int32" if attr_type == "bool" else attr_type))],
             keywords=[],
         )
 
@@ -4043,6 +4425,16 @@ class Transformer:
             args=[value.args[0]],
             keywords=[ast.keyword(arg="order", value=ast.Constant("F"))],
         )
+
+        if attr_type == "bool":
+            return ast.Assign(
+                targets=[ast.Subscript(target, ast.Slice(), ctx=ast.Store())],
+                value=ast.Compare(
+                    left=reshape_call,
+                    ops=[ast.NotEq()],
+                    comparators=[ast.Constant(value=0)],
+                ),
+            )
 
         return ast.Assign(
             targets=[ast.Subscript(target, ast.Slice(), ctx=ast.Store())],
@@ -4248,7 +4640,7 @@ class Transformer:
 
             subroutine_path = os.path.join(path_to_folder, subroutine_key)
             file_path = os.path.join(
-                subroutine_path, f"{python_file_type}_{subroutine_key}.py"
+                subroutine_path, f"{python_file_type}_{subroutine_key.lower()}.py"
             )
 
             # First create python benchmark directory which will contain the directories of each subroutines
@@ -4395,7 +4787,9 @@ class Transformer:
         """
         try:
             # 1. Extract instance + attributes
-            instance_name, attributes = self._extract_instance_attributes(cls_info)
+            instance_name, attributes = self._extract_instance_attributes(
+                cls_info, subroutine_key=subroutine_key
+            )
 
             # 2. Build function arguments
             args = self._build_test_args(instance_name, attributes, subroutine_key)
@@ -4432,42 +4826,47 @@ class Transformer:
             self.logger.exception("Exception in create_test_function")
             return None
 
-    def _extract_instance_attributes(self, cls_info: dict) -> tuple:
+    def _extract_instance_attributes(
+        self, cls_info: dict, subroutine_key: str
+    ) -> tuple:
         """
-        Retrieves the first instance in `cls_info` and merges its attributes
-        with any nested instance attributes.
+        Retrieve the instance name and attributes for the module owning
+        *subroutine_key*, merged with any nested instance attributes.
+
+        Resolves the owning module the same way :meth:`_get_primary_instance`
+        does (direct key, or ``Global_module_<subroutine_key>``), rather than
+        taking the first entry in `cls_info` — which is unsafe once `cls_info`
+        also contains dataclass entries (e.g. `laieff_type`) that aren't tied
+        to the subroutine's own instance.
 
         Parameters
         ----------
         cls_info : dict
             Nested class/instance metadata structure.
+        subroutine_key : str
+            Identifier of the subroutine whose owning instance should be
+            resolved.
 
         Returns
         -------
         tuple
             (instance_name, attributes)
-            - instance_name : str
-            - attributes : dict
-                Merged attribute dictionary for the instance.
 
         Raises
         ------
-        ValueError
-            If no instance is found in `cls_info`.
+        KeyError
+            If no module matching *subroutine_key* is found in `cls_info`.
         """
-        for class_data in cls_info.values():
-            instance_name = next(iter(class_data))
-            instance_data = class_data[instance_name]
+        _, instance_name, instance_data = self._get_primary_instance(
+            cls_info, subroutine_key
+        )
 
-            attributes = copy.deepcopy(instance_data.get("attributes", {}))
+        attributes = copy.deepcopy(instance_data.get("attributes", {}))
 
-            # Merge nested instance attributes
-            for inst in instance_data.get("instances", {}).values():
-                attributes.update(inst.get("attributes", {}))
+        for inst in instance_data.get("instances", {}).values():
+            attributes.update(inst.get("attributes", {}))
 
-            return instance_name, attributes
-
-        raise ValueError("No instance found in cls_info")
+        return instance_name, attributes
 
     def _build_test_args(
         self, instance_name: str, attributes: dict, subroutine_key: str
@@ -4493,13 +4892,16 @@ class Transformer:
 
         modif_vars = set(self.extractor.var_modif[subroutine_key])
 
+        def resolve_name(var: str) -> str:
+            return f"{var}_result" if var == subroutine_key else var
+
         # If any modified variable is a class attribute -> pass instance
         if attributes.keys() & modif_vars:
             args.append(ast.arg(arg=instance_name))
 
         # Add non-attribute variables
         for var in modif_vars - attributes.keys():
-            args.append(ast.arg(arg=var))
+            args.append(ast.arg(arg=resolve_name(var)))
 
         return args
 
@@ -4527,6 +4929,98 @@ ffile = FortranFile(path, 'r')
             benchmark_dir=self.benchmark_dir, subroutine_name=subroutine_key
         )
         return ast.parse(code).body
+
+    def _build_char_lengths_dict(
+        self, variables: list[str], subroutine_key: str
+    ) -> dict[str, int]:
+        """
+        Resolve declared ``CHARACTER`` lengths for the given modified-variable
+        names, for use in the generated test loop's per-string byte-record
+        reads.
+
+        A test-compared variable that is ``CHARACTER``-typed must be read
+        back from ``output.bin`` using the exact fixed record width Fortran
+        wrote it with -- that's the declared ``LEN=`` when the declaration
+        specifies one. When it doesn't, the running Python value's own
+        length at test-time is the best available guess, so this method
+        simply omits that name and the emitted template falls back to
+        ``len(value)`` in that case, mirroring :meth:`_get_char_length`'s own
+        default-vs-explicit distinction.
+
+        Both this subroutine's dummy-argument declarations and its global
+        declarations are searched, since a modified variable can be either.
+        Used by :meth:`_build_test_loop`.
+
+        Parameters
+        ----------
+        variables : list[str]
+            Names of the test-compared variables (from ``var_modif_info``).
+        subroutine_key : str
+            Current subroutine identifier.
+
+        Returns
+        -------
+        dict[str, int]
+            ``{variable_name: declared_length}``, containing only the names
+            that are ``CHARACTER``-typed with an explicit length selector.
+        """
+        lengths: dict[str, int] = {}
+        variables_set = set(variables)
+
+        # Dummy-argument declarations: each entry is already a single
+        # Fortran declaration node.
+        dummy_decls = list(self.extractor.var_dummy.get(subroutine_key, []))
+
+        # Global declarations: each entry is a declaration *block* (a list),
+        # needing the same preprocessing convert_SPECIFICATION_PART applies
+        # before it can be walked meaningfully.
+        global_decls = [
+            self._preprocess_declarations(block)
+            for block in self.extractor.dec_global.get(subroutine_key, {}).values()
+        ]
+
+        for decl in dummy_decls + global_decls:
+            self._collect_char_lengths(decl, variables_set, lengths)
+
+        return lengths
+
+    def _collect_char_lengths(
+        self, decl: Any, variables_set: set[str], lengths: dict[str, int]
+    ) -> None:
+        """
+        Record the declared length of *decl* into *lengths* for any of its
+        entities that are in *variables_set*, if *decl* is a ``CHARACTER``
+        declaration with an explicit length selector.
+
+        Mutates *lengths* in place. Used by :meth:`_build_char_lengths_dict`.
+
+        Parameters
+        ----------
+        decl : Any
+            A candidate Fortran declaration node.
+        variables_set : set[str]
+            Names to match against this declaration's entities.
+        lengths : dict[str, int]
+            Accumulator dict, mutated in place.
+        """
+        intrinsic_type_specs = walk(decl, F23.Intrinsic_Type_Spec)
+        if (
+            not intrinsic_type_specs
+            or intrinsic_type_specs[0].children[0] != "CHARACTER"
+        ):
+            return
+
+        if not walk(decl, F23.Length_Selector):
+            return  # no explicit length; fall back to runtime len(value)
+
+        declared_length = self._get_char_length(decl)
+        if not declared_length:
+            return
+
+        for entity in walk(decl, F23.Entity_Decl):
+            name = entity.children[0].tostr()
+            if name in variables_set:
+                lengths[name] = declared_length
 
     def _build_test_loop(self, cls_info: dict, subroutine_key: str):
         """
@@ -4571,11 +5065,26 @@ ffile = FortranFile(path, 'r')
             If global replacement via :class:`ReplaceGlobals` fails.
         """
         variables = list(self.extractor.var_modif_info[subroutine_key].keys())
+        resolved_variables = [
+            f"{v}_result" if v == subroutine_key else v for v in variables
+        ]
+
+        char_lengths = self._build_char_lengths_dict(variables, subroutine_key)
 
         # modif_var = [...]
         modif_var_assign = ast.Assign(
             targets=[ast.Name(id="modif_var", ctx=ast.Store())],
             value=ast.List(elts=[ast.Constant(v) for v in variables], ctx=ast.Load()),
+        )
+
+        # char_lengths = {...}  (only entries with an explicit LEN=; the
+        # template falls back to len(value) for anything not in this dict)
+        char_lengths_assign = ast.Assign(
+            targets=[ast.Name(id="char_lengths", ctx=ast.Store())],
+            value=ast.Dict(
+                keys=[ast.Constant(name) for name in char_lengths],
+                values=[ast.Constant(length) for length in char_lengths.values()],
+            ),
         )
 
         # for variable, value in zip(...)
@@ -4592,7 +5101,9 @@ ffile = FortranFile(path, 'r')
                 args=[
                     ast.Name(id="modif_var", ctx=ast.Load()),
                     ast.List(
-                        elts=[ast.Name(id=v, ctx=ast.Load()) for v in variables],
+                        elts=[
+                            ast.Name(id=v, ctx=ast.Load()) for v in resolved_variables
+                        ],
                         ctx=ast.Load(),
                     ),
                 ],
@@ -4621,7 +5132,7 @@ ffile = FortranFile(path, 'r')
             self.logger.error("Syntax error while parsing the code template:", e)
             raise
 
-        return [modif_var_assign, loop]
+        return [modif_var_assign, char_lengths_assign, loop]
 
     def prepare_read_code_for_global_template(
         self, assign_nodes: list, subroutine_key: str
@@ -4761,6 +5272,7 @@ ffile = FortranFile(path, 'r')
             assign_nodes = []
             procedure_nodes = []
             class_nodes = []
+            dataclass_nodes = []  # Need to differenciate between class and dataclass classes
 
             for node in ast_nodes:
                 if isinstance(node, ast.Import | ast.ImportFrom):
@@ -4768,15 +5280,20 @@ ffile = FortranFile(path, 'r')
                 elif isinstance(node, ast.Assign):
                     assign_nodes.append(node)
                 elif isinstance(node, ast.ClassDef):
-                    class_nodes.append(node)
+                    if node.decorator_list:
+                        dataclass_nodes.append(node)
+                    else:
+                        class_nodes.append(node)
 
             # If the procedures are present then that we add them to the template
             if procedure_nodes:
                 for procedure_node in procedure_nodes:
                     self.insert_at(None, procedure_node, class_tree)
 
-            # Derived types are placed as
-            if class_nodes:
+            # Derived types are placed as class nodes
+            if class_nodes or dataclass_nodes:
+                for dataclass_node in dataclass_nodes:
+                    self.insert_at(None, dataclass_node, class_tree)
                 for class_node in class_nodes:
                     self.insert_at(None, class_node, class_tree)
 
@@ -4959,6 +5476,119 @@ ffile = FortranFile(path, 'r')
         insert_pos = class_positions[0] if class_positions else len(tree.body)
         tree.body.insert(insert_pos, helper_def)
 
+    def _maybe_insert_fortran_derived_type_read_helpers(self, tree: ast.Module) -> None:
+        if not self.dataclass_field_info:
+            return
+
+        existing_names = {
+            node.name for node in tree.body if isinstance(node, ast.FunctionDef)
+        }
+        import_positions = self._find_positions(tree.body, (ast.Import, ast.ImportFrom))
+        insert_pos = import_positions[-1] + 1 if import_positions else 0
+
+        if (
+            self.derived_type_array_usage
+            and "read_fortran_struct_array" not in existing_names
+        ):
+            nodes = build_fortan_derived_type_array_read()
+            for offset, node in enumerate(nodes):
+                tree.body.insert(insert_pos + offset, node)
+            insert_pos += len(nodes)
+
+        scalar_types = set(self.dataclass_field_info) - self.derived_type_array_usage
+        if scalar_types and "read_fortran_struct_scalar" not in existing_names:
+            nodes = build_fortan_derived_type_scalar_read()
+            for offset, node in enumerate(nodes):
+                tree.body.insert(insert_pos + offset, node)
+            insert_pos += len(nodes)
+
+    def _scan_derived_type_array_usage(self, subroutine_key: str) -> set[str]:
+        """
+        Return the set of derived-type names that are ever declared with an
+        outer DIMENSION (array-of-structs) anywhere in the program: global
+        declarations, or any subroutine's dummy-argument list. Must run
+        before any class AST is built, since build_dataclass_from_derived_type
+        needs this answer to decide the class's base list up front.
+        """
+        needs_wrap = set()
+
+        def check(decl_stmts):
+            for decl in decl_stmts:
+                decl_list = decl if isinstance(decl, list) else [decl]
+                for d in decl_list:
+                    decl_spec = walk(d, F23.Declaration_Type_Spec)
+                    if not decl_spec:
+                        continue
+                    derived_spec = walk(decl_spec, F23.Derived_Type_Spec)
+                    type_name = (
+                        derived_spec[0].children[0].tostr()
+                        if derived_spec
+                        else decl_spec[0].children[1].tostr()
+                    )
+                    if self._is_array_declaration(d):
+                        needs_wrap.add(type_name)
+
+        # global (module-level) declarations
+        for subroutine_decls in self.extractor.dec_global[subroutine_key].values():
+            check(list(subroutine_decls))
+
+        # every subroutine's dummy-argument declarations
+        declaration_stmts = [
+            [elements] for elements in self.extractor.var_dummy[subroutine_key]
+        ]
+        check(declaration_stmts)
+
+        return needs_wrap
+
+    def _maybe_insert_fortran_derived_type_helper(self, tree: ast.Module) -> None:
+        if not self.derived_type_array_usage:
+            return
+        already_present = any(
+            isinstance(node, ast.ClassDef) and node.name == "FortranDerivedType"
+            for node in tree.body
+        )
+        if already_present:
+            return
+        helper_class = build_fortran_derived_type()
+        class_positions = self._find_positions(tree.body, ast.ClassDef)
+        insert_pos = class_positions[0] if class_positions else len(tree.body)
+        tree.body.insert(insert_pos, helper_class)
+
+    def _compute_shadowing_args(self, module_stacks, global_attr) -> dict[str, set]:
+        """
+        func_name -> set of dummy-arg names that collide with a global attribute
+        but receive a *different* actual argument at some call site.
+        """
+        shadowed = defaultdict(set)
+        by_name = {f.name: f for f in module_stacks}
+
+        for caller in module_stacks:
+            for call in ast_walk(caller, ast.Call):
+                if not isinstance(call.func, ast.Name):
+                    continue
+                callee = call.func.id
+                if callee not in by_name:
+                    continue
+
+                dummies = self.extractor.dummy_arg_list[callee]
+                for pos, dummy in enumerate(dummies):
+                    if pos >= len(call.args):
+                        continue
+                    cf = {a.casefold(): a for a in global_attr}
+                    if dummy.casefold() not in cf:
+                        continue
+                    actual = call.args[pos]
+                    passes_the_global = (
+                        isinstance(actual, ast.Name)
+                        and actual.id.casefold() == dummy.casefold()
+                    ) or (
+                        isinstance(actual, ast.Attribute)
+                        and actual.attr.casefold() == dummy.casefold()
+                    )
+                    if not passes_the_global:
+                        shadowed[callee].add(cf[dummy.casefold()])
+        return dict(shadowed)
+
     def update_global_python(
         self, subroutine_key: str, cls_mode: bool = True
     ) -> ast.Module:
@@ -4987,10 +5617,18 @@ ffile = FortranFile(path, 'r')
             AST tree containing the finalized and updated elements.
         """
         try:
+            # Pre-step: Consult the presence of derived types especially those of struct of arrays
+            if not self.derived_type_array_usage:
+                self.derived_type_array_usage = self._scan_derived_type_array_usage(
+                    subroutine_key=subroutine_key
+                )
+
             # Step 1: Configure global transformation state
             self.cls_mode = cls_mode
             self.global_state = True
             self.f2np.needs_fortran_reshape_helper = False
+            self.f2np.derived_type_array_usage = self.derived_type_array_usage
+
             if not cls_mode:
                 raise NotImplementedError(
                     "Only class-based global transformation is currently supported."
@@ -5020,7 +5658,14 @@ ffile = FortranFile(path, 'r')
                 ast_nodes=ast_nodes, subroutine_key=subroutine_key
             )
 
-            class_def = next(iter(ast_walk(tree, ast.ClassDef)), None)
+            class_def = next(
+                (
+                    node
+                    for node in ast_walk(tree, ast.ClassDef)
+                    if not node.decorator_list
+                ),
+                None,
+            )
             if not class_def:
                 raise ValueError("Expected a class-based global module")
 
@@ -5041,21 +5686,25 @@ ffile = FortranFile(path, 'r')
             all_child_subroutines = []
             all_child_subroutines = self.collect_descendants_dfs(subroutine_key)
 
+            is_main = self._is_main_program(subroutine_key)
             if all_child_subroutines:
-                all_child_subroutines[-1].decorator_list = (
-                    [
-                        ast.Name(
-                            id=next(ast_walk(timer_tree, ast.FunctionDef)).name,
-                            ctx=ast.Load(),
-                        )
-                    ]
-                    if timer_tree
-                    else []
-                )
+                if not is_main:
+                    all_child_subroutines[-1].decorator_list = (
+                        [
+                            ast.Name(
+                                id=next(ast_walk(timer_tree, ast.FunctionDef)).name,
+                                ctx=ast.Load(),
+                            )
+                        ]
+                        if timer_tree
+                        else []
+                    )
                 class_def.body.extend(all_child_subroutines)
 
             # Step 9: Update method metadata + procedure calls
-            update_methods(cls_info, all_child_subroutines)
+            update_methods(
+                cls_info, all_child_subroutines, subroutine_key=subroutine_key
+            )
             subroutine_to_stack_index = {
                 func.name: idx for idx, func in enumerate(all_child_subroutines)
             }
@@ -5068,7 +5717,14 @@ ffile = FortranFile(path, 'r')
             ]
             # Determine the primary class instance and compute call-site
             # preadjustment information before transforming the procedures.
-            module_name, instance_name, _ = self._get_primary_instance(cls_info)
+            module_name, instance_name, instance_data = self._get_primary_instance(
+                cls_info, subroutine_key=subroutine_key
+            )
+            self._shadowed_args = self._compute_shadowing_args(
+                all_child_subroutines,
+                instance_data["attributes"],
+            )
+
             call_site_preadjustment = self._compute_call_site_preadjustment(
                 cls_info,
                 module_name,
@@ -5076,7 +5732,6 @@ ffile = FortranFile(path, 'r')
                 copy.deepcopy(all_child_subroutines),
                 subroutine_to_stack_index,
             )
-            # print(f'call_site_preadjustement: {call_site_preadjustment}')
 
             self._process_procedures(
                 subroutine_key=subroutine_key,
@@ -5085,6 +5740,9 @@ ffile = FortranFile(path, 'r')
                 cls_info=cls_info,
                 main_file_attributes=main_file_attributes,
                 call_site_preadjustment=call_site_preadjustment,
+                module_name=module_name,
+                instance_name=instance_name,
+                instance_data=instance_data,
             )
 
             # Step 10: Ensure all methods have `self`
@@ -5095,8 +5753,20 @@ ffile = FortranFile(path, 'r')
 
             # Step 11: Splice in fortran_reshape helper if any translated
             # subroutine (including collected descendants) used RESHAPE with
-            # PAD=/ORDER=.
+            # PAD=/ORDER= or if the subroutine uses any derived struct of arrays
+            # type of derived_type
             self._maybe_insert_fortran_reshape_helper(tree)
+            if self.dataclass_field_info:
+                import_node = ast.ImportFrom(
+                    module="dataclasses",
+                    names=[
+                        ast.alias(name=name)
+                        for name in ["dataclass", "fields", "MISSING", "replace"]
+                    ],
+                    level=0,
+                )
+                self.insert_at(None, import_node, tree, method_name=None)
+            self._maybe_insert_fortran_derived_type_helper(tree)
 
             return ast.fix_missing_locations(tree)
         except Exception as e:
@@ -5148,10 +5818,8 @@ ffile = FortranFile(path, 'r')
             index = subroutine_to_stack_index.get(func_name)
             method = all_child_subroutines[index]
             # self._fix_function_arguments(method, instance_name, global_attr, instance_data)
-            _, actual_args = self._resolve_call_arguments(
-                func_name, call_indices, method
-            )
-            actual_args_list[func_name].append(actual_args)
+            new_args = self._select_call_args(func_name, call_indices, method, node)
+            actual_args_list[func_name].append(new_args)
         return dict(actual_args_list)
 
     def _topological_order_parents_first(self, methods: dict) -> list:
@@ -5276,6 +5944,7 @@ ffile = FortranFile(path, 'r')
         instance_data = cls_info[module_name][instance_name]
         methods = instance_data["methods"]
         global_attr = instance_data["attributes"]
+        actual_args_list = defaultdict(list)
 
         order = self._topological_order_parents_first(methods)
         reverse_order = order[::-1]
@@ -5315,14 +5984,13 @@ ffile = FortranFile(path, 'r')
 
                 child_method = all_child_subroutines[child_index]
 
-                new_args, _ = self._resolve_call_arguments(
-                    func_name,
-                    call_indices,
-                    child_method,
+                new_args = self._select_call_args(
+                    func_name, call_indices, child_method, node
                 )
 
                 if new_args:
                     node.args = new_args
+                    actual_args_list[func_name].append(new_args)
 
             all_child_subroutines[method_index] = method
 
@@ -5372,7 +6040,9 @@ ffile = FortranFile(path, 'r')
                         occurrences[occ_idx] if occ_idx < len(occurrences) else {}
                     )
                     for i, arg in enumerate(actual_args):
-                        is_preadj = name_state.get(arg.tostr(), False)
+                        is_preadj = isinstance(arg, ast.Name) and name_state.get(
+                            arg.id, False
+                        )
                         per_param[i] = per_param.get(i, True) and is_preadj
 
                 # Immediately propagate: translate the callee's per-position
@@ -5395,6 +6065,10 @@ ffile = FortranFile(path, 'r')
                             )
 
         return final_registry
+
+    def _is_main_program(self, key: str) -> bool:
+        working = self.isolator.working_subroutines
+        return key in working and bool(walk(working[key], F23.Main_Program))
 
     def collect_descendants_dfs(self, subroutine_key: str) -> list:
         """
@@ -5426,6 +6100,11 @@ ffile = FortranFile(path, 'r')
                 called.keys()
             ):  # We recursively call the call statement of internal call statement
                 dfs(child_key, stack)
+
+            if self._is_main_program(key):
+                visited.add(key)
+                stack.pop()
+                return
             # Now process this node (get AST)
             subroutines = self.isolator.working_subroutines[key]
             _, _, ast_list = self.f2np.recursive_ast(subroutines)
@@ -5623,11 +6302,12 @@ ffile = FortranFile(path, 'r')
                 if not assign:
                     continue
 
-                new_node = self.read_file_ast([assign])[0]
-                self._inject_tuple_args(function_def, new_node, seen)
+                new_nodes = self.read_file_ast([assign])
+                for new_node in new_nodes:
+                    self._inject_tuple_args(function_def, new_node, seen)
 
-                read_ast.body.insert(var_pos, new_node)
-                var_pos += 1
+                    read_ast.body.insert(var_pos, new_node)
+                    var_pos += 1
                 seen["arrays"].add(name)
 
             if scalar_name not in seen["scalars"]:
@@ -5735,6 +6415,47 @@ ffile = FortranFile(path, 'r')
 
         if difference:
             for_node.iter.elts = [ast.Name(id=v, ctx=ast.Load()) for v in difference]
+
+            if_body = ast.If(
+                test=ast.Call(
+                    func=ast.Name(id="is_dataclass", ctx=ast.Load()),
+                    args=[ast.Name(id="var", ctx=ast.Load())],
+                    keywords=[],
+                ),
+                body=[],
+                orelse=[],
+            )
+            if self.derived_type_array_usage:
+                derived_type_array_read = ast.If(
+                    test=ast.Call(
+                        func=ast.Name(id="hasattr", ctx=ast.Load()),
+                        args=[
+                            ast.Name(id="var", ctx=ast.Load()),
+                            ast.Constant(value="_shape"),
+                        ],
+                        keywords=[],
+                    ),
+                    body=[
+                        self._build_dataclass_read(
+                            "read_fortran_struct_array",
+                            ast.Name(id="var", ctx=ast.Load()),
+                        )
+                    ],
+                    orelse=[],
+                )
+                if_body.body.append(derived_type_array_read)
+            scalar_types = (
+                set(self.dataclass_field_info) - self.derived_type_array_usage
+            )
+            if scalar_types:
+                if_body.body.append(
+                    self._build_dataclass_read(
+                        "read_fortran_struct_scalar", ast.Name(id="var", ctx=ast.Load())
+                    )
+                )
+            if if_body.body:
+                for_node.body.append(if_body)
+
         else:
             read_ast.body = [n for n in read_ast.body if not isinstance(n, ast.For)]
 
@@ -5899,37 +6620,82 @@ ffile = FortranFile(path, 'r')
                 method="declaration_initialization",
             )
 
-            # Resolve references to global instances
-            identify_replace_all(
-                main_function.body, main_cls_info
-            )  # THis function allows us to identify and replace them recursivly.
-
             # 5. Build read + execution calls
-            idx = len(main_function.body)
-            read_dummy_ast = self.prepare_read_code_for_main_template(
-                assign_nodes, subroutine_key=subroutine_key
-            )
-            read_dummy_ast_call_stmt = self.create_call_statements(read_dummy_ast)
-            if read_dummy_ast_call_stmt is None:
-                raise ValueError("Read_ast_call_stmt is None")
+            is_main = self._is_main_program(subroutine_key)
+            if is_main:
+                program_node = self.isolator.working_subroutines[subroutine_key]
+                # A main program has no dummy args to read and no method to call:
+                # its translated body IS main()'s body.
+                specification_parts = walk(program_node, F23.Specification_Part)
 
-            call_stmts.append(read_dummy_ast_call_stmt)
-            function_stmts.append(read_dummy_ast)
+                if specification_parts:
+                    spec_part = specification_parts[0]
+                    declaration_stmts = [
+                        [node]
+                        for node in walk(
+                            spec_part,
+                            (
+                                F23.Type_Declaration_Stmt,
+                                F23.Use_Stmt,
+                                F23.Derived_Type_Def,
+                            ),
+                        )
+                    ]
+                    spec_stack = self.convert_SPECIFICATION_PART(
+                        declaration_stmts, fix_loc=True, cls_mode=False
+                    )
+                    main_function.body.extend(spec_stack)
 
-            # We need to search among that of the Global module the function itself,
-            instance_key, function_def = self._find_function_in_cls_info(
-                main_cls_info, subroutine_key=subroutine_key
-            )
-            function_def_call_stmt = self.create_call_statements(
-                function_def, instance=instance_key
-            )
-            if function_def_call_stmt is None:
-                raise ValueError("Function defintions call statement is None")
-            call_stmts.append(function_def_call_stmt)
+                execution_nodes = self.f2np.translate_main_program(program_node)
+
+                main_function.body.extend(execution_nodes)
+                cons_var = self._collect_loop_variables(main_function, subroutine_key)
+                adjuster = AdjustIndices(
+                    cons_var,
+                    self.extractor.all_array_info[subroutine_key],
+                    {},  # TODO: Need to make this ensure that we send it
+                    shift_user_call_args=True,  # This is the same principle as the call_site_preadjustement
+                )
+
+                for stmt in main_function.body:
+                    adjuster.visit(stmt)
+
+                # Resolve references to global instances
+                identify_replace_all(main_function.body, main_cls_info)
+                self._correct_main_call_assignments(main_function, main_cls_info)
+
+            else:
+                # Resolve references to global instances
+                identify_replace_all(main_function.body, main_cls_info)
+                idx = len(main_function.body)
+                read_dummy_ast = self.prepare_read_code_for_main_template(
+                    assign_nodes, subroutine_key=subroutine_key
+                )
+                read_dummy_ast_call_stmt = self.create_call_statements(read_dummy_ast)
+                if read_dummy_ast_call_stmt is None:
+                    raise ValueError("Read_ast_call_stmt is None")
+
+                call_stmts.append(read_dummy_ast_call_stmt)
+                function_stmts.append(read_dummy_ast)
+
+                # We need to search among that of the Global module the function itself,
+                instance_key, function_def = self._find_function_in_cls_info(
+                    main_cls_info, subroutine_key=subroutine_key
+                )
+                function_def_call_stmt = self.create_call_statements(
+                    function_def, instance=instance_key
+                )
+                if function_def_call_stmt is None:
+                    raise ValueError("Function defintions call statement is None")
+                call_stmts.append(function_def_call_stmt)
 
             # 6. Create test function
-            if os.path.exists(
-                os.path.join(self.benchmark_dir, subroutine_key, "output.bin")
+            test_variables = list(self.extractor.var_modif_info[subroutine_key].keys())
+            if (
+                os.path.exists(
+                    os.path.join(self.benchmark_dir, subroutine_key, "output.bin")
+                )
+                and test_variables
             ):
                 test_subroutine_function = self.create_test_function(
                     main_cls_info, subroutine_key=subroutine_key
@@ -5958,14 +6724,164 @@ ffile = FortranFile(path, 'r')
             for functions in function_stmts:
                 self.insert_at(None, functions, out_main_template)
 
-            # In the case, we have reshape inside the main script
+            # In the case, we have reshape inside the main script and in the case
+            # when we need to read derived types
             self._maybe_insert_fortran_reshape_helper(out_main_template)
+            if self.dataclass_field_info:
+                import_node = ast.ImportFrom(
+                    module="dataclasses",
+                    names=[ast.alias(name=name) for name in ["fields", "is_dataclass"]],
+                    level=0,
+                )
+                self.insert_at(None, import_node, out_main_template, method_name=None)
+            self._maybe_insert_fortran_derived_type_read_helpers(out_main_template)
+            self.dataclass_field_info = {}
+            self.derived_type_array_usage = set()
+
+            # Add the following to ensure that the logging.INFO are configured
+            self.add_logging_basic_config(out_main_template)
 
             return ast.fix_missing_locations(out_main_template)
 
         except Exception as e:
             self.logger.exception("Exception error in update_main_python", e)
             return None
+
+    def _get_return_names(self, function_ast):
+        return_stmt = next(
+            (
+                n
+                for n in ast.walk(function_ast)
+                if isinstance(n, ast.Return) and n.value is not None
+            ),
+            None,
+        )
+
+        if return_stmt is None:
+            return []
+
+        value = return_stmt.value
+        if isinstance(value, ast.Tuple):
+            return [elt.id for elt in value.elts if isinstance(elt, ast.Name)]
+
+        if isinstance(value, ast.Name):
+            return [value.id]
+
+        return []
+
+    def _correct_main_call_assignments(self, function_def, cls_info):
+        class MainCallCorrector(ast.NodeTransformer):
+            def __init__(self, transformer):
+                self.transformer = transformer
+                self.cls_info = cls_info
+
+            def visit_Assign(self, node):
+                self.generic_visit(node)
+
+                if not isinstance(node.value, ast.Call):
+                    return node
+
+                call = node.value
+                if not isinstance(call.func, ast.Attribute):
+                    return node
+
+                if not isinstance(call.func.value, ast.Name):
+                    return node
+
+                instance_name = call.func.value.id
+                method_name = call.func.attr
+
+                method_ast = None
+
+                # Find the translated method in cls_info
+                for module_info in self.cls_info.values():
+                    instance_info = module_info.get(instance_name)
+
+                    if not instance_info:
+                        continue
+
+                    method_ast = instance_info.get("methods", {}).get(method_name)
+
+                    if method_ast is not None:
+                        break
+
+                if method_ast is None:
+                    return node
+
+                # Get the variables returned by the translated function
+                return_names = self.transformer._get_return_names(method_ast)
+
+                if len(return_names) <= 1:
+                    # Nothing to expand
+                    return node
+
+                # The existing assignment target is authoritative for
+                # the first returned value.
+                existing_target = node.targets[0]
+
+                if isinstance(existing_target, ast.Name):
+                    existing_targets = [existing_target]
+
+                elif isinstance(existing_target, ast.Tuple):
+                    existing_targets = list(existing_target.elts)
+
+                else:
+                    return node
+
+                # If the assignment is already fully expanded, do nothing.
+                if len(existing_targets) >= len(return_names):
+                    return node
+
+                # Keep the existing target(s).
+                new_targets = list(existing_targets)
+
+                for name in return_names[len(existing_targets) :]:
+                    new_targets.append(
+                        ast.Name(
+                            id=name,
+                            ctx=ast.Store(),
+                        )
+                    )
+                node.targets[0] = ast.Tuple(
+                    elts=new_targets,
+                    ctx=ast.Store(),
+                )
+
+                return node
+
+        corrector = MainCallCorrector(self)
+        corrector.visit(function_def)
+        ast.fix_missing_locations(function_def)
+
+    def add_logging_basic_config(self, out_main_template):
+        logging_call = ast.Expr(
+            value=ast.Call(
+                func=ast.Attribute(
+                    value=ast.Name(id="logging", ctx=ast.Load()),
+                    attr="basicConfig",
+                    ctx=ast.Load(),
+                ),
+                args=[],
+                keywords=[
+                    ast.keyword(
+                        arg="level",
+                        value=ast.Attribute(
+                            value=ast.Name(id="logging", ctx=ast.Load()),
+                            attr="INFO",
+                            ctx=ast.Load(),
+                        ),
+                    )
+                ],
+            )
+        )
+        # Find the position immediately after the imports.
+        insert_pos = 0
+        for i, node in enumerate(out_main_template.body):
+            if isinstance(node, (ast.Import | ast.ImportFrom)):
+                insert_pos = i + 1
+        out_main_template.body.insert(insert_pos, logging_call)
+        ast.fix_missing_locations(out_main_template)
+        return out_main_template
 
     def _find_function_in_cls_info(self, cls_info: dict, subroutine_key: str) -> tuple:
         """
@@ -5990,6 +6906,10 @@ ffile = FortranFile(path, 'r')
         cls_info: dict,
         main_file_attributes: list,
         call_site_preadjustment: dict,
+        module_name: str,
+        instance_name: str,
+        instance_data: dict,
+        _processed: set = None,
     ) -> None:
         """
         Recursively process and correct procedure subroutines in dependency order.
@@ -6013,6 +6933,11 @@ ffile = FortranFile(path, 'r')
             used when correcting procedure arguments and array indices.
 
         """
+        if _processed is None:
+            _processed = set()
+        if subroutine_key in _processed:
+            return
+        _processed.add(subroutine_key)
         # First, process all sub-subroutines if any
         for child_key in self.extractor.call_within_sub.get(subroutine_key, []):
             self._process_procedures(
@@ -6022,21 +6947,33 @@ ffile = FortranFile(path, 'r')
                 cls_info,
                 main_file_attributes,
                 call_site_preadjustment,
+                module_name,
+                instance_name,
+                instance_data,
+                _processed,
             )  # recurse for nested calls
 
+        if subroutine_key not in subroutine_to_stack_index:
+            return  # main program: its children are corrected, it has no method to correct
         # Then process the current subroutine
         module_stack_index = subroutine_to_stack_index[subroutine_key]
         self.correct_function(
             module_stacks[module_stack_index],
             cls_info,
             call_site_preadjustment,
-            subroutine_key,
+            module_name=module_name,
+            instance_name=instance_name,
+            instance_data=instance_data,
+            subroutine_key=subroutine_key,
             main_file_attributes=main_file_attributes,
         )
+        local_names = set(self.extractor.var_local_names[subroutine_key])
+        local_names |= self._shadowed_args.get(subroutine_key, set())
+
         identify_replace_all(
             module_stacks[module_stack_index].body,
             cls_info,
-            self.extractor.var_local_names[subroutine_key],
+            local_names,
         )
 
     def run_python_scripts(
@@ -6065,7 +7002,7 @@ ffile = FortranFile(path, 'r')
 
         self.logger.info(f"Processing module: {subdir_path}")
         # Python file checks
-        executable_name = os.path.basename(target_dir.rstrip("/"))
+        executable_name = os.path.basename(target_dir.rstrip("/")).lower()
         main_file = os.path.join(subdir_path, f"main_{executable_name}.py")
         global_module_file = os.path.join(
             subdir_path, f"global_module_{executable_name}.py"
@@ -6111,6 +7048,10 @@ ffile = FortranFile(path, 'r')
                 ["python3", main_file], check=True, capture_output=True, text=True
             )
             self.logger.info(f"Execution output for '{subdir}':\n{result.stdout}")
+            if result.stderr:
+                self.logger.info(
+                    f"Execution output (logging output) for '{subdir}':\n{result.stderr}"
+                )
         except subprocess.CalledProcessError as e:
             self.logger.error(
                 f"Error running main_{executable_name}.py for '{subdir}': ", e.stderr

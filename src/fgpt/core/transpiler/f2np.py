@@ -15,6 +15,7 @@ from fparser.two.utils import walk
 
 from fgpt.core.common.logger import Logger
 from fgpt.core.common.utils import (
+    _PruneEmptyIf,
     ast_walk,
     dtype_attr,
     dtype_call,
@@ -22,6 +23,13 @@ from fgpt.core.common.utils import (
     sanitize_identifier,
 )
 from fgpt.core.frontend.extractor import Extractor
+from fgpt.core.transpiler.fortran_io import (
+    IOAccess,
+    IOForm,
+    IOPosition,
+    IOStatus,
+    IOUnit,
+)
 from fgpt.core.transpiler.intrinsic import (
     intrinsic_signatures,
     normalize_intrinsic_call,
@@ -150,6 +158,7 @@ class F2NP:
             r"\bRESHAPE\b": "np.reshape",
             r"\bALLOCATE\b": "np.empty",
             r"\bSIZE\b": "np.size",
+            r"\bTRIM\b": "str.rstrip",
         }
 
         self.conditional_ops_map = {
@@ -158,6 +167,7 @@ class F2NP:
             "<": ast.Lt(),
             "<=": ast.LtE(),
             "!=": ast.NotEq(),
+            "/=": ast.NotEq(),
             "==": ast.Eq(),
             "not": ast.Not(),
             "and": ast.And(),
@@ -169,6 +179,9 @@ class F2NP:
 
         self.func_name = None
         self.needs_fortran_reshape_helper = False
+        self.derived_type_array_usage: set = set()
+        self.io_units: dict[str, IOUnit] = {}
+        self._loop_vars: list = []
 
     def append_to_current_parent(self, stmt: ast.AST, control_stack: list) -> None:
         """
@@ -370,6 +383,11 @@ class F2NP:
                         self.append_to_current_parent(for_loop, control_stack)
                         control_stack.append(for_loop)
                         counters["do"] += 1
+                        self._loop_vars.append(
+                            for_loop.target.id
+                            if isinstance(for_loop, ast.For)
+                            else None
+                        )
 
                     # Handle IF-THEN
                     elif isinstance(child, F23.If_Then_Stmt):
@@ -497,6 +515,8 @@ class F2NP:
                             control_stack.append(parent_if.orelse)
 
                     elif isinstance(child, F23.End_Do_Stmt | F23.End_If_Stmt):
+                        if isinstance(child, F23.End_Do_Stmt) and self._loop_vars:
+                            self._loop_vars.pop()
                         if control_stack:
                             if (
                                 isinstance(child, F23.End_Do_Stmt)
@@ -546,18 +566,53 @@ class F2NP:
                         # https://pypi.org/project/ast-comments/
                         pass
 
+                    elif isinstance(child, F23.Open_Stmt):
+                        stmt = self.handle_open_stmt(child)
+                        if counters["do"] == 0 and counters["if"] == 0:
+                            module_stack.append(stmt)
+                        else:
+                            self.append_to_current_parent(stmt, control_stack)
+
+                    elif isinstance(child, F23.Close_Stmt):
+                        stmt = self.handle_close_stmt(child)
+                        if counters["do"] == 0 and counters["if"] == 0:
+                            module_stack.append(stmt)
+                        else:
+                            self.append_to_current_parent(stmt, control_stack)
+
+                    elif isinstance(child, F23.Read_Stmt):
+                        stmt = self.handle_read_stmt(child)
+                        if counters["do"] == 0 and counters["if"] == 0:
+                            module_stack.append(stmt)
+                        else:
+                            self.append_to_current_parent(stmt, control_stack)
+
+                    elif isinstance(child, F23.Stop_Stmt):
+                        stmt = self.handle_stop_stmt(child)
+                        if counters["do"] == 0 and counters["if"] == 0:
+                            module_stack.append(stmt)
+                        else:
+                            self.append_to_current_parent(stmt, control_stack)
+
                     elif isinstance(child, F23.Print_Stmt | F23.Write_Stmt):
                         # NOTE: FOR NOW WE will treat it as a print since numout = 6 in the class
                         # https://docs.oracle.com/cd/E19957-01/805-4940/6j4m1u7oh/index.html
                         # https://stackoverflow.com/questions/28620899/difference-between-write-and-write6-in-fortran
-                        # Since 1363 is to write into the files
+                        # Only plain, list-directed output to stdout is supported: PRINT *,
+                        # WRITE(*,*), WRITE(6,*), and WRITE(<var>,*) where <var> is assumed
+                        # to alias stdout. An explicit FORMAT string/label, or a literal
+                        # unit other than 6, means real formatted/file I/O and isn't
+                        # translated.
 
-                        if not any(
-                            walk(
-                                walk(child, F23.Io_Control_Spec),
-                                F23.Int_Literal_Constant,
-                            )
+                        if isinstance(child, F23.Write_Stmt) and self._is_file_write(
+                            child
                         ):
+                            stmt = self.handle_file_write_stmt(child)
+                            if counters["do"] == 0 and counters["if"] == 0:
+                                module_stack.append(stmt)
+                            else:
+                                self.append_to_current_parent(stmt, control_stack)
+                        elif self._is_supported_print_target(child):
                             stmt = self.handle_print_stmt(child)
                             if counters["do"] == 0 and counters["if"] == 0:
                                 module_stack.append(stmt)
@@ -565,7 +620,7 @@ class F2NP:
                                 self.append_to_current_parent(stmt, control_stack)
                         else:
                             raise NotImplementedError(
-                                "When 1363 is present, the approach hasn't be implemented yet"
+                                "Formatted or file-targeted WRITE/PRINT statements aren't implemented yet"
                             )
 
                     elif isinstance(child, F23.Call_Stmt):
@@ -711,6 +766,8 @@ class F2NP:
                                 func_body.append(node)
 
                             module_stack[:] = [func_def]
+                            _PruneEmptyIf().visit(func_def)
+                            ast.fix_missing_locations(func_def)
                             if isinstance(child, F23.End_Function_Stmt):
                                 # RESULT(name) is optional. When present, the result variable
                                 # is whatever name follows RESULT(...); when absent, the
@@ -876,6 +933,15 @@ class F2NP:
                             module_stack.append(stmt)
                         else:
                             self.append_to_current_parent(stmt, control_stack)
+
+                    elif isinstance(child, F23.Inquire_Stmt):
+                        stmts = self.handle_inquire_stmt(child)
+                        for s in stmts:
+                            if counters["do"] == 0 and counters["if"] == 0:
+                                module_stack.append(s)
+                            else:
+                                self.append_to_current_parent(s, control_stack)
+
                     elif isinstance(child, F23.Intrinsic_Stmt):
                         pass
                     else:
@@ -937,6 +1003,7 @@ class F2NP:
 
         try:
             self.arg_list = []
+            self.io_units = {}
             for child in stmt.children:
                 if child is None:
                     continue
@@ -1051,7 +1118,11 @@ class F2NP:
         ast.Call
             The constructed call expression.
         """
-        args = [self.handle_expr(arg) for arg in args_spec_list.children]
+        args = (
+            [self.handle_expr(arg) for arg in args_spec_list.children]
+            if args_spec_list is not None
+            else []
+        )
 
         return ast.Call(
             func=ast.Name(id=func_name, ctx=ast.Load()), args=args, keywords=[]
@@ -1704,6 +1775,37 @@ class F2NP:
 
         return mapping.get((normalized_upper_key, candidate_var))
 
+    def _build_range_call(self, start_node, end_node, stride_node):
+        # start: Fortran value -> 0-based
+        if isinstance(start_node, F23.Int_Literal_Constant):
+            lower_bound = ast.Constant(value=int(start_node.tostr()) - 1)
+        else:
+            start_ast = self._shift_outer_loop_vars(self.handle_expr(start_node))
+            lower_bound = self._fold_consts(
+                ast.BinOp(left=start_ast, op=ast.Sub(), right=ast.Constant(value=1))
+            )
+
+        # end: Fortran value, inclusive == Python exclusive stop
+        if isinstance(end_node, F23.Part_Ref):
+            end_ast = ast.Call(
+                func=ast.Name(id="int", ctx=ast.Load()),
+                args=[self.handle_expr(end_node)],
+                keywords=[],
+            )
+        else:
+            end_ast = self._fold_consts(
+                self._shift_outer_loop_vars(self.handle_expr(end_node))
+            )
+
+        stride = stride_node if stride_node is not None else 1
+        stride_ast = self.to_ast_constant_or_expr(stride)
+        end_ast = self.adjust_end_for_stride(end_ast, stride_ast)
+        return ast.Call(
+            func=ast.Name(id="range", ctx=ast.Load()),
+            args=[lower_bound, end_ast, stride_ast],
+            keywords=[],
+        )
+
     def handle_do_stmt(self, stmt: F23.Nonlabel_Do_Stmt) -> ast.For | ast.While:
         """
         Convert a Fortran ``DO`` loop into an ``ast.For`` or ``ast.While``.
@@ -1752,36 +1854,19 @@ class F2NP:
 
             # Handle DO loops
             loop_var, start_end_stride_values = elements[0].tostr(), elements[1]
-            start, end = start_end_stride_values[0], start_end_stride_values[1]
-
-            # Adjust start to Python 0-based indexing
-            start = self.adjust_start(start)
-            stride = (
-                start_end_stride_values[2] if len(start_end_stride_values) == 3 else 1
+            start_node, end_node = (
+                start_end_stride_values[0],
+                start_end_stride_values[1],
             )
-
-            # Convert bounds and stride to AST nodes
-            lower_bound = self.to_ast_constant_or_expr(start)
-            if isinstance(end, F23.Part_Ref):
-                end_ast = ast.Call(
-                    func=ast.Name(id="int", ctx=ast.Load()),
-                    args=[self.handle_expr(end)],
-                    keywords=[],
-                )
-            else:
-                end_ast = self.handle_expr(end)
-            stride_ast = self.to_ast_constant_or_expr(stride)
-
-            # Adjust end if stride is negative
-            end_ast = self.adjust_end_for_stride(end_ast, stride_ast)
+            stride_node = (
+                start_end_stride_values[2]
+                if len(start_end_stride_values) == 3
+                else None
+            )
 
             return ast.For(
                 target=ast.Name(id=loop_var, ctx=ast.Store()),
-                iter=ast.Call(
-                    func=ast.Name(id="range", ctx=ast.Load()),
-                    args=[lower_bound, end_ast, stride_ast],
-                    keywords=[],
-                ),
+                iter=self._build_range_call(start_node, end_node, stride_node),
                 body=[],
                 orelse=[],
             )
@@ -1974,82 +2059,228 @@ class F2NP:
         """
 
         try:
-            string_parts, value_parts = self._extract_print_items(stmt)
-            call = self._build_logging_call(
-                level="info", string_parts=string_parts, value_parts=value_parts
-            )
+            items = self._extract_print_items(stmt)
+            call = self._build_logging_call(level="info", items=items)
             return ast.Expr(value=call)
 
         except Exception:
             self.logger.exception("Exception in handle_print_statement")
             raise
 
-    def _extract_print_items(
-        self, stmt: F23.Base
-    ) -> tuple[list[ast.AST], list[ast.AST]]:
+    def _extract_print_items(self, stmt: F23.Base) -> list[tuple[bool, ast.AST, bool]]:
         """
-        Separate a ``PRINT`` statement's output items into string literals
-        and value expressions.
+        Resolve a PRINT/WRITE statement's output items into an ordered list
+        that preserves their original sequence.
 
         Each item is resolved via :meth:`handle_expr`; character literal
-        items are classified as string parts, everything else as value
-        parts. Used by :meth:`handle_print_stmt`.
+        items are flagged as string literals, everything else as values.
+        A bare ``Io_Implied_Do`` item (e.g. ``(a(i), i=1,5)``) is instead
+        converted via :meth:`_build_write_io_implied_do` into a list-valued
+        expression -- despite that method's name, it's shared: an
+        implied-do's values belong to a single output record whether that
+        record is a stdout log line or a file line, so the same "collect
+        into one list, then join" translation applies to both.
 
         Parameters
         ----------
         stmt : F23.Base
-            Fortran node representing the ``PRINT`` statement.
+            Fortran node representing the ``PRINT``/``WRITE`` statement.
 
         Returns
         -------
-        tuple[list[ast.AST], list[ast.AST]]
-            ``(string_parts, value_parts)``.
+        list[tuple[bool, ast.AST, bool]]
+            ``(is_string_literal, resolved_expr, is_sequence)`` triples, in
+            source order. ``is_sequence`` is ``True`` only for the
+            list-comprehension produced from an implied-do.
+
+        Raises
+        ------
+        NotImplementedError
+            If the output item list mixes plain items with an implied-do.
         """
-
-        string_parts = []
-        value_parts = []
-
+        elements = ()
         for child in stmt.children:
             if isinstance(child, F23.Output_Item_List):
-                for elem in child.children:
-                    expr = self.handle_expr(elem)
+                elements = child.children
+                break
 
-                    if isinstance(elem, F23.Char_Literal_Constant):
-                        string_parts.append(expr)
-                    else:
-                        value_parts.append(expr)
+        # implied_dos = [e for e in elements if isinstance(e, F23.Io_Implied_Do)]
 
-        return string_parts, value_parts
+        # if not implied_dos:
+        #     return [
+        #         (isinstance(elem, F23.Char_Literal_Constant), self.handle_expr(elem), False)
+        #         for elem in elements
+        #     ]
+
+        # if len(implied_dos) == 1 and len(elements) == 1:
+        #     return [(False, self._build_write_io_implied_do(implied_dos[0]), True)]
+
+        # raise NotImplementedError(
+        #     "PRINT/WRITE statements mixing plain output items with an "
+        #     "implied-do at the same level aren't supported yet"
+        # )
+        if not elements:
+            return []
+
+        items = []
+
+        for elem in elements:
+            if isinstance(elem, F23.Io_Implied_Do):
+                resolved_expr = self._build_write_io_implied_do(elem)
+                is_string_literal = False
+                is_sequence = True
+            else:
+                resolved_expr = self.handle_expr(elem)
+                is_string_literal = isinstance(elem, F23.Char_Literal_Constant)
+                is_sequence = False
+
+            items.append(
+                (
+                    is_string_literal,
+                    resolved_expr,
+                    is_sequence,
+                )
+            )
+
+        return items
+
+    def _extract_write_io_specs(
+        self, stmt: F23.Write_Stmt
+    ) -> tuple[F23.Base | None, F23.Base | None]:
+        """
+        Resolve the UNIT and FMT specifier nodes from a ``WRITE`` statement's
+        control-spec list.
+
+        Handles both positional (``WRITE(6,*)``, where the first item is the
+        unit and the second is the format) and explicit keyword forms
+        (``WRITE(UNIT=6, FMT=*)``), since fparser wraps every control-spec
+        item keyworded or not in an ``F23.Io_Control_Spec(keyword,
+        value)`` pair, with ``keyword`` set to ``None`` for positional items.
+        Any other keyworded spec (``IOSTAT=``, ``ERR=``, ``END=``, ...) is
+        ignored, since it doesn't affect where the output goes. Used by
+        :meth:`_is_supported_print_target`.
+
+        Parameters
+        ----------
+        stmt : F23.Write_Stmt
+            The Fortran ``WRITE`` statement.
+
+        Returns
+        -------
+        tuple[Optional[F23.Base], Optional[F23.Base]]
+            ``(unit_node, fmt_node)``, either of which may be ``None`` if not
+            present.
+        """
+        spec_list = stmt.children[0]
+        specs = spec_list.children if hasattr(spec_list, "children") else (spec_list,)
+
+        unit_node, fmt_node = None, None
+        positional_index = 0
+
+        for spec in specs:
+            keyword, value = (None, spec)
+            if isinstance(spec, F23.Io_Control_Spec):
+                keyword, value = spec.children
+
+            if keyword == "UNIT":
+                unit_node = value
+            elif keyword == "FMT":
+                fmt_node = value
+            elif keyword is not None:
+                # Some other keyworded spec (IOSTAT=, ERR=, END=, ...):
+                # doesn't affect the output target, so it doesn't consume a
+                # positional slot either.
+                continue
+            else:
+                # Positional: first unkeyworded item is UNIT, second is FMT.
+                if positional_index == 0:
+                    unit_node = value
+                elif positional_index == 1:
+                    fmt_node = value
+                positional_index += 1
+
+        return unit_node, fmt_node
+
+    def _is_supported_print_target(self, stmt: F23.Print_Stmt | F23.Write_Stmt) -> bool:
+        """
+        Determine whether a ``PRINT``/``WRITE`` statement is plain,
+        list-directed output to the default unit, the only shape this
+        translator lowers to ``logging.info(...)`` (see
+        :meth:`handle_print_stmt`).
+
+        Supported forms: ``PRINT *, ...``, ``WRITE(*,*) ...``, ``WRITE(6,*)
+        ...`` (unit 6 being Fortran's conventional stdout unit, mirroring
+        this codebase's ``numout = 6`` convention), and ``WRITE(<var>,*)
+        ...`` where ``<var>`` is a plain variable name, assumed to alias
+        stdout the same way. Anything else, an explicit ``FORMAT`` string
+        or statement label as the format specifier, or a literal unit other
+        than 6 (a real file), is genuine formatted/file I/O and is not
+        translated.
+
+        Parameters
+        ----------
+        stmt : F23.Print_Stmt or F23.Write_Stmt
+            The Fortran ``PRINT``/``WRITE`` statement to classify.
+
+        Returns
+        -------
+        bool
+            ``True`` if *stmt* is a supported list-directed write to stdout,
+            ``False`` otherwise.
+        """
+        # if isinstance(stmt, F23.Print_Stmt):
+        #     fmt_node = stmt.children[0]
+        #     return isinstance(fmt_node, F23.Format)
+        if isinstance(stmt, F23.Print_Stmt):
+            return True
+
+        unit_node, _ = self._extract_write_io_specs(stmt)
+        # First determine whether the unit is stdout.
+        if isinstance(unit_node, F23.Int_Literal_Constant):
+            return int(unit_node.tostr()) == 6
+
+        # WRITE(*,...) or WRITE(numout,...)
+        # where the variable is assumed to alias stdout.
+        unit_is_stdout = True
+
+        if not unit_is_stdout:
+            return False
+
+        # At this point the unit is stdout.
+        # We deliberately don't care whether fmt_node is:
+        #   *               -> list-directed
+        #   '(...)'         -> explicit format
+        #   format label    -> explicit format
+        # because handle_print_stmt() lowers everything to logging.info()
+        # and does not preserve Fortran formatting.
+        return True
 
     def _build_logging_call(
         self,
         level: str,
-        string_parts: list[ast.AST] = None,
-        value_parts: list[ast.AST] = None,
+        items: list[tuple[bool, ast.AST]] | None = None,
         raw_message: str = None,
     ) -> ast.Call:
         """
-        Build a ``logging.<level>(...)`` call covering three message
-        shapes.
+        Build a ``logging.<level>(...)`` call covering two message shapes.
 
         When *raw_message* is given, it is logged directly as a single
-        string constant (used by :meth:`_build_call_logging`). When
-        *value_parts* is non-empty, the message is built as an f-string via
-        :meth:`_build_fstring_values` (used by :meth:`handle_print_stmt`
-        for ``PRINT`` statements with variables). Otherwise, *string_parts*
-        are passed as positional arguments directly.
+        string constant (used by :meth:`_build_call_logging`). Otherwise
+        *items* -- an ordered ``(is_string_literal, expr)`` list from
+        :meth:`_extract_print_items` -- is used: if it contains no value
+        items, the string-literal expressions are passed straight through as
+        positional arguments; if it contains any value item, the whole list
+        is rendered as a single f-string via :meth:`_build_fstring_values`.
 
         Parameters
         ----------
         level : str
             Logging level method name, e.g. ``'info'``, ``'error'``.
-        string_parts : list[ast.AST], optional
-            String-literal expressions to log.
-        value_parts : list[ast.AST], optional
-            Variable-value expressions to interpolate.
+        items : list[tuple[bool, ast.AST]], optional
+            Ordered ``(is_string_literal, expr)`` pairs from a PRINT/WRITE
+            statement's output list.
         raw_message : str, optional
-            A raw string message to log directly, bypassing the
-            string/value-parts logic.
+            A raw string message to log directly, bypassing *items*.
 
         Returns
         -------
@@ -2066,35 +2297,41 @@ class F2NP:
                 func=func, args=[ast.Constant(value=raw_message)], keywords=[]
             )
 
-        # Case 2: structured (PRINT with variables)
-        if value_parts:
-            values = self._build_fstring_values(string_parts, value_parts)
+        items = items or []
+        if len(items) == 1 and items[0][2]:
+            joined = self._build_joined_sequence_expr(items[0][1])
+            return ast.Call(func=func, args=[joined], keywords=[])
 
-            return ast.Call(func=func, args=[ast.JoinedStr(values=values)], keywords=[])
+        has_values = any(not is_string for is_string, _, _ in items)
 
-        # Case 3: only strings
-        return ast.Call(func=func, args=string_parts or [], keywords=[])
+        # Case 2: Only strings
+        if not has_values:
+            return ast.Call(func=func, args=[expr for _, expr, _ in items], keywords=[])
 
-    def _build_fstring_values(
-        self,
-        string_parts: list[ast.AST],
-        value_parts: list[ast.AST],
-    ) -> list[ast.AST]:
+        # Case 3: values and strings
+        pairs = [(is_string, expr) for is_string, expr, _ in items]
+        values = self._build_fstring_values(pairs)
+        # values = self._build_fstring_values(items)
+        return ast.Call(func=func, args=[ast.JoinedStr(values=values)], keywords=[])
+
+    def _build_fstring_values(self, items: list[tuple[bool, ast.AST]]) -> list[ast.AST]:
         """
-        Interleave string literals and formatted values into an f-string's
-        component list.
+        Build an f-string's component list from an ordered PRINT/WRITE item
+        list, preserving each item's original position.
 
-        Pairs each string part with the following value part (formatted
-        via ``ast.FormattedValue``), inserting a ``", "`` separator between
-        successive value/string pairs. Used by :meth:`_build_logging_call`
-        to construct an ``ast.JoinedStr``.
+        A ``", "`` separator is inserted only between two consecutive
+        *value* items with no intervening string literal (e.g. ``PRINT *, a,
+        b``), mirroring Fortran's list-directed spacing for bare value
+        lists. When a string literal sits between two values -- the common
+        labelled idiom, e.g. ``PRINT *, "a=", a, " b=", b`` -- no artificial
+        separator is added, since the literal itself carries the intended
+        formatting.
 
         Parameters
         ----------
-        string_parts : list[ast.AST]
-            String-literal expressions.
-        value_parts : list[ast.AST]
-            Variable-value expressions to format.
+        items : list[tuple[bool, ast.AST]]
+            ``(is_string_literal, resolved_expr)`` pairs, in source order,
+            as produced by :meth:`_extract_print_items`.
 
         Returns
         -------
@@ -2102,18 +2339,17 @@ class F2NP:
             Components suitable for ``ast.JoinedStr(values=...)``.
         """
         values = []
+        previous_was_bare_value = False
 
-        max_len = max(len(string_parts), len(value_parts))
-
-        for i in range(max_len):
-            if i < len(string_parts) and string_parts[i] is not None:
-                values.append(string_parts[i])
-
-            if i < len(value_parts) and value_parts[i] is not None:
-                values.append(ast.FormattedValue(value=value_parts[i], conversion=-1))
-                # Add separator if not last element
-                if i < max_len - 1:
+        for is_string, expr in items:
+            if is_string:
+                values.append(expr)
+                previous_was_bare_value = False
+            else:
+                if previous_was_bare_value:
                     values.append(ast.Constant(value=", "))
+                values.append(ast.FormattedValue(value=expr, conversion=-1))
+                previous_was_bare_value = True
 
         return values
 
@@ -2174,6 +2410,44 @@ class F2NP:
             keywords=keywords,
         )
 
+    def _build_trim_call(
+        self, intrinsic_function_reference: F23.Intrinsic_Function_Reference
+    ) -> ast.Call:
+        """
+        Convert a Fortran ``TRIM(x)`` call into ``x.strip()``.
+
+        Handled as a dedicated case rather than through the generic
+        ``intrinsic_replacements``/``intrinsic_signatures`` machinery in
+        :meth:`handle_intrinsic_function_reference`, because TRIM lowers to a
+        *method call on its own argument* (``x.strip()``) rather than a free
+        function call (``np.func(x)``), which that generic path doesn't
+        support.
+
+        Note
+        ----
+        Fortran's ``TRIM`` removes only *trailing* blanks. Python's
+        ``str.strip()`` removes whitespace from both ends -- a close but not
+        byte-for-byte equivalent.
+
+        Parameters
+        ----------
+        intrinsic_function_reference : F23.Intrinsic_Function_Reference
+            The Fortran ``TRIM(...)`` call.
+
+        Returns
+        -------
+        ast.Call
+            ``<arg>.strip()``.
+        """
+        intrinsic_args = walk(intrinsic_function_reference, F23.Actual_Arg_Spec_List)[0]
+        arg_ast = self.handle_expr(intrinsic_args.children[0])
+
+        return ast.Call(
+            func=ast.Attribute(value=arg_ast, attr="strip", ctx=ast.Load()),
+            args=[],
+            keywords=[],
+        )
+
     def handle_intrinsic_function_reference(
         self,
         intrinsic_function_reference: F23.Intrinsic_Function_Reference | list,
@@ -2214,6 +2488,10 @@ class F2NP:
         """
         try:
             intrinsic_name = intrinsic_function_reference.items[0].tostr().upper()
+
+            if intrinsic_name == "TRIM":
+                return self._build_trim_call(intrinsic_function_reference)
+
             pattern = rf"\b{intrinsic_name}\b"
             func_name = self.intrinsic_replacements.get(pattern, None)
             intrinsic_func = None
@@ -2335,13 +2613,26 @@ class F2NP:
                         func=func, args=final_args, keywords=final_keywords
                     )
                 else:
-                    intrinsic_func = ast.Call(
-                        func=func,
-                        args=positional_args,
-                        keywords=[
-                            ast.keyword(arg=k, value=v) for k, v in keyword_args.items()
-                        ],
-                    )
+                    if intrinsic_name in ["REAL", "DBLE", "INT"]:
+                        # Type-conversion intrinsic: REAL(A[, KIND]) / INT(A[, KIND]).
+                        # The optional second argument is a kind specifier with no
+                        # Python equivalent, so only the first (value) argument is kept.
+                        # https://gcc.gnu.org/onlinedocs/gfortran/REAL.html
+                        first_arg = intrinsic_args.children[0]
+                        value_ast = self.handle_expr(first_arg)
+
+                        intrinsic_func = ast.Call(
+                            func=func, args=[value_ast], keywords=[]
+                        )
+                    else:
+                        intrinsic_func = ast.Call(
+                            func=func,
+                            args=positional_args,
+                            keywords=[
+                                ast.keyword(arg=k, value=v)
+                                for k, v in keyword_args.items()
+                            ],
+                        )
 
             return intrinsic_func
         except Exception:
@@ -2366,7 +2657,11 @@ class F2NP:
         ast.Constant
             Constant node holding the float value.
         """
-        return ast.Constant(value=float(real_literal_constant.items[0]))
+        text = real_literal_constant.items[0]
+        normalized = text.replace("D", "E").replace("d", "e")
+        # Either D or E, wouldn't matter since all of them are float
+        # and it's double precision
+        return ast.Constant(value=float(normalized))
 
     def handle_part_ref(self, part_ref: list | F23.Part_Ref) -> ast.AST:
         """
@@ -3065,7 +3360,8 @@ class F2NP:
             ``ast.Slice`` index.
         """
         return any(
-            isinstance(sub, ast.Subscript) and isinstance(sub.slice, ast.Slice)
+            isinstance(sub, ast.Subscript)
+            and any(isinstance(x, ast.Slice) for x in ast.walk(sub.slice))
             for sub in ast.walk(node)
         )
 
@@ -3390,6 +3686,9 @@ class F2NP:
             "*": ast.Mult(),
             "/": ast.Div(),
             "**": ast.Pow(),
+            "//": ast.Add(),  # Fortran's `//` is string concatenation, unrelated to Python's `//`
+            # (floor division) or `build_binop`'s numeric op_map, so it's handled
+            # directly here as Python's `+`.
         }
 
         op = op_map.get(op_str)
@@ -3592,9 +3891,7 @@ class F2NP:
                 raise NotImplementedError(f"Unsupported Actual_Arg_Spec: {expr_node}")
 
         elif isinstance(expr_node, F23.Write_Stmt | F23.Print_Stmt):
-            if not any(
-                walk(walk(expr_node, F23.Io_Control_Spec), F23.Int_Literal_Constant)
-            ):
+            if self._is_supported_print_target(expr_node):
                 stmt = self.handle_print_stmt(expr_node)
                 return stmt
 
@@ -3611,8 +3908,7 @@ class F2NP:
             # list since it's just a literal argument value,
             # not a declared array.
             array_list = walk(expr_node, F23.Ac_Value_List)[0]
-            elements = [self.handle_expr(val) for val in array_list.children]
-            return ast.List(elts=elements, ctx=ast.Load())
+            return self._build_array_constructor_value(array_list)
 
         elif isinstance(expr_node, F23.Assignment_Stmt):
             return self.handle_assignment(expr_node)
@@ -3623,6 +3919,30 @@ class F2NP:
         elif isinstance(expr_node, F23.Structure_Constructor):
             return self.handle_structure_constructor(expr_node)
 
+        elif isinstance(expr_node, F23.Return_Stmt):
+            children = [child for child in expr_node.children if child is not None]
+
+            if not children:
+                return ast.Return(value=None)
+
+            args = [self.handle_expr(child) for child in children]
+
+            if len(args) == 1:
+                return ast.Return(value=args[0])
+
+            return ast.Return(
+                value=ast.Tuple(
+                    elts=args,
+                    ctx=ast.Load(),
+                )
+            )
+
+        elif isinstance(expr_node, F23.Level_3_Expr):
+            return self._binop_from_items(expr_node.items)
+
+        elif isinstance(expr_node, F23.Stop_Stmt):
+            return self.handle_stop_stmt(expr_node)
+
         else:
             raise NotImplementedError(
                 f"Unsupported node type: {type(expr_node).__name__}\n"
@@ -3631,6 +3951,52 @@ class F2NP:
 
     def handle_data_ref(self, node: F23.Data_Ref) -> ast.AST:
         parts = node.children
+        # NOTE: do not build a struct field assignment as
+        # `laieff_fit[idx].a = x`. Indexing `laieff_fit` invokes
+        # `FortranStruct.__getitem__`, which returns a new struct containing
+        # slices of the original fields. Assigning `.a` on that temporary
+        # therefore updates only the copy and silently leaves the original
+        # array unchanged. For an array-of-structs reference such as
+        # `laieff_fit(i,j,k) % a`, access the field array directly as
+        # `laieff_fit.a[i,j,k]` so the assignment updates the original data.
+
+        # Case 1 & 2: struct itself is array-of-structs.
+        if (
+            isinstance(parts[0], F23.Part_Ref)
+            and len(parts) == 2
+            and isinstance(parts[1], F23.Name | F23.Part_Ref)
+        ):
+            struct_name = parts[0].children[0].tostr()
+            outer_dims = self._extract_dimensions(parts[0])
+            outer_idx = [self._build_slice_or_index(d) for d in outer_dims]
+
+            if isinstance(parts[1], F23.Name):
+                field_name = parts[1].tostr()
+                full_idx = outer_idx
+            else:
+                field_name = parts[1].children[0].tostr()
+                inner_dims = self._extract_dimensions(parts[1])
+                inner_idx = [self._build_slice_or_index(d) for d in inner_dims]
+                full_idx = outer_idx + inner_idx
+
+            slice_node = (
+                full_idx[0]
+                if len(full_idx) == 1
+                else ast.Tuple(elts=full_idx, ctx=ast.Load())
+            )
+            return ast.Subscript(
+                value=ast.Attribute(
+                    value=ast.Name(id=struct_name, ctx=ast.Load()),
+                    attr=field_name,
+                    ctx=ast.Load(),
+                ),
+                slice=slice_node,
+                ctx=ast.Load(),
+            )
+
+        # Everything else (scalar struct % scalar field, scalar struct % array
+        # field, deeper/nested chains) falls through to the general loop,
+        # which already handles these correctly.
         base = (
             ast.Name(id=parts[0].tostr(), ctx=ast.Load())
             if isinstance(parts[0], F23.Name)
@@ -3649,6 +4015,7 @@ class F2NP:
                     args[0] if len(args) == 1 else ast.Tuple(elts=args, ctx=ast.Load())
                 )
                 base = ast.Subscript(value=base, slice=slice_node, ctx=ast.Load())
+
         return base
 
     def apply_mask_to_rhs(self, node: ast.AST) -> ast.AST:
@@ -3815,22 +4182,30 @@ class F2NP:
         type_name = walk(type_def, F23.Derived_Type_Stmt)[0].items[1].tostr()
 
         body = []
-        for decl in walk(type_def, F23.Data_Component_Def_Stmt):
+        for decl in walk(
+            type_def, F23.Data_Component_Def_Stmt | F23.Type_Declaration_Stmt
+        ):
             body.extend(self._build_dataclass_fields(decl))
 
         if not body:
             body = [ast.Pass()]
 
+        bases = (
+            [ast.Name(id="FortranDerivedType", ctx=ast.Load())]
+            if type_name in self.derived_type_array_usage
+            else []
+        )
+
         return ast.ClassDef(
             name=type_name,
-            bases=[],
+            bases=bases,
             keywords=[],
             body=body,
             decorator_list=[ast.Name(id="dataclass", ctx=ast.Load())],
         )
 
     def _build_dataclass_fields(
-        self, decl: F23.Data_Component_Def_Stmt
+        self, decl: F23.Data_Component_Def_Stmt | F23.Type_Declaration_Stmt
     ) -> list[ast.AnnAssign]:
         """
         Convert a single derived-type component declaration into one or
@@ -3899,11 +4274,9 @@ class F2NP:
         """
         fields = []
         intrinsic = walk(decl, F23.Intrinsic_Type_Spec)
-        is_array = is_array_declaration(
-            decl
-        )  # reuse Transformer's helper, or a local copy
+        is_array = is_array_declaration(decl)
 
-        for entity in walk(decl, F23.Component_Decl):
+        for entity in walk(decl, F23.Component_Decl | F23.Entity_Decl):
             name = entity.children[0].tostr()
 
             if intrinsic:
@@ -4037,4 +4410,1261 @@ class F2NP:
             func=ast.Name(id=type_name, ctx=ast.Load()),
             args=args,
             keywords=keywords,
+        )
+
+    def _build_array_constructor_value(self, array_list):
+        elements = array_list.children
+        implied_dos = [e for e in elements if isinstance(e, F23.Ac_Implied_Do)]
+        if not implied_dos:
+            return ast.List(
+                elts=[self.handle_expr(v) for v in elements], ctx=ast.Load()
+            )
+        if len(implied_dos) == 1 and len(elements) == 1:
+            return self._build_ac_implied_do(implied_dos[0])
+        raise NotImplementedError("mixed array constructor not supported")
+
+    def _build_ac_implied_do(self, implied_do):
+        generators = []
+        node = implied_do
+        while isinstance(node, F23.Ac_Implied_Do):
+            value_list, control = node.children
+            elements = (
+                value_list.children
+                if hasattr(value_list, "children")
+                else (value_list,)
+            )
+            if len(elements) != 1:
+                raise NotImplementedError("multi-value implied-do not supported")
+            loop_var_node = control.children[0]
+            bounds = control.children[1]
+            start_node, end_node = bounds[0], bounds[1]
+            stride_node = bounds[2] if len(bounds) == 3 else None
+            generators.append(
+                ast.comprehension(
+                    target=ast.Name(
+                        id=sanitize_identifier(loop_var_node.tostr()), ctx=ast.Store()
+                    ),
+                    iter=self._build_range_call(start_node, end_node, stride_node),
+                    ifs=[],
+                    is_async=0,
+                )
+            )
+            node = elements[0]
+        elt = self.handle_expr(node)
+        return ast.ListComp(elt=elt, generators=generators)
+
+    def _build_write_io_implied_do(self, implied_do: F23.Io_Implied_Do) -> ast.ListComp:
+        """
+        Convert a WRITE-statement io-implied-do (e.g. ``(mat(i,j), j=1,ncol)``)
+        into a Python list comprehension producing that record's sequence of
+        values.
+
+        Unlike the stdout PRINT/WRITE path (:meth:`_build_implied_do_loop`),
+        which expands an implied-do into its own ``for`` loop emitting one
+        ``logging.info(...)`` call per iteration, a real file WRITE's
+        implied-do values all belong to a *single* output record/line, so
+        they're collected into one list expression here instead. Reuses
+        :meth:`_build_range_call`, the same helper :meth:`_build_ac_implied_do`
+        uses for array-constructor implied-dos, since both share the
+        ``var = start, end[, stride]`` bound shape.
+
+        Nested implied-dos (e.g. for a 2-D dump) are handled the same way
+        :meth:`_build_ac_implied_do` handles them: by adding further ``for``
+        clauses to the same comprehension rather than nesting comprehensions.
+
+        Parameters
+        ----------
+        implied_do : F23.Io_Implied_Do
+            The implied-do node to convert.
+
+        Returns
+        -------
+        ast.ListComp
+            The equivalent Python list comprehension.
+
+        Raises
+        ------
+        NotImplementedError
+            If any level's object list contains more than one item (e.g.
+            ``(a(i), b(i), i=1,n)``).
+        """
+        generators = []
+        node = implied_do
+
+        while isinstance(node, F23.Io_Implied_Do):
+            object_list, control = node.children
+            elements = (
+                object_list.children
+                if hasattr(object_list, "children")
+                else (object_list,)
+            )
+
+            if len(elements) != 1:
+                raise NotImplementedError(
+                    "File WRITE implied-do with more than one object per "
+                    "iteration (e.g. (a(i), b(i), i=1,n)) isn't supported yet"
+                )
+
+            loop_var_node, start_node, end_node, stride_node = control.children
+            generators.append(
+                ast.comprehension(
+                    target=ast.Name(
+                        id=sanitize_identifier(loop_var_node.tostr()), ctx=ast.Store()
+                    ),
+                    iter=self._build_range_call(start_node, end_node, stride_node),
+                    ifs=[],
+                    is_async=0,
+                )
+            )
+            node = elements[0]
+
+        elt = self.handle_expr(node)
+        return ast.ListComp(elt=elt, generators=generators)
+
+    def _extract_char_spec(self, node, default: str) -> str:
+        if node is None:
+            return default
+        return node.tostr().strip("'\"").lower()
+
+    def handle_open_stmt(self, stmt: F23.Open_Stmt) -> ast.AST:
+        """
+        Convert a Fortran ``OPEN`` statement into ``unit = open(file, mode)``
+        (formatted) or ``unit = FortranFile(file, mode)`` (unformatted),
+        recording the unit's metadata in :attr:`io_units` so later
+        WRITE/READ/CLOSE statements referencing the same unit variable know
+        how to translate. When ``IOSTAT=`` is given, the assignment is
+        wrapped in a ``try/except OSError`` that sets the iostat variable to
+        0/1, mirroring Fortran's iostat semantics instead of letting the
+        exception propagate.
+        """
+        specs = {}
+        for spec in stmt.children[1].children:
+            keyword, value = spec.children
+            specs[keyword] = value
+
+        unit_node = specs.get("NEWUNIT") or specs.get("UNIT")
+        if unit_node is None:
+            raise NotImplementedError("OPEN without NEWUNIT=/UNIT= is not supported")
+        unit_name = sanitize_identifier(unit_node.tostr())
+
+        file_node = specs.get("FILE")
+        if file_node is None:
+            raise NotImplementedError("OPEN without FILE= is not supported")
+
+        io_unit = IOUnit(
+            unit_name=unit_name,
+            file_expr=self.handle_expr(file_node),
+            status=self._extract_char_spec(specs.get("STATUS"), IOStatus.UNKNOWN),
+            form=self._extract_char_spec(specs.get("FORM"), IOForm.FORMATTED),
+            access=self._extract_char_spec(specs.get("ACCESS"), IOAccess.SEQUENTIAL),
+            position=self._extract_char_spec(specs.get("POSITION"), IOPosition.ASIS),
+            recl_expr=self.handle_expr(specs["RECL"]) if "RECL" in specs else None,
+            iostat_expr=self.handle_expr(specs["IOSTAT"])
+            if "IOSTAT" in specs
+            else None,
+        )
+        self.io_units[unit_name] = io_unit
+
+        return self._build_open_call(io_unit)
+
+    def _build_open_mode(self, io_unit: "IOUnit") -> str:
+        if io_unit.access == IOAccess.STREAM:
+            if io_unit.form == IOForm.UNFORMATTED:
+                # Raw binary stream: no Fortran record markers.
+                if io_unit.position == IOPosition.APPEND:
+                    return "ab"
+                if io_unit.status == IOStatus.OLD:
+                    return "rb"
+                if io_unit.status == IOStatus.NEW:
+                    return "xb"
+                if io_unit.status in (IOStatus.REPLACE, IOStatus.SCRATCH):
+                    return "wb"
+
+                # UNKNOWN:
+                # There is no single Python mode that exactly matches
+                # Fortran STATUS='UNKNOWN'. This is the closest simple
+                # read/write binary mode, but it truncates an existing file.
+                return "w+b"
+
+        if io_unit.form == IOForm.UNFORMATTED:
+            # scipy.io.FortranFile only accepts 'r' or 'w'.
+            return "r" if io_unit.status == IOStatus.OLD else "w"
+        if io_unit.position == IOPosition.APPEND:
+            return "a"
+        if io_unit.status == IOStatus.OLD:
+            return "r"
+        if io_unit.status == IOStatus.NEW:
+            return "x"
+        if io_unit.status in (IOStatus.REPLACE, IOStatus.SCRATCH):
+            return "w"
+        # https://www.geeksforgeeks.org/python/file-mode-in-python/
+        # UNKNOWN: Fortran's own default (open existing, else create) has no
+        # single matching Python mode; 'w+' is the closest widely-usable one.
+        return "w+"
+
+    def _build_open_call(self, io_unit: "IOUnit") -> ast.AST:
+        mode = self._build_open_mode(io_unit)
+        use_fortran_file = (
+            io_unit.access == IOAccess.SEQUENTIAL and io_unit.form == IOForm.UNFORMATTED
+        )
+
+        func_name = "FortranFile" if use_fortran_file else "open"
+
+        assign = ast.Assign(
+            targets=[ast.Name(id=io_unit.unit_name, ctx=ast.Store())],
+            value=ast.Call(
+                func=ast.Name(id=func_name, ctx=ast.Load()),
+                args=[io_unit.file_expr, ast.Constant(value=mode)],
+                keywords=[],
+            ),
+        )
+
+        if io_unit.iostat_expr is None:
+            return assign
+
+        iostat_target = copy.deepcopy(io_unit.iostat_expr)
+        iostat_target.ctx = ast.Store()
+        ok_assign = ast.Assign(targets=[iostat_target], value=ast.Constant(value=0))
+        fail_target = copy.deepcopy(iostat_target)
+        fail_assign = ast.Assign(targets=[fail_target], value=ast.Constant(value=1))
+
+        return ast.Try(
+            body=[assign, ok_assign],
+            handlers=[
+                ast.ExceptHandler(
+                    type=ast.Name(id="OSError", ctx=ast.Load()),
+                    name=None,
+                    body=[fail_assign],
+                )
+            ],
+            orelse=[],
+            finalbody=[],
+        )
+
+    def handle_close_stmt(self, stmt: F23.Close_Stmt) -> ast.Expr:
+        unit_node = next(
+            (
+                v
+                for k, v in (s.children for s in stmt.children[1].children)
+                if k == "UNIT"
+            ),
+            None,
+        )
+        if unit_node is None:
+            raise NotImplementedError("CLOSE without a UNIT is not supported")
+
+        unit_name = sanitize_identifier(unit_node.tostr())
+        self.io_units.pop(unit_name, None)
+
+        return ast.Expr(
+            value=ast.Call(
+                func=ast.Attribute(
+                    value=ast.Name(id=unit_name, ctx=ast.Load()),
+                    attr="close",
+                    ctx=ast.Load(),
+                ),
+                args=[],
+                keywords=[],
+            )
+        )
+
+    def _is_file_write(self, stmt: F23.Write_Stmt) -> bool:
+        unit_node, _ = self._extract_write_io_specs(stmt)
+        return isinstance(unit_node, F23.Name) and unit_node.tostr() in self.io_units
+
+    def handle_file_write_stmt(self, stmt: F23.Write_Stmt) -> ast.Expr:
+        """
+        Convert a ``WRITE(unit, ...)`` statement whose unit is a tracked open
+        file (per :attr:`io_units`) into ``unit.write(...)`` (formatted, one
+        line of text per statement) or ``unit.write_record(...)``
+        (unformatted).
+        """
+        unit_node, _ = self._extract_write_io_specs(stmt)
+        unit_name = unit_node.tostr()
+        io_unit = self.io_units[unit_name]
+        items = self._extract_print_items(stmt)
+
+        if io_unit.form == IOForm.UNFORMATTED:
+            return self._build_unformatted_write(unit_name, items, io_unit)
+        return self._build_formatted_write(unit_name, items)
+
+    def _build_formatted_write(self, unit_name: str, items) -> ast.Expr:
+        if len(items) == 1 and items[0][2]:
+            line_expr = self._build_joined_sequence_line(items[0][1])
+        elif len(items) == 1 and items[0][0]:
+            line_expr = ast.BinOp(
+                left=items[0][1], op=ast.Add(), right=ast.Constant(value="\n")
+            )
+        else:
+            pairs = [(is_str, expr) for is_str, expr, _ in items]
+            values = self._build_fstring_values(pairs)
+            values.append(ast.Constant(value="\n"))
+            line_expr = ast.JoinedStr(values=values)
+
+        return ast.Expr(
+            value=ast.Call(
+                func=ast.Attribute(
+                    value=ast.Name(id=unit_name, ctx=ast.Load()),
+                    attr="write",
+                    ctx=ast.Load(),
+                ),
+                args=[line_expr],
+                keywords=[],
+            )
+        )
+
+    def _build_joined_sequence_expr(self, sequence_expr: ast.expr) -> ast.Call:
+        """``" ".join(map(str, <sequence_expr>))`` -- collapses an
+        implied-do's collected values into one string."""
+        return ast.Call(
+            func=ast.Attribute(
+                value=ast.Constant(value=" "), attr="join", ctx=ast.Load()
+            ),
+            args=[
+                ast.Call(
+                    func=ast.Name(id="map", ctx=ast.Load()),
+                    args=[ast.Name(id="str", ctx=ast.Load()), sequence_expr],
+                    keywords=[],
+                )
+            ],
+            keywords=[],
+        )
+
+    def _build_joined_sequence_line(self, sequence_expr: ast.expr) -> ast.BinOp:
+        """``<joined> + "\n"`` — the file-write variant, with the trailing
+        newline logging doesn't need."""
+        return ast.BinOp(
+            left=self._build_joined_sequence_expr(sequence_expr),
+            op=ast.Add(),
+            right=ast.Constant(value="\n"),
+        )
+
+    def _resolve_var_dtype(self, name: str) -> tuple[str, str]:
+        """
+        Resolve *name*'s Fortran intrinsic type to the ``(module, attr)``
+        NumPy dtype pair this codebase already uses everywhere else for a
+        variable of that type (``REAL`` -> ``np.float64``, ``INTEGER`` ->
+        ``np.int32``, ``LOGICAL`` -> ``np.bool``), via :meth:`_extract_dtype`.
+
+        Both the current subroutine's dummy-argument declarations
+        (``extractor.var_dummy``) and global/module-level declarations
+        (``extractor.dec_global``) are searched, since a variable written by
+        an unformatted ``WRITE`` can be either. Global declaration entries
+        are searched as raw blocks rather than through
+        ``Transformer._preprocess_declarations`` (unavailable here -- F2NP
+        has no ``self.isolator``), since that preprocessing only merges split
+        ``ALLOCATABLE`` declarations and strips ``INTENT``/``SAVE``, neither
+        of which affects locating the intrinsic type keyword or entity name.
+
+        Falls back to ``('np', 'float64')`` -- matching :meth:`_extract_dtype`'s
+        own unrecognised-type default -- if *name* can't be resolved at all
+        (e.g. a local variable, which F2NP doesn't retain declaration
+        metadata for once translated). Used by
+        :meth:`_resolve_write_record_dtype`.
+
+        Parameters
+        ----------
+        name : str
+            The variable name to resolve.
+
+        Returns
+        -------
+        tuple[str, str]
+            ``(module, attr)`` dtype pair, e.g. ``('np', 'float64')``.
+        """
+        extractor = getattr(self, "extractor", None)
+        if extractor is None or not self.func_name:
+            return ("np", "float64")
+
+        # Local declarations
+        for decl in extractor.var_local.get(self.func_name, []):
+            dtype = self._match_decl_dtype(decl, name)
+            if dtype is not None:
+                return dtype
+
+        # Dummy-argument declarations: each entry is already a single
+        # Fortran declaration node.
+        for decl in extractor.var_dummy.get(self.func_name, []):
+            dtype = self._match_decl_dtype(decl, name)
+            if dtype is not None:
+                return dtype
+
+        # Global (module-level) declarations: each entry is a declaration
+        # *block* a list of one or more nodes, keyed by variable name.
+        for block in extractor.dec_global.get(self.func_name, {}).values():
+            for decl in block:
+                dtype = self._match_decl_dtype(decl, name)
+                if dtype is not None:
+                    return dtype
+
+        return ("np", "float64")
+
+    def _get_char_length(self, decl) -> int:
+        """
+        Extract a CHARACTER declaration's length from its ``LEN=``/``*n``
+        selector, defaulting to 256 when none is given
+        """
+        length_selectors = walk(decl, F23.Length_Selector)
+        if length_selectors:
+            length_node = length_selectors[0].children[1]
+            if isinstance(length_node, F23.Int_Literal_Constant):
+                return int(length_node.tostr())
+        return None
+
+    def _match_decl_dtype(self, decl, name: str) -> tuple[str, str] | None:
+        """
+        Return *decl*'s NumPy dtype pair if *name* is one of its declared
+        entities, else ``None``. Used by :meth:`_resolve_var_dtype`.
+        """
+        for entity in walk(decl, F23.Entity_Decl):
+            if entity.children[0].tostr() == name:
+                intrinsic = walk(decl, F23.Intrinsic_Type_Spec)
+                if intrinsic and intrinsic[0].children[0] == "CHARACTER":
+                    return ("char", str(self._get_char_length(decl)))
+                try:
+                    return self._extract_dtype(decl)
+                except KeyError:
+                    return ("np", "float64")
+        return None
+
+    def _extract_base_name(self, node: ast.expr) -> str | None:
+        """
+        Extract the underlying variable name from a (possibly subscripted)
+        expression node, for dtype resolution in
+        :meth:`_resolve_write_record_dtype`.
+        """
+        if isinstance(node, ast.Name):
+            return node.id
+        if isinstance(node, ast.Subscript):
+            return self._extract_base_name(node.value)
+        return None
+
+    def _resolve_write_record_dtype(self, values: list[ast.AST]) -> tuple[str, str]:
+        """
+        Resolve the NumPy dtype to tag an unformatted ``write_record`` call
+        with, from the first written item's declared Fortran type. A single
+        ``WRITE(unit)`` statement writes one homogeneous record, so only the
+        first item needs consulting.
+
+        Parameters
+        ----------
+        values : list[ast.expr]
+            The resolved output-item expressions for one WRITE statement.
+
+        Returns
+        -------
+        tuple[str, str]
+            ``(module, attr)`` dtype pair.
+        """
+        if not values:
+            return ("np", "float64")
+        name = self._extract_base_name(values[0])
+        if name is None:
+            return ("np", "float64")
+        return self._resolve_var_dtype(name)
+
+    def _build_unformatted_write(
+        self, unit_name: str, items: list, io_unit: "IOUnit"
+    ) -> ast.Expr:
+        if len(items) == 1 and items[0][2]:
+            listcomp = items[0][1]
+            record = listcomp
+            dtype = self._resolve_write_record_dtype([listcomp.elt])
+        else:
+            values = [expr for _, expr, _ in items]
+            record = (
+                values[0] if len(values) == 1 else ast.List(elts=values, ctx=ast.Load())
+            )
+            dtype = self._resolve_write_record_dtype(values)
+            if dtype[0] == "char":
+                value_expr = (
+                    listcomp.elt if (len(items) == 1 and items[0][2]) else values[0]
+                )
+                return self._build_char_unformatted_write(
+                    unit_name, value_expr, int(dtype[1]), io_unit
+                )
+
+        array_call = ast.Call(
+            func=ast.Attribute(
+                value=ast.Name(id="np", ctx=ast.Load()), attr="array", ctx=ast.Load()
+            ),
+            args=[record],
+            keywords=[ast.keyword(arg="dtype", value=dtype_attr(dtype))],
+        )
+
+        if io_unit.access == IOAccess.STREAM and io_unit.form == IOForm.UNFORMATTED:
+            # np.array(...).tobytes()
+            bytes_call = ast.Call(
+                func=ast.Attribute(value=array_call, attr="tobytes", ctx=ast.Load()),
+                args=[],
+                keywords=[],
+            )
+
+            # unit.write(np.array(...).tobytes())
+            return ast.Expr(
+                value=ast.Call(
+                    func=ast.Attribute(
+                        value=ast.Name(
+                            id=unit_name,
+                            ctx=ast.Load(),
+                        ),
+                        attr="write",
+                        ctx=ast.Load(),
+                    ),
+                    args=[bytes_call],
+                    keywords=[],
+                )
+            )
+
+        return ast.Expr(
+            value=ast.Call(
+                func=ast.Attribute(
+                    value=ast.Name(id=unit_name, ctx=ast.Load()),
+                    attr="write_record",
+                    ctx=ast.Load(),
+                ),
+                args=[array_call],
+                keywords=[],
+            )
+        )
+
+    def _build_char_unformatted_write(
+        self, unit_name: str, value_expr: ast.expr, length: int, io_unit: "IOUnit"
+    ) -> ast.Expr:
+        padded = ast.Call(
+            func=ast.Attribute(
+                value=ast.Call(
+                    func=ast.Attribute(value=value_expr, attr="encode", ctx=ast.Load()),
+                    args=[ast.Constant(value="ascii")],
+                    keywords=[],
+                ),
+                attr="ljust",
+                ctx=ast.Load(),
+            ),
+            args=[ast.Constant(value=length)],
+            keywords=[],
+        )
+
+        if io_unit.access == IOAccess.STREAM:
+            return ast.Expr(
+                value=ast.Call(
+                    func=ast.Attribute(
+                        value=ast.Name(id=unit_name, ctx=ast.Load()),
+                        attr="write",
+                        ctx=ast.Load(),
+                    ),
+                    args=[padded],
+                    keywords=[],
+                )
+            )
+
+        array_call = ast.Call(
+            func=ast.Attribute(
+                value=ast.Name(id="np", ctx=ast.Load()), attr="array", ctx=ast.Load()
+            ),
+            args=[padded],
+            keywords=[ast.keyword(arg="dtype", value=ast.Constant(value=f"S{length}"))],
+        )
+        return ast.Expr(
+            value=ast.Call(
+                func=ast.Attribute(
+                    value=ast.Name(id=unit_name, ctx=ast.Load()),
+                    attr="write_record",
+                    ctx=ast.Load(),
+                ),
+                args=[array_call],
+                keywords=[],
+            )
+        )
+
+    def _build_char_unformatted_read(
+        self, unit_name: str, length: int, io_unit: "IOUnit", target_ast: ast.expr
+    ) -> ast.Assign:
+        if io_unit.access == IOAccess.STREAM:
+            length_expr = ast.Constant(value=length)
+            read_call = ast.Call(
+                func=ast.Attribute(
+                    value=ast.Name(id=unit_name, ctx=ast.Load()),
+                    attr="read",
+                    ctx=ast.Load(),
+                ),
+                args=[length_expr],
+                keywords=[],
+            )
+            decode_call = ast.Call(
+                func=ast.Attribute(value=read_call, attr="decode", ctx=ast.Load()),
+                args=[ast.Constant(value="ascii")],
+                keywords=[],
+            )
+        else:
+            record_call = ast.Call(
+                func=ast.Attribute(
+                    value=ast.Name(id=unit_name, ctx=ast.Load()),
+                    attr="read_record",
+                    ctx=ast.Load(),
+                ),
+                args=[ast.Constant(value=f"S{length}")],
+                keywords=[],
+            )
+            raw_item = ast.Subscript(record_call, ast.Constant(0), ctx=ast.Load())
+            decode_call = ast.Call(
+                func=ast.Attribute(value=raw_item, attr="decode", ctx=ast.Load()),
+                args=[ast.Constant(value="ascii")],
+                keywords=[],
+            )
+
+        rstrip_call = ast.Call(
+            func=ast.Attribute(value=decode_call, attr="rstrip", ctx=ast.Load()),
+            args=[],
+            keywords=[],
+        )
+        self._set_store_ctx(target_ast)
+        return ast.Assign(targets=[target_ast], value=rstrip_call)
+
+    def _build_char_formatted_read(
+        self,
+        unit_name: str,
+        target_ast: ast.expr,
+    ) -> ast.Assign:
+        readline_call = ast.Call(
+            func=ast.Attribute(
+                value=ast.Name(id=unit_name, ctx=ast.Load()),
+                attr="readline",
+                ctx=ast.Load(),
+            ),
+            args=[],
+            keywords=[],
+        )
+
+        rstrip_call = ast.Call(
+            func=ast.Attribute(value=readline_call, attr="rstrip", ctx=ast.Load()),
+            args=[],
+            keywords=[],
+        )
+
+        self._set_store_ctx(target_ast)
+
+        return ast.Assign(
+            targets=[target_ast],
+            value=rstrip_call,
+        )
+
+    def handle_read_stmt(self, stmt: F23.Read_Stmt) -> ast.AST:
+        """
+        Convert ``READ(unit, *[, IOSTAT=ios]) item`` into
+        ``item = float(unit.readline())``, wrapped in ``try/except`` to set
+        ``ios`` when IOSTAT is given. Only READs from a tracked open unit
+        with exactly one input item are supported; stdin reads and
+        multi-item READs raise NotImplementedError.
+        """
+        io_control_list, _, input_item_list = stmt.children
+
+        unit_node, iostat_node = None, None
+        for spec in io_control_list.children:
+            keyword, value = (
+                spec.children if isinstance(spec, F23.Io_Control_Spec) else (None, spec)
+            )
+            if keyword == "IOSTAT":
+                iostat_node = value
+            elif keyword == "UNIT" or (keyword is None and unit_node is None):
+                unit_node = value
+
+        if not (isinstance(unit_node, F23.Name) and unit_node.tostr() in self.io_units):
+            raise NotImplementedError(
+                "READ from stdin/an unopened unit is not supported"
+            )
+
+        items = input_item_list.children
+        if len(items) != 1:
+            raise NotImplementedError(
+                "READ with more than one input item is not supported yet"
+            )
+
+        unit_name = unit_node.tostr()
+        target_ast = self.handle_expr(items[0])
+        self._set_store_ctx(target_ast)
+
+        io_unit = self.io_units[unit_name]
+        # Resolve the Fortran type of the destination.
+        name = self._extract_base_name(target_ast)
+        if name is None:
+            raise NotImplementedError(
+                "READ destination must be a variable or array element"
+            )
+        dtype = self._resolve_var_dtype(name)
+        func_arrays = self._get_func_arrays()
+        is_array = True if name in func_arrays else False
+
+        if dtype[0] == "char":
+            if io_unit.form == IOForm.FORMATTED:
+                read_assign = self._build_char_formatted_read(
+                    unit_name,
+                    target_ast,
+                )
+            else:
+                read_assign = self._build_char_unformatted_read(
+                    unit_name,
+                    dtype[1],
+                    io_unit,
+                    target_ast,
+                )
+        else:
+            if io_unit.form == IOForm.FORMATTED:
+                read_assign = self.build_formatted_read_assign(
+                    unit_name,
+                    dtype,
+                    target_ast,
+                )
+
+            elif (
+                io_unit.access == IOAccess.SEQUENTIAL
+                and io_unit.form == IOForm.UNFORMATTED
+            ):
+                read_assign = self.build_unformatted_read_assign(
+                    unit_name,
+                    dtype,
+                    is_array,
+                    name,
+                    self._get_func_arrays(),
+                    target_ast,
+                )
+            elif (
+                io_unit.access == IOAccess.STREAM and io_unit.form == IOForm.UNFORMATTED
+            ):
+                read_assign = self.build_stream_unformatted_read_assign(
+                    unit_name,
+                    dtype,
+                    is_array,
+                    name,
+                    self._get_func_arrays(),
+                    target_ast,
+                )
+
+        if iostat_node is None:
+            return read_assign
+
+        iostat_target = self.handle_expr(iostat_node)
+        iostat_target.ctx = ast.Store()
+        ok_assign = ast.Assign(targets=[iostat_target], value=ast.Constant(value=0))
+        fail_assign = ast.Assign(
+            targets=[copy.deepcopy(iostat_target)], value=ast.Constant(value=1)
+        )
+
+        return ast.Try(
+            body=[read_assign, ok_assign],
+            handlers=[
+                ast.ExceptHandler(
+                    type=ast.Tuple(
+                        elts=[
+                            ast.Name(id="ValueError", ctx=ast.Load()),
+                            ast.Name(id="OSError", ctx=ast.Load()),
+                        ],
+                        ctx=ast.Load(),
+                    ),
+                    name=None,
+                    body=[fail_assign],
+                )
+            ],
+            orelse=[],
+            finalbody=[],
+        )
+
+    def python_cast_func(self, dtype):
+        _, attr = dtype
+        if attr == "int32":
+            return "int"
+        if attr == "bool":
+            return "bool"
+        return "float"
+
+    def build_formatted_read_assign(self, unit_name, dtype, target_ast):
+        cast_func = self.python_cast_func(dtype)
+
+        # A sliced target consumes multiple values from the input record.
+        if self._contains_slice_subscript(target_ast):
+            token_name = "x"
+
+            readline_call = ast.Call(
+                func=ast.Attribute(
+                    value=ast.Name(id=unit_name, ctx=ast.Load()),
+                    attr="readline",
+                    ctx=ast.Load(),
+                ),
+                args=[],
+                keywords=[],
+            )
+
+            split_call = ast.Call(
+                func=ast.Attribute(value=readline_call, attr="split", ctx=ast.Load()),
+                args=[],
+                keywords=[],
+            )
+
+            token_ast = ast.Name(id=token_name, ctx=ast.Load())
+
+            if cast_func == "bool":
+                # Preserve the existing Fortran LOGICAL interpretation.
+                value_expr = ast.Compare(
+                    left=ast.Call(
+                        func=ast.Attribute(
+                            value=ast.Call(
+                                func=ast.Attribute(
+                                    value=token_ast, attr="strip", ctx=ast.Load()
+                                ),
+                                args=[],
+                                keywords=[],
+                            ),
+                            attr="lower",
+                            ctx=ast.Load(),
+                        ),
+                        args=[],
+                        keywords=[],
+                    ),
+                    ops=[ast.Eq()],
+                    comparators=[ast.Constant(value="true")],
+                )
+            else:
+                value_expr = ast.Call(
+                    func=ast.Name(id=cast_func, ctx=ast.Load()),
+                    args=[token_ast],
+                    keywords=[],
+                )
+
+            listcomp = ast.ListComp(
+                elt=value_expr,
+                generators=[
+                    ast.comprehension(
+                        target=ast.Name(id=token_name, ctx=ast.Store()),
+                        iter=split_call,
+                        ifs=[],
+                        is_async=0,
+                    )
+                ],
+            )
+
+            self._set_store_ctx(target_ast)
+
+            return ast.Assign(
+                targets=[target_ast],
+                value=listcomp,
+            )
+
+        # Existing scalar-read behaviour.
+        if cast_func == "bool":
+            value_expr = ast.Compare(
+                left=ast.Call(
+                    func=ast.Attribute(
+                        value=ast.Call(
+                            func=ast.Attribute(
+                                value=ast.Call(
+                                    func=ast.Attribute(
+                                        value=ast.Name(
+                                            id=unit_name,
+                                            ctx=ast.Load(),
+                                        ),
+                                        attr="readline",
+                                        ctx=ast.Load(),
+                                    ),
+                                    args=[],
+                                    keywords=[],
+                                ),
+                                attr="strip",
+                                ctx=ast.Load(),
+                            ),
+                            args=[],
+                            keywords=[],
+                        ),
+                        attr="lower",
+                        ctx=ast.Load(),
+                    ),
+                    args=[],
+                    keywords=[],
+                ),
+                ops=[ast.Eq()],
+                comparators=[ast.Constant(value="true")],
+            )
+        else:
+            value_expr = ast.Call(
+                func=ast.Name(id=cast_func, ctx=ast.Load()),
+                args=[
+                    ast.Call(
+                        func=ast.Attribute(
+                            value=ast.Name(id=unit_name, ctx=ast.Load()),
+                            attr="readline",
+                            ctx=ast.Load(),
+                        ),
+                        args=[],
+                        keywords=[],
+                    )
+                ],
+                keywords=[],
+            )
+
+        self._set_store_ctx(target_ast)
+
+        return ast.Assign(
+            targets=[target_ast],
+            value=value_expr,
+        )
+
+    def build_full_slice(self, ndim):
+        if ndim == 1:
+            return ast.Slice()
+        return ast.Tuple(elts=[ast.Slice() for _ in range(ndim)], ctx=ast.Load())
+
+    def build_unformatted_read_assign(
+        self,
+        unit_name: str,
+        dtype: tuple[str, str],
+        is_whole_array: bool,
+        name: str,
+        func_arrays: dict,
+        target_ast: ast.AST,
+    ) -> ast.Assign:
+        read_func = "read_ints" if dtype[1] in ("int32", "bool") else "read_reals"
+        read_call = ast.Call(
+            func=ast.Attribute(
+                value=ast.Name(id=unit_name, ctx=ast.Load()),
+                attr=read_func,
+                ctx=ast.Load(),
+            ),
+            args=[dtype_attr(dtype)],
+            keywords=[],
+        )
+        if is_whole_array:
+            ndim = len(func_arrays[name])
+            target = ast.Subscript(
+                value=ast.Name(id=name, ctx=ast.Load()),
+                slice=self.build_full_slice(ndim),
+                ctx=ast.Store(),
+            )
+            reshape_call = ast.Call(
+                func=ast.Attribute(value=read_call, attr="reshape", ctx=ast.Load()),
+                args=[
+                    ast.Attribute(
+                        value=ast.Name(id=name, ctx=ast.Load()),
+                        attr="shape",
+                        ctx=ast.Load(),
+                    )
+                ],
+                keywords=[ast.keyword(arg="order", value=ast.Constant(value="F"))],
+            )
+            return ast.Assign(targets=[target], value=reshape_call)
+
+        self._set_store_ctx(target_ast)
+        scalar_value = ast.Subscript(
+            value=read_call, slice=ast.Constant(value=0), ctx=ast.Load()
+        )
+        if dtype[1] == "bool":
+            scalar_value = ast.Call(
+                func=dtype_attr(("np", "bool")), args=[scalar_value], keywords=[]
+            )
+        return ast.Assign(targets=[target_ast], value=scalar_value)
+
+    def build_stream_unformatted_read_assign(
+        self,
+        unit_name: str,
+        dtype: tuple[str, str],
+        is_whole_array: bool,
+        name: str,
+        func_arrays: dict,
+        target_ast: ast.AST,
+    ) -> ast.Assign:
+        """
+        Build a READ for ACCESS='STREAM', FORM='UNFORMATTED'.
+
+        Python's normal binary file object is used. No Fortran
+        sequential record markers are involved.
+        """
+
+        dtype_expr = dtype_attr(dtype)
+        # Determine the number of bytes for one value
+        if dtype[1] == "int32":
+            itemsize = 4
+        elif dtype[1] == "float64":
+            itemsize = 8
+        elif dtype[1] == "bool":
+            itemsize = 1
+        else:
+            raise NotImplementedError(f"Unsupported stream-unformatted dtype: {dtype}")
+
+        if is_whole_array:
+            ndim = len(func_arrays[name])
+
+            # arr.size * itemsize
+            nbytes = ast.BinOp(
+                left=ast.Attribute(
+                    value=ast.Name(id=name, ctx=ast.Load()), attr="size", ctx=ast.Load()
+                ),
+                op=ast.Mult(),
+                right=ast.Constant(value=itemsize),
+            )
+
+            # unit.read(arr.size * itemsize)
+            read_call = ast.Call(
+                func=ast.Attribute(
+                    value=ast.Name(id=unit_name, ctx=ast.Load()),
+                    attr="read",
+                    ctx=ast.Load(),
+                ),
+                args=[nbytes],
+                keywords=[],
+            )
+
+            # np.frombuffer(unit.read(...), dtype=dtype)
+            frombuffer_call = ast.Call(
+                func=ast.Attribute(
+                    value=ast.Name(id="np", ctx=ast.Load()),
+                    attr="frombuffer",
+                    ctx=ast.Load(),
+                ),
+                args=[read_call],
+                keywords=[ast.keyword(arg="dtype", value=dtype_expr)],
+            )
+
+            # .reshape(arr.shape, order="F")
+            reshape_call = ast.Call(
+                func=ast.Attribute(
+                    value=frombuffer_call, attr="reshape", ctx=ast.Load()
+                ),
+                args=[
+                    ast.Attribute(
+                        value=ast.Name(id=name, ctx=ast.Load()),
+                        attr="shape",
+                        ctx=ast.Load(),
+                    )
+                ],
+                keywords=[ast.keyword(arg="order", value=ast.Constant(value="F"))],
+            )
+
+            target = ast.Subscript(
+                value=ast.Name(id=name, ctx=ast.Load()),
+                slice=self.build_full_slice(ndim),
+                ctx=ast.Store(),
+            )
+
+            return ast.Assign(targets=[target], value=reshape_call)
+
+        # unit.read(itemsize)
+        read_call = ast.Call(
+            func=ast.Attribute(
+                value=ast.Name(id=unit_name, ctx=ast.Load()),
+                attr="read",
+                ctx=ast.Load(),
+            ),
+            args=[ast.Constant(value=itemsize)],
+            keywords=[],
+        )
+
+        # np.frombuffer(unit.read(itemsize), dtype=dtype)[0]
+        scalar_value = ast.Subscript(
+            value=ast.Call(
+                func=ast.Attribute(
+                    value=ast.Name(id="np", ctx=ast.Load()),
+                    attr="frombuffer",
+                    ctx=ast.Load(),
+                ),
+                args=[read_call],
+                keywords=[ast.keyword(arg="dtype", value=dtype_expr)],
+            ),
+            slice=ast.Constant(value=0),
+            ctx=ast.Load(),
+        )
+
+        self._set_store_ctx(target_ast)
+
+        return ast.Assign(
+            targets=[target_ast],
+            value=scalar_value,
+        )
+
+    def handle_stop_stmt(self, stmt: F23.Stop_Stmt) -> ast.Raise:
+        """Convert ``STOP ["message"]`` into ``raise RuntimeError(["message"])``."""
+        stop_code = stmt.children[1]
+        if stop_code is None:
+            exc_args = []
+        elif isinstance(stop_code, F23.Char_Literal_Constant):
+            exc_args = [ast.Constant(value=stop_code.tostr().strip("'\""))]
+        else:
+            exc_args = [self.handle_expr(stop_code)]
+
+        return ast.Raise(
+            exc=ast.Call(
+                func=ast.Name(id="RuntimeError", ctx=ast.Load()),
+                args=exc_args,
+                keywords=[],
+            ),
+            cause=None,
+        )
+
+    def _build_os_path_call(self, attr: str, file_expr: ast.expr) -> ast.Call:
+        return ast.Call(
+            func=ast.Attribute(
+                value=ast.Attribute(
+                    value=ast.Name(id="os", ctx=ast.Load()), attr="path", ctx=ast.Load()
+                ),
+                attr=attr,
+                ctx=ast.Load(),
+            ),
+            args=[file_expr],
+            keywords=[],
+        )
+
+    def handle_inquire_stmt(self, stmt: F23.Inquire_Stmt) -> list[ast.stmt]:
+        """
+        Convert ``INQUIRE(FILE=..., EXIST=..., SIZE=...)`` into
+        ``os.path.exists(...)``/``os.path.getsize(...)`` assignments.
+
+        Only the ``FILE=``-based form is supported (unit-based INQUIRE, and
+        specifiers other than ``EXIST=``/``SIZE=`` such as ``OPENED=``,
+        ``NAMED=``, ``NUMBER=``, raise ``NotImplementedError``).
+
+        ``SIZE=`` is guarded against a missing file, since
+        ``os.path.getsize`` raises ``FileNotFoundError`` where Fortran's
+        ``INQUIRE`` never raises at all -- if ``EXIST=`` was given in the
+        same statement, that already-computed variable is reused as the
+        guard (evaluated first, so it's in scope); otherwise a fresh
+        ``os.path.exists(...)`` call is inlined as the guard.
+
+        Returns
+        -------
+        list[ast.stmt]
+            One ``ast.Assign`` per requested specifier, in
+            ``EXIST=`` before ``SIZE=`` order.
+
+        Raises
+        ------
+        NotImplementedError
+            If ``FILE=`` is absent, or any specifier other than
+            ``EXIST=``/``SIZE=`` is present.
+        """
+        inquire_spec_list = walk(stmt, F23.Inquire_Spec_List)[0]
+        specs = {}
+        for spec in inquire_spec_list.children:
+            keyword, value = spec.children
+            specs[keyword] = value
+
+        file_node = specs.get("FILE")
+        if file_node is None:
+            raise NotImplementedError(
+                "INQUIRE without FILE= (unit-based, or OPENED=/NAMED=/NUMBER=-"
+                "style inquiries) isn't supported yet"
+            )
+
+        unsupported = set(specs) - {"FILE", "EXIST", "SIZE"}
+        if unsupported:
+            raise NotImplementedError(
+                f"INQUIRE specifier(s) {sorted(unsupported)} aren't supported yet"
+            )
+
+        statements: list[ast.stmt] = []
+        exists_target_name: str | None = None
+
+        if "EXIST" in specs:
+            exists_target = self.handle_expr(specs["EXIST"])
+            self._set_store_ctx(exists_target)
+            statements.append(
+                ast.Assign(
+                    targets=[exists_target],
+                    value=self._build_os_path_call(
+                        "exists", self.handle_expr(file_node)
+                    ),
+                )
+            )
+            exists_target_name = self._extract_base_name(exists_target)
+
+        if "SIZE" in specs:
+            size_target = self.handle_expr(specs["SIZE"])
+            self._set_store_ctx(size_target)
+
+            guard = (
+                ast.Name(id=exists_target_name, ctx=ast.Load())
+                if exists_target_name is not None
+                else self._build_os_path_call("exists", self.handle_expr(file_node))
+            )
+
+            statements.append(
+                ast.Assign(
+                    targets=[size_target],
+                    value=ast.IfExp(
+                        test=guard,
+                        body=self._build_os_path_call(
+                            "getsize", self.handle_expr(file_node)
+                        ),
+                        orelse=ast.Constant(value=0),
+                    ),
+                )
+            )
+
+        return statements
+
+    def translate_main_program(self, program_node: F23.Program) -> list[ast.AST]:
+        program_stmt = walk(program_node, F23.Program_Stmt)[0]
+
+        self.func_name = program_stmt.items[1].tostr()
+        self.arg_list = []
+        self.io_units = {}
+
+        execution_parts = walk(program_node, F23.Execution_Part)
+
+        if not execution_parts:
+            self.func_name = None
+            return []
+
+        _, _, exec_stack = self.recursive_ast(execution_parts[0])
+
+        for stmt in exec_stack:
+            ast.fix_missing_locations(stmt)
+
+        self.func_name = None
+
+        return exec_stack
+
+    def _shift_outer_loop_vars(self, node):
+        """Replace enclosing-loop names with (name + 1), i.e. their Fortran value.
+        Subscripts are skipped: AdjustIndices handles those later."""
+        outer = {v for v in self._loop_vars if v}
+        if not outer:
+            return node
+
+        class _Shift(ast.NodeTransformer):
+            def visit_Subscript(self, n):
+                return n
+
+            def visit_Name(self, n):
+                if isinstance(n.ctx, ast.Load) and n.id in outer:
+                    return ast.BinOp(left=n, op=ast.Add(), right=ast.Constant(value=1))
+                return n
+
+        return _Shift().visit(node)
+
+    def _fold_consts(self, node):
+        """(i + 1) + 1 - 1 -> i + 1 ; 3 - 1 -> 2"""
+
+        def const_of(n):
+            if (
+                isinstance(n, ast.BinOp)
+                and isinstance(n.op, (ast.Add | ast.Sub))
+                and isinstance(n.right, ast.Constant)
+                and isinstance(n.right.value, int)
+            ):
+                return n.right.value if isinstance(n.op, ast.Add) else -n.right.value
+            return None
+
+        c = const_of(node)
+        if c is None:
+            return node
+        left = self._fold_consts(node.left)
+        lc = const_of(left)
+        if lc is not None:
+            c += lc
+            left = left.left
+        elif isinstance(left, ast.Constant) and isinstance(left.value, int):
+            return ast.Constant(value=left.value + c)
+        if c == 0:
+            return left
+        return ast.BinOp(
+            left=left,
+            op=ast.Add() if c > 0 else ast.Sub(),
+            right=ast.Constant(value=abs(c)),
         )
