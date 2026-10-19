@@ -11,6 +11,7 @@ import ast
 import os
 import stat
 import subprocess
+import textwrap
 from copy import deepcopy
 from pathlib import Path
 from string import Template
@@ -20,10 +21,12 @@ from fgpt.core.backends.jax_converter.converter import JaxConverter
 from fgpt.core.backends.utils import (
     CallEdge,
     RemoveLogging,
+    _zeros_shape_dims,
     contains_name,
     convert_np_jnp,
     get_class_info_from_ast,
     get_name,
+    get_struct_info_from_ast,
     topo_sort,
 )
 from fgpt.core.common.logger import Logger
@@ -135,7 +138,9 @@ class AutoDiff:
             self.config_path = Path(config_path).resolve()
         self.mode = mode
         self.removelogging = RemoveLogging()
-
+        self.str_codes: dict[str, list[str]] = {}
+        self.struct_vars: dict = {}
+        self.struct_info: dict = {}
         self._LIB_ALIASES: set = {"np", "jnp", "torch", "tf"}
         self._SHAPE_CTORS: set = {
             "zeros",
@@ -300,10 +305,12 @@ class AutoDiff:
             Wraps any unexpected exception for upstream handling.
         """
         try:
+            self._add_fortran_derived_type_methods(class_module)
             class_defs = [
                 node
                 for node in ast.walk(class_module)
                 if isinstance(node, ast.ClassDef)
+                and node.name not in self.struct_classes
             ]
 
             # Extract timer and strip it from the class body
@@ -326,8 +333,29 @@ class AutoDiff:
                 names=[ast.alias(name="jit"), ast.alias(name="lax")],
                 level=0,
             )
+
             class_module.body.insert(0, jax_func_import)
-            self.cls_info = get_class_info_from_ast(class_module)
+            struct_info = get_struct_info_from_ast(class_module, self.struct_classes)
+            self.struct_info = struct_info or {}
+            cls_info = get_class_info_from_ast(class_module, self.struct_classes)
+            struct_instances = main_details.get("struct_instances", {})
+
+            def _norm(v):  # accept both str and dict forms
+                return v if isinstance(v, dict) else {"type": v, "dimensions": []}
+
+            struct_vars = {k: _norm(v) for k, v in struct_instances.items()}
+            self.struct_vars = struct_vars
+            entry = {mc["method"] for mc in main_details["method_calls"]}
+            for cls in cls_info.values():
+                for name, m in cls["methods"].items():
+                    if name not in entry:
+                        continue
+                    sa = {a: struct_vars[a] for a in m["args"] if a in struct_vars}
+                    if sa:
+                        m["struct_args"] = sa
+            self.cls_info = {
+                k: v for k, v in cls_info.items() if k not in self.struct_classes
+            }
 
             # Transformation 1 — add eqx.Module base and rename classes
             for class_def in class_defs:
@@ -397,14 +425,24 @@ class AutoDiff:
                     class_module.body[i] = convert_np_jnp(stmt)
 
             # Transformation 5 — convert procedure bodies to JAX
+            struct_fn_ids = {
+                id(fn)
+                for c in ast.walk(class_module)
+                if isinstance(c, ast.ClassDef) and c.name in self.struct_classes
+                for fn in c.body
+                if isinstance(fn, ast.FunctionDef)
+            }
+
             functions = [
                 convert_np_jnp(node)
                 for node in ast_walk(class_module, ast.FunctionDef)
-                if node.name
+                if id(node) not in struct_fn_ids
+                and node.name
                 not in {"__init__", "declaration_initialization", "timer", "wrapper"}
             ]
             class_dep = self.get_class_dep(functions)
             fn_index = self._index_functions(functions)
+            self._propagate_struct_args(class_dep, fn_index)
             fn_shapes = self._propagate_shapes(class_dep, fn_index, method_calls)
             if not fn_shapes:
                 raise ValueError("fn_shapes is empty — check _propagate_shapes")
@@ -414,6 +452,9 @@ class AutoDiff:
                 vectorize=self.vectorize,
                 logger=self.logger,
                 mode=self.mode,
+                struct_classes=self.struct_classes,
+                struct_info=struct_info if struct_info else None,
+                scalar_state_attrs=set(self.str_codes) if self.str_codes else None,
             )
             self.transform_procedure(class_dep, fn_index, fn_shapes, jax_converter)
 
@@ -432,7 +473,8 @@ class AutoDiff:
             class_modif: dict = {}
             fn_map = {
                 n.name: n
-                for n in ast.walk(class_module)
+                for cd in class_defs
+                for n in cd.body
                 if isinstance(n, ast.FunctionDef)
             }
             for method_call in method_calls:
@@ -539,6 +581,169 @@ class AutoDiff:
                 "Expected a module containing `if __name__ == '__main__':`."
             )
 
+    @staticmethod
+    def _is_dataclass_deco(d: ast.expr) -> bool:
+        if isinstance(d, ast.Call):
+            d = d.func
+        return (isinstance(d, ast.Name) and d.id == "dataclass") or (
+            isinstance(d, ast.Attribute) and d.attr == "dataclass"
+        )
+
+    def _find_struct_classes(self, module: ast.Module) -> set[str]:
+        classes = {n.name: n for n in module.body if isinstance(n, ast.ClassDef)}
+
+        def base_names(c):
+            return {b.id for b in c.bases if isinstance(b, ast.Name)}
+
+        structs = {
+            name
+            for name, c in classes.items()
+            if any(self._is_dataclass_deco(d) for d in c.decorator_list)
+        }
+
+        # Pull in base classes of structs (FortranDerivedType) ...
+        changed = True
+        while changed:
+            changed = False
+            for name in list(structs):
+                for b in base_names(classes[name]):
+                    if b in classes and b not in structs:
+                        structs.add(b)
+                        changed = True
+        # ... and subclasses of structs
+        for name, c in classes.items():
+            if name not in structs and base_names(c) & structs:
+                structs.add(name)
+        return structs
+
+    def _add_fortran_derived_type_methods(self, class_module: ast.AST):
+        methods_src = """
+    def with_field(self, name, value):
+        return replace(self, **{name: value})
+
+    def set(self, idx, value):
+        return type(self)(
+            **{
+                f.name: getattr(self, f.name).at[idx].set(
+                    getattr(value, f.name)
+                )
+                for f in fields(self)
+            }
+        )
+    """
+
+        methods = ast.parse(textwrap.dedent(methods_src)).body
+
+        for node in class_module.body:
+            if isinstance(node, ast.ClassDef) and node.name == "FortranDerivedType":
+                node.body.extend(methods)
+                ast.fix_missing_locations(node)
+                return
+
+    def _encode_string_attrs(self, class_module: ast.Module) -> dict[str, list[str]]:
+        """Replace str-valued ``self.<attr>`` with int32 codes; return the codebook."""
+
+        def is_self_attr(n):
+            return (
+                isinstance(n, ast.Attribute)
+                and isinstance(n.value, ast.Name)
+                and n.value.id == "self"
+            )
+
+        def is_str(n):
+            return isinstance(n, ast.Constant) and isinstance(n.value, str)
+
+        classes = [
+            c
+            for c in class_module.body
+            if isinstance(c, ast.ClassDef) and c.name not in self.struct_classes
+        ]
+
+        # Pass 1: attributes that are assigned a str constant, in any method
+        str_attrs = {
+            t.attr
+            for c in classes
+            for n in ast.walk(c)
+            if isinstance(n, ast.Assign) and is_str(n.value)
+            for t in n.targets
+            if is_self_attr(t)
+        }
+        if not str_attrs:
+            return {}
+
+        # Pass 2: codebook. Code 0 is "" so blank-padded values (80 spaces) map to 0.
+        codes: dict[str, list[str]] = {a: [""] for a in str_attrs}
+
+        def register(attr, s):
+            s = s.rstrip()
+            if s not in codes[attr]:
+                codes[attr].append(s)  # append-only keeps codes stable
+
+        for c in classes:
+            for n in ast.walk(c):
+                if isinstance(n, ast.Assign) and is_str(n.value):
+                    for t in n.targets:
+                        if is_self_attr(t) and t.attr in codes:
+                            register(t.attr, n.value.value)
+                elif isinstance(n, ast.Compare):
+                    ops = [n.left, *n.comparators]
+                    attr = next(
+                        (o.attr for o in ops if is_self_attr(o) and o.attr in codes),
+                        None,
+                    )
+                    if attr:
+                        for o in ops:
+                            if is_str(o):
+                                register(attr, o.value)
+
+        # Pass 3: rewrite
+        class Encoder(ast.NodeTransformer):
+            def visit_Assign(self, node):
+                self.generic_visit(node)
+                if is_str(node.value):
+                    for t in node.targets:
+                        if is_self_attr(t) and t.attr in codes:
+                            code = codes[t.attr].index(node.value.value.rstrip())
+                            node.value = ast.Call(
+                                func=ast.Attribute(
+                                    value=ast.Name(id="jnp", ctx=ast.Load()),
+                                    attr="int32",
+                                    ctx=ast.Load(),
+                                ),
+                                args=[ast.Constant(value=code)],
+                                keywords=[],
+                            )
+                return node
+
+            def visit_Compare(self, node):
+                self.generic_visit(node)
+                ops = [node.left, *node.comparators]
+                attr = next(
+                    (o.attr for o in ops if is_self_attr(o) and o.attr in codes), None
+                )
+                if attr:
+                    ops = [
+                        ast.Constant(codes[attr].index(o.value.rstrip()))
+                        if is_str(o)
+                        else o
+                        for o in ops
+                    ]
+                    node.left, node.comparators = ops[0], ops[1:]
+                return node
+
+        for c in classes:
+            Encoder().visit(c)
+        ast.fix_missing_locations(class_module)
+        return codes
+
+    def _struct_of(self, name, fn_name):
+        """Struct info for `name` as seen inside method `fn_name`, or None."""
+        for cls in self.cls_info.values():
+            sa = cls["methods"].get(fn_name, {}).get("struct_args", {})
+            if name in sa:
+                return sa[name]
+        return self.struct_vars.get(name)
+
     def transform(
         self,
         main_file: str | ast.Module,
@@ -593,6 +798,9 @@ class AutoDiff:
             self._validate_class_module(class_module)
             self._validate_main_module(main_module)
 
+            self.struct_classes = self._find_struct_classes(class_module)
+            self.str_codes = self._encode_string_attrs(class_module)
+
             # Resolve output paths from the original string paths when available,
             # otherwise fall back to the import statement inside main_module.
             if isinstance(main_file, str) and isinstance(class_file, str):
@@ -623,6 +831,32 @@ class AutoDiff:
             class_new_path = self._build_output_path(class_path)
 
             self._add_jax_imports(main_module)
+            new_body = []
+            for stmt in class_module.body:
+                new_body.append(stmt)
+                if (
+                    isinstance(stmt, ast.ClassDef)
+                    and stmt.name in self.struct_classes
+                    and any(self._is_dataclass_deco(d) for d in stmt.decorator_list)
+                ):
+                    new_body.append(
+                        ast.Expr(
+                            ast.Call(
+                                func=ast.Attribute(
+                                    value=ast.Attribute(
+                                        value=ast.Name(id="jax", ctx=ast.Load()),
+                                        attr="tree_util",
+                                        ctx=ast.Load(),
+                                    ),
+                                    attr="register_dataclass",
+                                    ctx=ast.Load(),
+                                ),
+                                args=[ast.Name(id=stmt.name, ctx=ast.Load())],
+                                keywords=[],
+                            )
+                        )
+                    )
+            class_module.body = new_body
 
             main_func = next(
                 (
@@ -680,12 +914,47 @@ class AutoDiff:
                         for n in stmt.names
                     ]
                     stmt.module = class_new_path.stem
+                    if self.str_codes and not any(
+                        n.name == "STR_CODES" for n in stmt.names
+                    ):
+                        stmt.names.append(ast.alias(name="STR_CODES"))
                     if stmt.names:
                         new_body.append(stmt)
                 else:
                     new_body.append(stmt)
             main_module.body = new_body
 
+            main_module.body = [
+                stmt
+                for stmt in main_module.body
+                if not (
+                    isinstance(stmt, ast.Expr)
+                    and isinstance(stmt.value, ast.Call)
+                    and isinstance(stmt.value.func, ast.Attribute)
+                    and isinstance(stmt.value.func.value, ast.Name)
+                    and stmt.value.func.value.id == "logging"
+                    and stmt.value.func.attr == "basicConfig"
+                )
+            ]
+
+            if self.str_codes:
+                stmt = ast.parse(f"STR_CODES = {self.str_codes!r}").body[0]
+                last_imp = max(
+                    i
+                    for i, n in enumerate(class_module.body)
+                    if isinstance(n, (ast.Import | ast.ImportFrom))
+                )
+                class_module.body.insert(last_imp + 1, stmt)
+                helper = ast.parse(
+                    textwrap.dedent("""
+                    def _encode_str(attr, s):
+                        codes = STR_CODES[attr]
+                        if s not in codes:
+                            codes.append(s)
+                        return jnp.int32(codes.index(s))
+                """)
+                ).body[0]
+                class_module.body.insert(last_imp + 2, helper)
             self.write_to_file(main_new_path, main_module)
             self.write_to_file(class_new_path, class_module)
 
@@ -857,6 +1126,36 @@ class AutoDiff:
                     return node
 
             FortranCaster().visit(node)
+            if self.str_codes:
+                codes = self.str_codes
+
+                class StrDecoder(ast.NodeTransformer):
+                    def visit_Attribute(self, n):
+                        self.generic_visit(n)
+                        if (
+                            n.attr in codes
+                            and isinstance(n.ctx, ast.Load)
+                            and not (
+                                isinstance(n.value, ast.Name) and n.value.id == "self"
+                            )
+                        ):
+                            # gmasme.which_rt -> STR_CODES['which_rt'][int(gmasme.which_rt)]
+                            return ast.Subscript(
+                                value=ast.Subscript(
+                                    value=ast.Name(id="STR_CODES", ctx=ast.Load()),
+                                    slice=ast.Constant(n.attr),
+                                    ctx=ast.Load(),
+                                ),
+                                slice=ast.Call(
+                                    func=ast.Name(id="int", ctx=ast.Load()),
+                                    args=[n],
+                                    keywords=[],
+                                ),
+                                ctx=ast.Load(),
+                            )
+                        return n
+
+                StrDecoder().visit(node)
 
         except Exception as e:
             self.logger.exception("Exception in correct_test_func:", e)
@@ -1007,7 +1306,6 @@ class AutoDiff:
             )
             node.body.insert(1, jax_enable)
 
-            # Collect all array inputs consumed by method calls and test calls
             instances = main_details["instances"]
             input_args = {
                 arg
@@ -1023,8 +1321,29 @@ class AutoDiff:
                 if arg != call["instance"]
             }
 
-            # Map each input arg to its jnp constructor
-            input_attr_map: dict[str, str] = {name: "asarray" for name in input_args}
+            # Integer numpy scalar casts must become plain Python `int(...)` —
+            # they may end up used as jnp.arange bounds / array shapes inside
+            # jit, where a jnp.int32 tracer is illegal. Everything else keeps
+            # its jnp constructor.
+            _INT_SCALAR_CASTS = {
+                "int32",
+                "int64",
+                "intc",
+                "int_",
+                "intp",
+                "int8",
+                "int16",
+            }
+
+            # input_attr_map[name] = (namespace, ctor) where namespace is
+            # "builtin" (plain Python callable) or "jnp" (jnp.<ctor>)
+            input_attr_map: dict[str, tuple[str, str]] = {
+                name: ("jnp", "asarray") for name in input_args
+            }
+            struct_names = set(main_details.get("struct_instances", {}))
+            for name in input_args & struct_names:
+                input_attr_map[name] = ("tree", "tree_map")
+
             for stmt in ast.walk(node):
                 if not isinstance(stmt, ast.Assign):
                     continue
@@ -1038,11 +1357,51 @@ class AutoDiff:
                         and stmt.value.func.value.id == "np"
                     ):
                         attr = stmt.value.func.attr
-                        input_attr_map[target.id] = (
-                            "asarray" if attr == "zeros" else attr
-                        )
+                        if attr == "zeros":
+                            input_attr_map[target.id] = ("jnp", "asarray")
+                        elif attr in _INT_SCALAR_CASTS:
+                            input_attr_map[target.id] = ("builtin", "int")
+                        else:
+                            input_attr_map[target.id] = ("jnp", attr)
 
-            # Build the x_d = jnp.<ctor>(x) assignment nodes
+            def _build_ctor_call(name: str) -> ast.Call:
+                namespace, ctor = input_attr_map[name]
+                if namespace == "tree":
+                    return ast.Call(
+                        func=ast.Attribute(
+                            value=ast.Attribute(
+                                value=ast.Name(id="jax", ctx=ast.Load()),
+                                attr="tree_util",
+                                ctx=ast.Load(),
+                            ),
+                            attr="tree_map",
+                            ctx=ast.Load(),
+                        ),
+                        args=[
+                            ast.Attribute(
+                                value=ast.Name(id="jnp", ctx=ast.Load()),
+                                attr="asarray",
+                                ctx=ast.Load(),
+                            ),
+                            ast.Name(id=name, ctx=ast.Load()),
+                        ],
+                        keywords=[],
+                    )
+                func = (
+                    ast.Name(id=ctor, ctx=ast.Load())
+                    if namespace == "builtin"
+                    else ast.Attribute(
+                        value=ast.Name(id="jnp", ctx=ast.Load()),
+                        attr=ctor,
+                        ctx=ast.Load(),
+                    )
+                )
+                return ast.Call(
+                    func=func,
+                    args=[ast.Name(id=name, ctx=ast.Load())],
+                    keywords=[],
+                )
+
             jd_assignments = [
                 ast.Assign(
                     targets=[
@@ -1050,15 +1409,7 @@ class AutoDiff:
                             id=f"{name}{self._MODE_SUFFIX[self.mode]}", ctx=ast.Store()
                         )
                     ],
-                    value=ast.Call(
-                        func=ast.Attribute(
-                            value=ast.Name(id="jnp", ctx=ast.Load()),
-                            attr=input_attr_map[name],
-                            ctx=ast.Load(),
-                        ),
-                        args=[ast.Name(id=name, ctx=ast.Load())],
-                        keywords=[],
-                    ),
+                    value=_build_ctor_call(name),
                 )
                 for name in input_args
             ]
@@ -1438,6 +1789,7 @@ class AutoDiff:
             method_calls: list[dict] = []
             test_calls: list[dict] = []
             attributes_used: set = set()
+            struct_instances: dict[str, dict] = {}
 
             # Class instantiations and assigned method-call results
             for node in ast.walk(tree):
@@ -1450,10 +1802,28 @@ class AutoDiff:
                     if not isinstance(target, ast.Name):
                         continue
                     if isinstance(call.func, ast.Name):
-                        instance_to_class[target.id] = call.func.id
+                        if call.func.id in self.struct_classes:
+                            struct_instances[target.id] = {
+                                "type": call.func.id,
+                                "dimensions": [],
+                            }
+                        else:
+                            instance_to_class[target.id] = call.func.id
                     elif isinstance(call.func, ast.Attribute):
                         obj = call.func.value
-                        if isinstance(obj, ast.Name) and obj.id in instance_to_class:
+                        # Struct-of-arrays constructor: laieff_fit = laieff_type.zeros(...)
+                        # Track the assigned variable as a struct instance.
+                        if (
+                            isinstance(obj, ast.Name)
+                            and obj.id in self.struct_classes
+                            and call.func.attr in {"zeros", "ones"}
+                        ):
+                            struct_instances[target.id] = {
+                                "type": obj.id,
+                                "dimensions": _zeros_shape_dims(call),
+                            }
+                        # Method call on an already tracked class instance:
+                        elif isinstance(obj, ast.Name) and obj.id in instance_to_class:
                             method_calls.append(
                                 {
                                     "instance": obj.id,
@@ -1536,6 +1906,7 @@ class AutoDiff:
 
             return {
                 "instances": instance_to_class,
+                "struct_instances": struct_instances,
                 "method_calls": method_calls,
                 "test_calls": test_calls,
                 "attributes_used": attributes_used,
@@ -1587,15 +1958,31 @@ class AutoDiff:
                 if not (
                     isinstance(call.func, ast.Attribute)
                     and isinstance(call.func.value, ast.Name)
-                    and call.func.value.id in self._LIB_ALIASES
                 ):
                     continue
+
+                lib = call.func.value.id
+                is_array_ctor = lib in self._LIB_ALIASES
+                # Struct-of-arrays constructor: laieff_type.zeros((a, b, c))
+                is_struct_ctor = (
+                    lib in self.struct_classes and call.func.attr == "zeros"
+                )
+                if not (is_array_ctor or is_struct_ctor):
+                    continue
+
                 for target in node.targets:
                     if not (isinstance(target, ast.Name) and target.id in args):
                         continue
-                    for arg in call.args:
-                        if isinstance(arg, ast.Tuple):
-                            args_shape[target.id] = [get_name(elt) for elt in arg.elts]
+                    if is_struct_ctor:
+                        dims = _zeros_shape_dims(call)
+                        if dims:
+                            args_shape[target.id] = dims
+                    else:
+                        for arg in call.args:
+                            if isinstance(arg, ast.Tuple):
+                                args_shape[target.id] = [
+                                    get_name(elt) for elt in arg.elts
+                                ]
             return args_shape
         except Exception as e:
             self.logger.exception("Exception in _get_args_shape:", e)
@@ -1761,6 +2148,61 @@ class AutoDiff:
             self.logger.exception("Exception in _propagate_shapes:", e)
             raise
 
+    def _propagate_struct_args(self, class_dep, fn_index):
+        """Push struct_args from callers to callees, callers first."""
+        try:
+            for cls in self.cls_info.values():
+                methods = cls["methods"]
+                for caller in reversed(
+                    topo_sort(class_dep)
+                ):  # topo_sort is leaves-first
+                    c_structs = methods.get(caller, {}).get("struct_args", {})
+                    if not c_structs:
+                        continue
+                    for edge in class_dep.get(caller, []):
+                        callee = methods.get(edge.callee)
+                        if callee is None:
+                            continue
+                        for i, arg in enumerate(edge.call_node.args):
+                            if i >= len(edge.func_args):
+                                break
+                            # whole struct or struct element only (not var.field)
+                            ref = self._split_struct_ref(arg)
+                            if (
+                                ref is None
+                                or ref[1] is not None
+                                or ref[0] not in c_structs
+                            ):
+                                continue
+                            root = ref[0]
+                            info = c_structs[root]
+                            dims = list(info["dimensions"])
+                            if isinstance(arg, ast.Subscript):
+                                dims = self._infer_subscript_shape(
+                                    dims, arg.slice, keep_loop_index=True
+                                )
+                                if dims is None:
+                                    self.logger.warning(
+                                        f"{caller}->{edge.callee}: cannot infer dims for "
+                                        f"{ast.unparse(arg)}"
+                                    )
+                                    continue
+                            new = {"type": info["type"], "dimensions": dims}
+                            param = edge.func_args[i]
+                            slot = callee.setdefault("struct_args", {})
+                            old = slot.get(param)
+                            if old is not None and old != new:
+                                raise ValueError(
+                                    f"Conflicting struct_args for {edge.callee}.{param}: "
+                                    f"{old} vs {new} (from {caller})"
+                                )
+                            slot[param] = new
+        except ValueError:
+            raise
+        except Exception as e:
+            self.logger.exception("Exception in _propagate_struct_args:", e)
+            raise
+
     def _infer_child_args(
         self,
         call_node: ast.Call,
@@ -1809,8 +2251,30 @@ class AutoDiff:
                     break
                 param = callee_args[i]
                 arg_name = get_name(call_arg)
+                # Struct element, e.g. laieff_fit[ji, ivm, ilevel] or self.laieff_fit[...]:
+                # the callee receives one element, not the whole struct, so skip
+                # Its dims travel via struct_args.
+                ref = self._split_struct_ref(call_arg)  # the merged helper
+                if ref is not None and self._struct_of(ref[0], fn.name) is not None:
+                    var, field = ref
+                    if field is None:
+                        # struct or struct element
+                        if isinstance(call_arg, ast.Subscript):
+                            arg_name = None  # skip pass-through, dims via struct_args
+                    else:
+                        # field access: resolve through struct_info right here
+                        sv = self._struct_of(var, fn.name)
+                        fld = self.struct_info.get(sv["type"], {}).get(field)
+                        if fld is not None:
+                            dims = list(sv["dimensions"]) + list(fld["inner_dims"])
+                            if isinstance(call_arg, ast.Subscript):
+                                dims = self._infer_subscript_shape(dims, call_arg.slice)
+                            if dims is not None:
+                                resolved[param] = dims
+                                continue
+                        arg_name = None
 
-                # 1. Direct pass-through
+                # 1. Direct pass-through (never for subscripts)
                 if arg_name and arg_name in arg_shapes:
                     resolved[param] = arg_shapes[arg_name]
                     continue
@@ -1822,13 +2286,13 @@ class AutoDiff:
                         resolved[param] = local_shape
                         continue
 
-                # 3. Inline constructor (e.g. np.zeros((2, 3)))
+                # 3. Inline constructor
                 inline_shape = self._resolve_inline_shape(call_arg)
                 if inline_shape is not None:
                     resolved[param] = inline_shape
                     continue
 
-                # 4. Attribute / subscript (self.x, batch[0])
+                # 4. Attribute / subscript
                 attr_shape = self._resolve_attr_or_subscript(call_arg, arg_shapes)
                 if attr_shape is not None:
                     resolved[param] = attr_shape
@@ -2078,10 +2542,41 @@ class AutoDiff:
             self.logger.exception("Exception in _resolve_attr_or_subscript:", e)
             raise
 
+    @staticmethod
+    def _split_struct_ref(node):
+        """Return (var, field_or_None) for:
+        var, var[...], self.var, self.var[...]      -> (var, None)
+        var.f, var.f[...], self.var.f, self.var.f[...] -> (var, f)
+        """
+        base = node
+        while isinstance(base, ast.Subscript):
+            base = base.value
+
+        def var_of(n):
+            if isinstance(n, ast.Name) and n.id != "self":
+                return n.id
+            if (
+                isinstance(n, ast.Attribute)
+                and isinstance(n.value, ast.Name)
+                and n.value.id == "self"
+            ):
+                return n.attr
+            return None
+
+        v = var_of(base)
+        if v is not None:
+            return v, None
+        if isinstance(base, ast.Attribute):
+            v = var_of(base.value)
+            if v is not None:
+                return v, base.attr
+        return None
+
     def _infer_subscript_shape(
         self,
         parent_shape: Any,
         slice_node: ast.AST,
+        keep_loop_index: bool = False,
     ) -> list | None:
         """
         Infer the shape produced by indexing into *parent_shape*.
@@ -2110,15 +2605,30 @@ class AutoDiff:
             if not (isinstance(parent_shape, list) and parent_shape):
                 return None
 
-            if isinstance(slice_node, ast.Constant) and isinstance(
-                slice_node.value, int
-            ):
-                return parent_shape[1:] if len(parent_shape) > 1 else []
+            elts = (
+                slice_node.elts if isinstance(slice_node, ast.Tuple) else [slice_node]
+            )
+            if len(elts) > len(parent_shape):
+                return None
 
-            if isinstance(slice_node, ast.Slice):
-                return parent_shape
-
-            return None
+            kept = []
+            for dim, idx in zip(parent_shape, elts):
+                if isinstance(idx, ast.Slice):
+                    kept.append(dim)
+                elif (
+                    keep_loop_index
+                    and isinstance(idx, ast.Name)
+                    and dim in self.vectorize
+                ):
+                    kept.append(dim)
+                elif isinstance(
+                    idx, ast.Name | ast.Attribute | ast.BinOp | ast.Constant
+                ):
+                    continue  # scalar index: axis dropped
+                else:
+                    return None  # unknown (fancy/array index): don't guess
+            kept += parent_shape[len(elts) :]  # untouched trailing dims
+            return kept
 
         except Exception as e:
             self.logger.exception("Exception in _infer_subscript_shape:", e)
@@ -2316,7 +2826,7 @@ class AutoDiff:
             var_modif_attr = var_modif_attrs | converter._var_modif["attr"]
             var_modif_args = var_modif_args | converter._var_modif["args"]
 
-            if not isinstance(new_tree.body[-1], ast.Return):
+            if not new_tree.body or not isinstance(new_tree.body[-1], ast.Return):
                 ret_stmt = converter.add_return_stmt(
                     var_modif_args=var_modif_args,
                     var_modif_attr=var_modif_attr,
@@ -2511,8 +3021,8 @@ class AutoDiff:
                 declaration_initialization_used = [
                     n for n in declaration_initialization_used if n in attributes
                 ]
+                decl_init_set = set(declaration_initialization_used)
 
-                # Collect dimension names that are statically known
                 arr_dim: set = set()
                 for attr_info in attributes.values():
                     for dim in attr_info.get("dimensions", []):
@@ -2526,21 +3036,40 @@ class AutoDiff:
                         for attr in method_values.get("local_arr", {}).values():
                             arr_dim.update(attr.get("dimensions", []))
 
-                # Attributes initialised in declaration_initialization are dynamic
-                arr_dim -= set(declaration_initialization_used)
+                # Attributes initialised in declaration_initialization can never
+                # be static, drop them from the static candidate set.
+                arr_dim -= decl_init_set
 
                 static_attributes, dynamic_attributes = [], []
                 for key, value in attributes.items():
                     if value["type"] in {"int", "float", "bool"} and key in arr_dim:
                         static_attributes.append((key, value["type"]))
-                    elif value["type"] in {"jnp.ndarray", "int", "float", "bool"}:
+                    elif value["type"] in {
+                        "jnp.ndarray",
+                        "int",
+                        "float",
+                        "bool",
+                    }:  # "str"
                         dynamic_attributes.append((key, value["type"]))
 
-                # Ensure all dimension-referenced attributes are present as static int
+                # Any attribute used as a shape/loop-bound dimension in main()
+                # should also be static, UNLESS it's reassigned inside
+                # declaration_initialization. This is the only
+                # discriminator needed
                 static_keys = {v[0] for v in static_attributes}
+                dynamic_keys = {v[0] for v in dynamic_attributes}
+
                 for arg_member in attributes_used:
+                    if arg_member in decl_init_set:
+                        continue  # must remain dynamic; do not force static
                     if arg_member not in static_keys:
                         static_attributes.append((arg_member, "int"))
+                        static_keys.add(arg_member)
+                        if arg_member in dynamic_keys:
+                            dynamic_attributes = [
+                                (k, t) for k, t in dynamic_attributes if k != arg_member
+                            ]
+                            dynamic_keys.discard(arg_member)
 
                 dynamic_static_fields: list[ast.AnnAssign] = []
 
@@ -2573,13 +3102,27 @@ class AutoDiff:
                             attr="ndarray",
                             ctx=ast.Load(),
                         )
-                        if type_str == "jnp.ndarray"
+                        if type_str == "jnp.ndarray" or name in self.str_codes
                         else ast.Name(id=type_str, ctx=ast.Load())
                     )
                     dynamic_static_fields.append(
                         ast.AnnAssign(
                             target=ast.Name(id=name, ctx=ast.Store()),
                             annotation=annotation,
+                            simple=1,
+                        )
+                    )
+
+                for name, info in attributes.items():
+                    if info.get("type") != "struct":
+                        continue
+                    struct_type = info.get("struct_type")
+                    if struct_type not in self.struct_classes:
+                        continue
+                    dynamic_static_fields.append(
+                        ast.AnnAssign(
+                            target=ast.Name(id=name, ctx=ast.Store()),
+                            annotation=ast.Name(id=struct_type, ctx=ast.Load()),
                             simple=1,
                         )
                     )
@@ -2808,13 +3351,20 @@ class AutoDiff:
         Exception
             Re-raises any unexpected error after logging.
         """
+        _READ_CALLS = {"read_ints", "read_reals", "read_record"}
         try:
-            call, _ = self._get_read_call(node)
-            if call:
-                return True
-            if isinstance(node, ast.Call):
-                return any(self._check_read_rhs_assign_value(arg) for arg in node.args)
-            return False
+            # call, _ = self._get_read_call(node)
+            # if call:
+            #     return True
+            # if isinstance(node, ast.Call):
+            #     return any(self._check_read_rhs_assign_value(arg) for arg in node.args)
+            # return False
+            return any(
+                isinstance(n, ast.Call)
+                and isinstance(n.func, ast.Attribute)
+                and n.func.attr in _READ_CALLS
+                for n in ast.walk(node)
+            )
         except Exception as e:
             self.logger.exception("Exception in _check_read_rhs_assign_value:", e)
             raise
@@ -2901,6 +3451,15 @@ class AutoDiff:
             self.logger.exception("Exception in _correct_tuple_shape:", e)
             raise
 
+    @staticmethod
+    def _is_string_read(node: ast.AST) -> bool:
+        return any(
+            isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Attribute)
+            and n.func.attr == "read_record"
+            for n in ast.walk(node)
+        )
+
     def _identify_transform_scalar(
         self,
         decl_init_function: ast.FunctionDef,
@@ -2940,6 +3499,9 @@ class AutoDiff:
             values: list[ast.Name] = []
             inside_method = False
 
+            # Map Fortran-read dtype string -> Python builtin caster name
+            _BUILTIN_CAST = {"int32": "int", "float64": "float"}
+
             for assign in ast_walk(decl_init_function, ast.Assign):
                 has_read = self._check_read_rhs_assign_value(assign.value)
 
@@ -2959,7 +3521,6 @@ class AutoDiff:
                     name = target.attr
                     assign.targets[0] = ast.Name(id=name, ctx=target.ctx)
 
-                    # Replace self.<x> references in the shape tuple
                     known_names = [n.id for n in values if isinstance(n, ast.Name)]
                     for i, arg in enumerate(assign.value.args):
                         if isinstance(arg, ast.Tuple):
@@ -2972,7 +3533,7 @@ class AutoDiff:
                     values.append(ast.Name(id=name, ctx=ast.Load()))
 
                 else:
-                    # Read assignment: wrap RHS in jnp cast
+                    # Read assignment: wrap RHS in a plain Python builtin cast
                     target = assign.targets[0]
                     if not isinstance(target, ast.Attribute):
                         continue
@@ -2982,17 +3543,23 @@ class AutoDiff:
                     keys.append(ast.Constant(value=name))
                     values.append(ast.Name(id=name, ctx=ast.Load()))
 
-                    call_node, dtype = self._get_read_call(assign.value)
-                    if call_node:
+                    if self._is_string_read(assign.value):
+                        # which_rt = _encode_str('which_rt', ffile.read_record('S80')[0].decode('ascii').rstrip())
+                        # where encode string is in the case the string is not initialized
                         assign.value = ast.Call(
-                            func=ast.Attribute(
-                                value=ast.Name(id="jnp", ctx=ast.Load()),
-                                attr=dtype,
-                                ctx=ast.Load(),
-                            ),
-                            args=[assign.value],
+                            func=ast.Name(id="_encode_str", ctx=ast.Load()),
+                            args=[ast.Constant(name), assign.value],
                             keywords=[],
                         )
+                    else:
+                        call_node, dtype = self._get_read_call(assign.value)
+                        if call_node:
+                            builtin_name = _BUILTIN_CAST.get(dtype, "float")
+                            assign.value = ast.Call(
+                                func=ast.Name(id=builtin_name, ctx=ast.Load()),
+                                args=[assign.value],
+                                keywords=[],
+                            )
 
             if keys:
                 return ast.Dict(keys=keys, values=values), inside_method

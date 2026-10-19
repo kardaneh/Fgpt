@@ -662,6 +662,7 @@ class Isolator:
                 ignore_case=None,
                 config_path=self.config_path,
                 logger=self.logger,
+                target_model=self.target_model,
             )
         else:
             self.logger.info("Skipping Transformer initialization as f2np is disabled.")
