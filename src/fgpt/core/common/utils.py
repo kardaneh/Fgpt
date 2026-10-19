@@ -116,6 +116,9 @@ class ReplaceGlobals(ast.NodeTransformer):
 
             for _, instances in self.cls_info.items():
                 for inst_key, value in instances.items():
+                    if value.get("is_dataclass"):
+                        continue  # dataclass field-owner records aren't a qualifiable "self.x" instance
+
                     cls_attr = value.get("attributes", {})
                     other_object_instances = value.get("instances", {})
 
@@ -131,7 +134,7 @@ class ReplaceGlobals(ast.NodeTransformer):
                     elif other_object_instances:
                         for key in list(other_object_instances.keys()):
                             other_object_attributes = other_object_instances[key].get(
-                                "attributes"
+                                "attributes", {}
                             )
                             if name in other_object_attributes:
                                 return ast.Attribute(
@@ -213,8 +216,11 @@ class ReplaceGlobals(ast.NodeTransformer):
                 # Check if it's a local attribute
                 for _, instances in self.cls_info.items():
                     for _, value in instances.items():
+                        if value.get("is_dataclass"):
+                            continue  # dataclass field-owner records aren't a qualifiable "self.x" instance
+
                         local_attrs = value.get("attributes", [])
-                        other_instances = value.get("instances", [])
+                        other_instances = value.get("instances", {})
 
                         if name.isupper():
                             name = name.lower()
@@ -336,6 +342,9 @@ class ReplaceGlobals(ast.NodeTransformer):
                 # First the method name and then check the args
                 for _, instances in self.cls_info.items():
                     for inst_key, value in instances.items():
+                        if value.get("is_dataclass"):
+                            continue  # dataclass field-owner records aren't a qualifiable "self.x" instance
+
                         methods = value.get("methods", [])
                         other_object_instances = value.get("instances", [])
                         if method_name in methods:
@@ -474,9 +483,10 @@ class ReplaceGlobals(ast.NodeTransformer):
                                 node.iter.args[i] = replacement
             return node
         except Exception as e:
+            Exception("RuntimeError in visit_For of ReplaceGlobals")
             raise RuntimeError(
-                f"RuntimeError in visit_For of \
-                                ReplaceGlobals: {ast.dump(node, indent=4)}"
+                f"RuntimeError in visit_For of "
+                f"ReplaceGlobals: {ast.dump(node, indent=4)}"
             ) from e
 
     def visit_If(self, node):
@@ -783,6 +793,9 @@ class AdjustIndices(ast.NodeTransformer):
         # treated as pre-adjusted. The state is cleared when the name is rebound
         # as a fresh loop target.
         self._raw_override: set[str] = set()
+
+        # This is meant for the case of F23.Main_Program
+        self.shift_user_call_args = kwargs.get("shift_user_call_args", False)
 
     def _is_preadjusted(self, name: str) -> bool:
         """
@@ -1595,7 +1608,7 @@ class AdjustIndices(ast.NodeTransformer):
                     }
                     registry.setdefault(called_name, []).append(name_state)
 
-            # TODO: Need to improve
+            # TODO: Need to improve perhaps some edge testcases
             # NOTE: value-context correction for conventional loop variables.
             # Fortran `DO jrp = 1, nrp` becomes Python `range(0, nrp)`, so the
             # loop variable itself is shifted by -1 relative to Fortran. When
@@ -1603,16 +1616,25 @@ class AdjustIndices(ast.NodeTransformer):
             # But when jrp is cast to a real/float and used as
             # a *value* in a formula (e.g. REAL(jrp) -> float(jrp)), the
             # original Fortran value must be recovered explicitly with +1.
-            if (
-                isinstance(node.func, ast.Name)
-                and node.func.id in ("float", "int")
-                and len(node.args) == 1
-                and isinstance(node.args[0], ast.Name)
-                and node.args[0].id in self.CONV_VARS
-            ):
-                node.args[0] = ast.BinOp(
-                    left=node.args[0], op=ast.Add(), right=ast.Constant(value=1)
-                )
+            is_intrinsic = (
+                isinstance(node.func, ast.Name) and node.func.id in ("float", "int")
+            ) or (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "np"
+            )
+            # This is meant for the control for the F23.Main_Program just like
+            # for the call_site_preadjustement done for the subroutines and their calls
+            # (see Transformer._compute_call_site_preadjustment).
+            is_user_call = (
+                self.shift_user_call_args
+                and isinstance(node.func, ast.Name)
+                and node.func.id not in ("range", "float", "int", "len", "print")
+            )
+
+            if is_intrinsic or is_user_call:
+                sh = _ShiftLoopVars(self._is_preadjusted)
+                node.args = [sh.visit(a) for a in node.args]
 
             if isinstance(node.func, ast.Attribute) and node.func.attr in [
                 "argmin",
@@ -1720,18 +1742,28 @@ class AdjustIndices(ast.NodeTransformer):
             # `_is_preadjusted()` also accounts for `_raw_override`, ensuring that
             # names currently holding raw values are treated as unadjusted.
             if isinstance(node, ast.Name) and self._is_preadjusted(node.id):
-                node = ast.BinOp(
-                    left=node, op=ast.Add(), right=ast.Constant(value=offset)
-                )
+                node = self._shift_const(node, offset)
+            # raw name (holds the Fortran value) -> subtract the lower bound
+            elif isinstance(node, ast.Name) and node.id in self._raw_override:
+                node = self._shift_const(node, offset - 1)
 
-            elif isinstance(node, ast.BinOp):  # THis is to handle cases when the
-                left = node.left
-                right = node.right
-                op = node.op
+            elif isinstance(node, ast.BinOp):
+                left, right, op = node.left, node.right, node.op
+
+                # Raw name +/- int constant, e.g. k + 1 on a lower-bound-5 array
+                if (
+                    isinstance(left, ast.Name)
+                    and left.id in self._raw_override
+                    and isinstance(right, ast.Constant)
+                    and isinstance(right.value, int)
+                    and isinstance(op, ast.Add | ast.Sub)
+                ):
+                    c = right.value if isinstance(op, ast.Add) else -right.value
+                    return self._shift_const(left, c + offset - 1)
 
                 is_valid_left = False
 
-                # Case 1: left is a Name
+                # Case 1: left is a pre-adjusted Name
                 if isinstance(left, ast.Name):
                     if self._is_preadjusted(left.id):
                         is_valid_left = True
@@ -1744,40 +1776,59 @@ class AdjustIndices(ast.NodeTransformer):
                     ):
                         is_valid_left = True
 
-                if is_valid_left and isinstance(right, ast.Constant):
-                    original_value = right.value
-
+                if (
+                    is_valid_left
+                    and isinstance(right, ast.Constant)
+                    and isinstance(right.value, int)
+                ):
                     if isinstance(op, ast.Sub):
-                        new_value = original_value - offset
-                        if new_value == 0:
-                            node = left
-                        else:
-                            node = ast.BinOp(
-                                left=left,
-                                op=ast.Sub(),
-                                right=ast.Constant(value=new_value),
-                            )
-
+                        node = self._shift_const(left, -(right.value - offset))
                     elif isinstance(op, ast.Add):
-                        new_value = original_value + offset
-                        if new_value == 0:
-                            node = left
-                        else:
-                            node = ast.BinOp(
-                                left=left,
-                                op=ast.Add(),
-                                right=ast.Constant(value=new_value),
-                            )
+                        node = self._shift_const(left, right.value + offset)
 
             elif isinstance(node, ast.Call):
                 if not self._check_internal_call_element(node):
-                    node = ast.BinOp(
-                        left=node, op=ast.Add(), right=ast.Constant(value=offset)
-                    )
+                    node = self._shift_const(node, offset)
 
             return node
         except Exception:
             raise
+
+    def _collect_terms(self, node, sign, terms, const):
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add | ast.Sub):
+            self._collect_terms(node.left, sign, terms, const)
+            self._collect_terms(
+                node.right,
+                sign if isinstance(node.op, ast.Add) else -sign,
+                terms,
+                const,
+            )
+        elif isinstance(node, ast.Constant) and isinstance(node.value, int):
+            const[0] += sign * node.value
+        else:
+            terms.append((sign, node))
+            if isinstance(node, ast.Name) and (
+                self._is_preadjusted(node.id)
+                or (self.exclude_index and node.id in self.exclude_index)
+            ):
+                const[0] += sign
+
+    def _rebuild_terms(self, terms, const):
+        terms = list(terms)
+        first = next((k for k, (s, _) in enumerate(terms) if s > 0), None)
+        if first is None:
+            expr = ast.UnaryOp(op=ast.USub(), operand=terms.pop(0)[1])
+        else:
+            expr = terms.pop(first)[1]
+        for s, t in terms:
+            expr = ast.BinOp(left=expr, op=ast.Add() if s > 0 else ast.Sub(), right=t)
+        if const:
+            expr = ast.BinOp(
+                left=expr,
+                op=ast.Add() if const > 0 else ast.Sub(),
+                right=ast.Constant(value=abs(const)),
+            )
+        return expr
 
     def _adjust_index(self, index_node: ast.AST) -> ast.AST:
         """
@@ -2014,6 +2065,28 @@ class AdjustIndices(ast.NodeTransformer):
         """
         return ast.BinOp(left=node, op=ast.Sub(), right=ast.Constant(value=1))
 
+    def _uses_preadjusted(self, node: ast.AST) -> bool:
+        return any(
+            isinstance(n, ast.Name) and self._is_preadjusted(n.id)
+            for n in ast.walk(node)
+        )
+
+    def _shift_const(self, expr: ast.AST, d: int) -> ast.AST:
+        if d == 0:
+            return expr
+        if isinstance(expr, ast.Constant) and isinstance(expr.value, int):
+            return ast.Constant(value=expr.value + d)
+        if (
+            isinstance(expr, ast.BinOp)
+            and isinstance(expr.op, ast.Add | ast.Sub)
+            and isinstance(expr.right, ast.Constant)
+            and isinstance(expr.right.value, int)
+        ):
+            c = expr.right.value if isinstance(expr.op, ast.Add) else -expr.right.value
+            return self._shift_const(expr.left, c + d)
+        op = ast.Add() if d > 0 else ast.Sub()
+        return ast.BinOp(left=expr, op=op, right=ast.Constant(value=abs(d)))
+
     def _handle_binop(self, node: ast.BinOp) -> ast.AST:
         """
         Adjust binary index expressions for Python indexing semantics.
@@ -2039,6 +2112,9 @@ class AdjustIndices(ast.NodeTransformer):
         """
         try:
             self.generic_visit(node)
+            node = _DivToFloorDiv().visit(node)
+            if isinstance(node.op, ast.FloorDiv) and not self._uses_preadjusted(node):
+                return self._subtract_one(node)
             check = (
                 isinstance(node.left, ast.Name)
                 and node.left.id not in self.CONV_VARS
@@ -2064,11 +2140,88 @@ class AdjustIndices(ast.NodeTransformer):
                                 op=ast.Add(),
                                 right=ast.Constant(value=node.right.value - 1),
                             )
+            if (
+                isinstance(node.op, ast.Add | ast.Sub)
+                and isinstance(node.left, ast.BinOp)
+                and isinstance(node.right, ast.Constant)
+                and isinstance(node.right.value, int)
+                and not self._uses_preadjusted(node.left)
+            ):
+                c = (
+                    node.right.value
+                    if isinstance(node.op, ast.Add)
+                    else -node.right.value
+                )
+                return self._shift_const(node.left, c - 1)
+
+            if isinstance(node.op, ast.Add | ast.Sub):
+                terms, const = [], [0]
+                self._collect_terms(node, 1, terms, const)
+                if len(terms) >= 2:
+                    return self._rebuild_terms(terms, const[0] - 1)
+
             return node
         except Exception as e:
             raise RuntimeError(
                 f"_handle_binop failed for node={ast.dump(node, indent=4)}"
             ) from e
+
+
+class _DivToFloorDiv(ast.NodeTransformer):
+    """Fortran integer division inside an index -> Python floor division."""
+
+    def visit_BinOp(self, node):
+        self.generic_visit(node)
+        if isinstance(node.op, ast.Div):
+            node.op = ast.FloorDiv()
+        return node
+
+    def visit_Call(self, node):  # don't touch call arguments like float(a/b)
+        return node
+
+
+class _ShiftLoopVars(ast.NodeTransformer):
+    def __init__(self, is_pre):
+        self.is_pre = is_pre
+
+    def visit_Subscript(self, node):
+        return node
+
+    def visit_Name(self, node):
+        if isinstance(node.ctx, ast.Load) and self.is_pre(node.id):
+            return ast.BinOp(left=node, op=ast.Add(), right=ast.Constant(value=1))
+        return node
+
+
+class _PruneEmptyIf(ast.NodeTransformer):
+    """
+    Drop `ast.If` nodes whose body is empty in both branches, working
+    bottom-up so a nested empty IF collapses before its parent is
+    checked (e.g. an outer IF/ELSE where both branches only ever
+    contained now-pruned inner empty IFs also becomes empty and is
+    pruned in turn). If only `body` ends up empty but `orelse` doesn't,
+    a `pass` is inserted rather than pruning, since Python requires a
+    non-empty `body` even when only the `else` branch has content.
+    """
+
+    def visit_If(self, node: ast.If) -> ast.If | None:
+        self.generic_visit(
+            node
+        )  # recurse first: children collapse before this node is judged
+
+        node.body = [s for s in node.body if s is not None]
+        node.orelse = [s for s in node.orelse if s is not None]
+
+        body_empty = not node.body
+        orelse_empty = not node.orelse
+
+        if body_empty and orelse_empty:
+            return None  # drop this IF entirely
+
+        if body_empty:
+            node.body = [ast.Pass()]
+
+        return node
 
 
 def get_instance_name(node_name: str) -> str:
@@ -2410,13 +2563,17 @@ def safe_eval_expr(node, attributes: dict[str, tuple] | None = None) -> Any:
         raise NotImplementedError(f"Unsupported AST node type: {type(node)}")
 
 
-def update_methods(module_dict: dict, function_defs: list) -> None:
+def update_methods(
+    module_dict: dict,
+    function_defs: list,
+    subroutine_key: str | None = None,
+) -> None:
     """
     Update module method dictionaries with new function definitions.
 
     Searches *module_dict* for nested dictionaries containing a
-    ``"methods"`` entry and adds or replaces method definitions
-    using the supplied AST function definitions.
+    ``"methods"`` entry. If *subroutine_key* is provided, only the
+    subroutine matching that key is updated.
 
     Existing methods with the same name are overwritten by the
     corresponding entries in *function_defs*.
@@ -2428,6 +2585,10 @@ def update_methods(module_dict: dict, function_defs: list) -> None:
         dictionaries with a ``"methods"`` key.
     function_defs : list[ast.FunctionDef]
         Function definitions to add to the target method dictionary.
+    subroutine_key : str | None, optional
+        Key identifying the specific subroutine whose ``"methods"``
+        dictionary should be updated. If not provided, the first
+        matching ``"methods"`` dictionary is updated.
 
     Notes
     -----
@@ -2436,18 +2597,30 @@ def update_methods(module_dict: dict, function_defs: list) -> None:
     - The update is performed in-place and no copy of
       *module_dict* is created.
     """
-    # Loop over the top-level module(s)
-    for _, module_content in module_dict.items():
-        # Search for the inner dict that contains 'methods'
-        for _, instance_val in module_content.items():
-            if isinstance(instance_val, dict) and "methods" in instance_val:
-                methods_dict = instance_val["methods"]
-                for func_def in function_defs:
-                    if isinstance(func_def, ast.FunctionDef):
-                        methods_dict[func_def.name] = func_def
-                # Ensure the dict is updated
-                instance_val["methods"] = methods_dict
-                break
+
+    def apply(instance_val):
+        if isinstance(instance_val, dict) and "methods" in instance_val:
+            methods_dict = instance_val["methods"]
+            for func_def in function_defs:
+                if isinstance(func_def, ast.FunctionDef):
+                    methods_dict[func_def.name] = func_def
+            return True
+        return False
+
+    if subroutine_key is None:
+        for module_content in module_dict.values():
+            for instance_val in module_content.values():
+                if apply(instance_val):
+                    return
+        return
+
+    prefixed_key = f"Global_module_{subroutine_key}"
+
+    for class_name, module_content in module_dict.items():
+        if class_name in (subroutine_key, prefixed_key):
+            for instance_val in module_content.values():
+                if apply(instance_val):
+                    return
 
 
 def collect_dependencies(node: ast.AST) -> set[str]:
