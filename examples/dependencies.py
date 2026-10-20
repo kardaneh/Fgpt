@@ -33,7 +33,7 @@ sys.argv = [
     "--py2jx",
     "False",
     "--tapenade",
-    "False",
+    "True",
     "--mode",
     "jax",
     "--benchmark_dir",

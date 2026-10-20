@@ -218,6 +218,7 @@ class Processor:
         self.fortran_intrinsics_lower = {
             func.lower(): func.upper() for func in self.fortran_intrinsics
         }
+        # need to be add into yaml
         self.allowed_external_subroutines = {
             "ipslerr_p",
             "histwrite_p",

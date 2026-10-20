@@ -718,6 +718,11 @@ class TapenadePass:
             # Process call statements with 'isize' arguments
             for call_stmt in walk(tree, F23.Call_Stmt):
                 actual_arg_list = call_stmt.children[1]
+                if actual_arg_list is None:
+                    self.logger.warning(
+                        f"Call statement '{call_stmt.tostr()}' has no actual argument list."
+                    )
+                    continue
                 actual_args_text = actual_arg_list.tostr()
 
                 if "isize" not in actual_args_text:
@@ -1727,6 +1732,13 @@ class TapenadePass:
                     if isinstance(child, F23.Call_Stmt):
                         children = child.children
                         actual_arg_list = children[1]
+
+                        if actual_arg_list is None:
+                            self.logger.warning(
+                                f"Call statement '{child.tostr()}' has no actual argument list."
+                            )
+                            i += 1
+                            continue
 
                         if "isize" in actual_arg_list.tostr():
                             args = actual_arg_list.children
