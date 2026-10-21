@@ -479,11 +479,9 @@ terms: **Attribution**, **NonCommercial**, and **ShareAlike**. See the
 ## Authors
 
 **Kazem Ardaneh**
-CNRS / IPSL / Sorbonne University
 kardaneh@ipsl.fr
 
 **Shivamshan Sivanesan**
-CNRS / IPSL
 ssivanesan@ipsl.fr
 
 ## Citation

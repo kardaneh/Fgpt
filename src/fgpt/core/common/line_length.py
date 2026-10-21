@@ -1,4 +1,4 @@
-# Copyright 2026 IPSL / CNRS / Sorbonne University
+# Copyright 2026 CNRS
 # Authors: Shivamshan Sivanesan and Kazem Ardaneh
 #
 # This class has been adapted from the ``FortLineLength`` implementation in

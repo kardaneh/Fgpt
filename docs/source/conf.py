@@ -9,10 +9,7 @@ sys.path.insert(0, os.path.join(PROJECT_ROOT, "src"))
 project = "FGPT"
 html_title = "FGPT Documentation"
 
-copyright = (
-    f"{datetime.now().year}, "
-    "S. Sivanesan, K. Ardaneh / CNRS / IPSL / Sorbonne University"
-)
+copyright = f"{datetime.now().year}, CNRS"
 
 author = "Shivamshan Sivanesan, Kazem Ardaneh"
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-echo "Starting isolation: 20260923_132830"
+echo "Starting isolation: 20261021_092639"
 echo "Target module: condveg"
 echo "Parent subroutine: condveg_main"
 echo "Target subroutines: albedo_surface_main"
