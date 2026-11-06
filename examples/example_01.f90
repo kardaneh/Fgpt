@@ -181,7 +181,7 @@ program test_procedures
     implicit none
 
     integer, parameter :: n = 10
-    real, allocatable  :: data_array(:)
+    real :: data_array(n)
     real :: average, variance, stddev
     real :: compute_average
 
