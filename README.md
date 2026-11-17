@@ -89,8 +89,6 @@ available in the repository:
   <strong><a href="./docs/FGPT.pdf">📄 FGPT.pdf — Project Presentation</a></strong>
 </p>
 
-- **Direct link:** [`docs/FGPT.pdf`](./docs/FGPT.pdf)
-- **Raw URL:** <https://github.com/kardaneh/FGPT/raw/main/docs/FGPT.pdf>
 
 ---
 
