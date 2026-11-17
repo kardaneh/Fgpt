@@ -26,14 +26,15 @@ The project has received support from the AI4PEX project.
 ## Table of Contents
 
 1. [Introduction](#introduction)
-2. [Project Structure](#project-structure)
-3. [Pipeline Overview](#pipeline-overview)
-4. [Installation](#installation)
-5. [Usage](#usage)
-6. [Testing](#testing)
-7. [Development](#development)
-8. [License](#license)
-9. [Authors](#authors)
+2. [Presentation](#presentation)
+3. [Project Structure](#project-structure)
+4. [Pipeline Overview](#pipeline-overview)
+5. [Installation](#installation)
+6. [Usage](#usage)
+7. [Testing](#testing)
+8. [Development](#development)
+9. [License](#license)
+10. [Authors](#authors)
 ---
 
 ## Introduction
@@ -71,6 +72,25 @@ The translation is AST-based throughout. Fortran source is parsed into an
 `fparser` AST; Python output is assembled as a `ast.Module` and unparsed
 to source — never via string manipulation — ensuring syntactic correctness
 and enabling precise, auditable transformations at every stage.
+
+---
+
+## Presentation
+
+A presentation giving an overview of FGPT — its motivation, the three-stage
+pipeline (isolation, Fortran-level optimizations, transpilation), the JAX
+conversion path, and example results on the IPSL land-surface model — is
+available in the repository:
+
+<p align="center">
+  <a href="./docs/FGPT.pdf">
+  </a>
+  <br>
+  <strong><a href="./docs/FGPT.pdf">📄 FGPT.pdf — Project Presentation</a></strong>
+</p>
+
+- **Direct link:** [`docs/FGPT.pdf`](./docs/FGPT.pdf)
+- **Raw URL:** <https://github.com/kardaneh/FGPT/raw/main/docs/FGPT.pdf>
 
 ---
 
