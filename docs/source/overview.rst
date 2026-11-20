@@ -49,6 +49,13 @@ FGPT addresses these challenges through a structured, three-phase transformation
 - Fortran source code (.f, .f90, modules, subroutines)
 - Parsed AST using fparser
 
+.. note::
+
+   Sources should follow the coding conventions in
+   :doc:`standards_and_limits`. That page also lists the constructs that
+   are not yet supported (pointers, classes, blocks) or only partially
+   supported (derived types, interface blocks).
+
 **Frontend — parsing and IR construction:**
 
 - Fortran parsing and AST generation (Processor)
@@ -143,3 +150,4 @@ Next Steps
 - :doc:`installation` - Set up FGPT environment
 - :doc:`quickstart` - Run your first Fortran-to-Python conversion
 - :doc:`jax_conversion` - Learn JAX conversion for optimized and accelerated code
+- :doc:`standards_and_limits` - Check input requirements and known limitations

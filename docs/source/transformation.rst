@@ -301,6 +301,36 @@ subroutine in isolation.
 
 See the :doc:`API reference </api/fgpt>` for the full method signatures.
 
+Fortran I/O Runtime Support
+---------------------------
+
+The transpilation pipeline includes runtime helpers for representing
+Fortran derived types in Python, reading binary data produced by Fortran
+programs, tracking Fortran I/O units, and replacing the Fortran netCDF
+libraries.
+
+Implemented in the I/O runtime modules, these helpers provide:
+
+- Python representations of Fortran derived types using dataclasses that
+  inherit from ``FortranDerivedType``, including nested types.
+- Initialization of array-valued derived-type instances in
+  structure-of-arrays form.
+- A single recursive reader, ``read_fortran_struct``, for scalar derived
+  types, arrays of derived types and nested types stored as one unformatted
+  record, preserving Fortran array ordering.
+- Metadata for tracking Fortran I/O units, including file status, format,
+  access mode, position, and record-length information.
+- NetCDF support for the netCDF-2 (``nc*``), netCDF-3 (``nf_*``) and
+  ``nf__*`` interfaces: translator metadata (``netcdf_map.py``), a Python
+  runtime (``fortran_netcdf.py``) built on ``netCDF4``, and call rewriting
+  in ``F2NP``.
+
+The runtime helpers generate Python AST nodes that can be inserted into the
+translated module. The resulting code relies on NumPy, Python's dataclasses
+support and, for NetCDF, the ``netCDF4`` package.
+
+For implementation details, see :doc:`fortran_io_runtime`.
+
 
 AST Post-Processing Transformers
 ---------------------------------

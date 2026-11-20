@@ -136,6 +136,14 @@ the pipeline stops before any Python output is written.
 Usage
 -----
 
+.. note::
+
+   The numerical comparison in the later steps assumes the reference data
+   already exists. Run the workflow in :doc:`validation` first to produce
+   the input ``.bin`` files (global and dummy) and the reference
+   ``output.bin``, before using the ``f2py``, ``py2jx`` API.
+
+
 Python API
 ~~~~~~~~~~
 

@@ -27,3 +27,11 @@ fgpt.core.transpiler.intrinsic module
    :members:
    :undoc-members:
    :show-inheritance:
+
+fgpt.core.transpiler.fortran_io module
+--------------------------------------
+
+.. automodule:: fgpt.core.transpiler.fortran_io
+   :members:
+   :undoc-members:
+   :show-inheritance:

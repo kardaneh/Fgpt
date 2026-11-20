@@ -45,6 +45,7 @@ Key Features
 * **JAX conversion utilities** for generating differentiable numerical kernels
 * **Modular architecture** supporting custom transformation passes
 * **Extensible framework** for future optimization and backend generation
+* **Documented coding standards and limits** for inputs FGPT can translate
 
 .. figure:: ../../images/Flowchart_FGPT.png
    :align: center
@@ -107,11 +108,15 @@ can later be optimized, vectorized, or lowered to specialized numerical backends
 
     architecture
     transformation
+    fortran_io_runtime
+    derived_types
     isolator
     tapenade
     extractor
     jax_conversion
     configuration
+    standards_and_limits
+    validation
     benchmark
 
 .. toctree::
@@ -128,8 +133,8 @@ can later be optimized, vectorized, or lowered to specialized numerical backends
     contributing
     testing
 
-# Indices and tables
-====================
+Indices and tables
+==================
 
 * :ref:`genindex`
 * :ref:`modindex`

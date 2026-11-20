@@ -19,7 +19,7 @@ pipeline description.
    │       ├── cli.py                     # Command-line interface
    │       ├── version.py                 # Package version
    │       ├── isolator.py                # Fortran isolation pipeline
-   │       ├── autodiff.py                # JAX/Tapenade conversion pipeline
+   │       ├── autodiff.py                # JAX/Automatic differentiation conversion pipeline
    │       │
    │       ├── core/
    │       │   ├── frontend/
@@ -34,11 +34,12 @@ pipeline description.
    │       │   │
    │       │   ├── passes/
    |       |   |   ├── __init__.py
-   │       │   │   └── modifier.py        # Fortran AST transformation passes
+   │       │   │   └── tapenade.py        # Fortran AD pipeline
    │       │   │
    │       │   ├── transpiler/
    |       |   |   ├── __init__.py
    │       │   │   ├── transformer.py     # Fortran → Python pipeline
+   │       │   │   ├── fortran_io.py      # Fortran I/O and helpers
    │       │   │   ├── f2np.py            # Statement/expression-level translation
    │       │   │   └── intrinsic.py       # Fortran intrinsic → NumPy mapping
    │       │   │
@@ -68,6 +69,7 @@ pipeline description.
    ├── tests/                    # Unit tests
    │   ├── conftest.py
    │   ├── test_autodiff.py
+   │   ├── test_dataio.py
    │   ├── test_extractor.py
    │   ├── test_f2np.py
    │   ├── test_intrinsic.py
@@ -77,26 +79,31 @@ pipeline description.
    │   ├── test_processor.py
    │   ├── test_shaper.py
    │   ├── test_utils.py
+   │   ├── test_tapenade.py
    │   └── test_transformer.py
    |
    ├── notebooks/                         # Example notebooks, tutorials, and development prototypes
-   │   ├── autodiff_principles.ipynb      # Introduction to JVP and VJP concepts
+   │   ├── autodiff_Basics.ipynb          # Introduction to JVP and VJP concepts
    │   ├── prototype.ipynb                # Experimental notebook with autodifferenciation
-   │   ├── fortran_to_numpy.ipynb         # F2NP translation examples
+   │   ├── fortran2numpy.ipynb            # F2NP translation examples
    │   ├── jax_converter.ipynb            # JAX conversion pipeline examples
    │   ├── jax_examples.ipynb             # JAX experiments and demonstrations
-   │   └── Test_Transformer.ipynb         # Transformer pipeline examples
+   │   ├── example_01.ipynb               # Example of isolationg a child procedure
+   │   ├── example_02.ipynb               # Full isolation child -> parent
+   │   ├── example_03.ipynb               # Isolating NetCDF W/R
+   │   ├── example_04.ipynb               # Isolating Fortran I/O
+   │   ├── example_05.ipynb               # Isolating child procedure with complex dependencies
+   │   └── isolator.ipynb                 # Isolator pipeline example
    |
    ├── docs/                     # Documentation
    │   ├── source/
    │   └── build/
    ├── .github/workflows/        # CI/CD pipelines
-   │   ├── ci.yaml
-   │   └── docs.yml
+   │   └── ci.yaml
+   │
    ├── setup                     # Setup file for transformation
-   ├── arch-nvhpc_HAL.env
-   ├── arch-nvhpc_LEONARDO.env
-   ├── arch-nvhpc_spirit.env
+   ├── arch-nvhpc.env
+   ├── uv.lock
    ├── Makefile                  # Makefile to run the isolated procedures in Fortran
    ├── template.yaml             # Predefined templates
    ├── pyproject.toml            # Package configuration
@@ -107,7 +114,7 @@ Module Descriptions
 -------------------
 
 Frontend — ``core/frontend/``
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 .. list-table::
    :header-rows: 1
