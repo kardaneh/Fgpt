@@ -66,6 +66,21 @@ These have the same format as the Fortran output, so the same plotting script ca
 ```bash
 python ~/Fgpt/examples/autodiff/Fortran/forward/plots.py --n_sites 8
 ```
+The optimization procedure generates two diagnostic figures:
+
+- `optimization_history.png`: Summarizes the optimization process, including the cost function, parameter evolution, gradient evolution, Levenberg–Marquardt damping parameter (λ), parameter errors, and gain ratio (ρ).
+
+- `flux_comparison.png`: Compares the reference and recovered upward fluxes over the full year (365 days) for each site, illustrating how well the optimized parameters reproduce the reference fluxes.
+
+The resulting figures are shown below.
+
+<p align="center">
+  <img src="../../../../images/optimization_history_python.png" alt="Optimization History" width="80%">
+</p>
+
+<p align="center">
+  <img src="../../../../images/flux_comparison_python.png" alt="Optimization History" width="80%">
+</p>
 
 ## Notes
 

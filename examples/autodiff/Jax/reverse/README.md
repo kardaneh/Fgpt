@@ -69,6 +69,27 @@ These have the same format as the Fortran output, so the same plotting script ca
 ```bash
 python ~/Fgpt/examples/autodiff/Fortran/reverse/plots.py --n_sites 8
 ```
+The resulting figures provide:
+
+- Optimization convergence diagnostics.
+- Comparison between true and recovered parameters.
+- Comparison between observed and recovered upward fluxes over the annual cycle.
+
+For a detailed description of each figure, see the ``Diagnostic Plots`` section of the Fortran section.
+
+The resulting figures are shown below.
+
+<p align="center">
+  <img src="../../../../images/optimization_history_python_b.png" alt="Optimization History" width="80%">
+</p>
+
+<p align="center">
+  <img src="../../../../images/parameters_summary_python_b.png" alt="Optimization History" width="80%">
+</p>
+
+<p align="center">
+  <img src="../../../../images/flux_comparison_python_b.png" alt="Optimization History" width="80%">
+</p>
 
 ## Notes
 
