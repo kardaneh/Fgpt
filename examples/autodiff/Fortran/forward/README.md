@@ -228,7 +228,7 @@ The figure contains six diagnostic panels:
 6. **LM Gain Ratio ($\rho$)**
 
 <p align="center">
-  <img src="../../../images/optimization_history.png" alt="Optimization History" width="80%">
+  <img src="../../../../images/optimization_history.png" alt="Optimization History" width="80%">
 </p>
 
 ### flux_comparison.png
@@ -236,5 +236,5 @@ The figure contains six diagnostic panels:
 The figure compares reference vs recovered upward fluxes over the full year (365 days) for each sites. This plot validates that the recovered parameters reproduce the reference flux across the entire seasonal cycle.
 
 <p align="center">
-  <img src="../../../images/flux_comparison.png" alt="Flux Comparison" width="80%">
+  <img src="../../../../images/flux_comparison.png" alt="Flux Comparison" width="80%">
 </p>

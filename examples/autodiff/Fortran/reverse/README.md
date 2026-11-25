@@ -281,7 +281,7 @@ The figure contains six diagnostic panels:
 6. **Relative Cost Reduction:** Shows the cost reduction ratio between iterations.
 
 <p align="center">
-  <img src="../../../images/optimization_history_b.png" alt="Optimization History" width="80%">
+  <img src="../../../../images/optimization_history_b.png" alt="Optimization History" width="80%">
 </p>
 
 ### parameters_summary.png
@@ -293,7 +293,7 @@ Compares true vs. recovered parameters for:
 - `rs(1)`, `rs(2)`, ..., `rs(N_sites)` (surface reflectance per site)
 
 <p align="center">
-  <img src="../../../images/parameters_summary_b.png" alt="Flux Comparison" width="80%">
+  <img src="../../../../images/parameters_summary_b.png" alt="Flux Comparison" width="80%">
 </p>
 
 ### flux_comparison.png
@@ -309,5 +309,5 @@ Each subplot shows:
 This plot validates that the recovered parameters reproduce the reference flux across the entire seasonal cycle.
 
 <p align="center">
-  <img src="../../../images/flux_comparison_b.png" alt="Flux Comparison" width="80%">
+  <img src="../../../../images/flux_comparison_b.png" alt="Flux Comparison" width="80%">
 </p>
